@@ -159,6 +159,19 @@ async fn ddl_statements_run() -> Result<()> {
     )
     .await?;
     tx.rollback().await?;
+    // Begins a transaction itself, as `Connection::begin_with` sends it.
+    run(
+        &mut conn,
+        &mut ran,
+        &statement::BEGIN_MANY,
+        &template::Values::new(),
+    )
+    .await?;
+    let mode: String = sqlx::query_scalar("SELECT current_setting('plan_cache_mode')")
+        .fetch_one(&mut conn)
+        .await?;
+    assert_eq!(mode, "force_custom_plan");
+    sqlx::query("ROLLBACK").execute(&mut conn).await?;
     let mut tx = conn.begin().await?;
     for statement in [&statement::PROBE_JOINS, &statement::PLAN_JOINS] {
         run(&mut tx, &mut ran, statement, &template::Values::new()).await?;

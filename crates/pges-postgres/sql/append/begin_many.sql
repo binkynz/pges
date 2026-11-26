@@ -1,0 +1,12 @@
+-- Begins the transaction of an append_many outside a unit of work, with custom plans for its statements.
+--
+-- The batch statement (append/many_head.sql) goes through streams and prunes its hash partitions only in a
+-- custom plan: PostgreSQL 18 locks every partition of a generic plan before run-time pruning, and the plan
+-- cache keeps a generic plan when the partitions were analyzed nearly empty, or under force_generic_plan
+-- (128 and 256 partition locks at 64 partitions, against 4 per partition the batch touches). The setting
+-- lasts until the transaction ends, so it never reaches the role's other statements, and it overrides a
+-- role's or session's force_generic_plan. A populated store's batches got custom plans already, so they cost
+-- what they did.
+--
+-- Two statements, sent with the simple query protocol in one round trip.
+BEGIN; SET LOCAL plan_cache_mode = force_custom_plan

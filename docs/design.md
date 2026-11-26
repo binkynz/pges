@@ -65,9 +65,10 @@ Guardrails:
   lock table, and 7–28% of readers waited on the LockManager lock; a generic plan of the commit fetch would
   take 2003 (Spike 3, below).
 - Keep `stream_partitions` at 64 (the default) up to about 1B streams. Single appends lock only their
-  stream's partition (9 locks), but `append_many` locks each partition it touches, and a
-  generic plan locks them all (schema.md, Tables). Do not set `plan_cache_mode = force_generic_plan` on writer
-  roles: it brings back the append's lock on every partition.
+  stream's partition (9 locks), but `append_many` locks each partition it touches (4 locks each) (schema.md,
+  Tables). Do not set `plan_cache_mode = force_generic_plan` on writer roles of a store whose appends go
+  through `streams`: it brings back the single append's lock on every partition. `append_many` sets custom
+  plans for itself.
 - Store migration 0001 sets the `streams` partitions' autovacuum scale factor to 0.02 (PostgreSQL's 0.2
   allowed about 312k dead tuples per partition at 100M streams). Existing stores must be recreated.
 - Retention per leaf costs O(leaf streams) (schema.md, Partition maintenance, Retention). Its
@@ -1772,9 +1773,51 @@ the halt, 43 recovered, 335 after.
     a SQL function with `SET plan_cache_mode = force_custom_plan` (9 locks in every regime and as fast as
     today, but a store schema change, and the statement would live in a migration instead of `sql/`);
     `satisfies_hash_partition` in the query (the planner does not prune on it).
-  - `append_many` stays as it was (one prepared statement through `streams`, 4 locks per touched partition,
-    every partition under a generic plan): running it unprepared fixes the statistics regimes but cost
-    20–25% of batches per second at concurrency 1.
+  - `append_many` stayed as it was at first (one prepared statement through `streams`, 4 locks per touched
+    partition, every partition under a generic plan): running it unprepared fixes the statistics regimes
+    but cost 20–25% of batches per second at concurrency 1. Fixed by custom plans (below).
+- `append_many` plans for its streams (2026-11-26; schema.md, Append (several streams)):
+  - The batch statement runs with `plan_cache_mode = force_custom_plan`: in its own transaction through
+    `BEGIN; SET LOCAL plan_cache_mode = force_custom_plan`, one simple-query round trip
+    (`Connection::begin_with`); inside a unit of work through `set_config(…, true)` before the batch and
+    the transaction's previous value after it (two round trips). A custom plan prunes `streams` to the
+    batch's partitions, so a batch locks 4 entries per partition it touches whatever the statistics and the
+    role's or session's mode, with routing on or off: 8 for 2 streams over 2 partitions where the plan
+    cache's generic plan locked 128 (analyzed nearly empty), 16 for 4 over 4 where `force_generic_plan`
+    locked 256, at 64 partitions. No new prepared
+    statement in the store's own transactions; one (`append/plan_mode.sql`) on connections that run batches
+    in units of work. It also covers stores whose appends go through `streams` (256 partitions with sqlx's
+    default cache).
+  - Batches per second, batches of 16 single-event appends to random existing streams of 1M
+    (`pges-bench scale append --batch 16`, 10 s runs, two rounds interleaved, before | after), on a dev box
+    shared with other work (load 12–50). `synchronous_commit = off`: with the plan cache's own choice
+    (custom plans) 64 partitions 592–659 | 574–650 at concurrency 1 and 5.9–6.5k | 6.1–6.5k at 16, 256
+    partitions 381–663 | 531–649 and 5.1–5.7k | 5.9–6.0k (no change: the plans were custom already);
+    under `force_generic_plan` 64 partitions 457–476 | 689–702 and 3.2–3.3k | 5.2–5.3k, 256 partitions
+    104–111 | 641 and 0.8–0.9k | 4.6–4.9k; a store of 3 streams analyzed, appending new streams (four
+    rounds) 1057–1134 | 1054–1146 and 7.2–9.0k | 8.8–8.9k. Durable commits are bound by the WAL flush and
+    the box's I/O (round-to-round spread up to 2x): 64 partitions 222–335 | 210–326 at 1 and 1.7–3.9k |
+    1.4–3.7k at 16; `force_generic_plan` 56–128 | 174–176, 256 partitions 46 | 332.
+  - The cost: where the plan cache chose a generic plan that was cheap to run, every batch is now planned.
+    `pges-bench append` (100k streams created by batches, then analyzed, durable): the plan cache kept a
+    generic plan (48 plans for 3380 batches, 0.77 ms of execution, every partition locked); forced custom
+    plans take about 1 ms of planning and 0.7 ms of execution. At concurrency 1 that was 439–571 → 422–534
+    batches/s over six rounds on a quieter box, and 282–456 → 231–251 over four under heavier load; at 16,
+    3.0–3.8k → 3.3–4.1k.
+  - Rejected, measured: appending a batch stream by stream with the partition statements of routed single
+    appends, in stream id order (2 locks per partition touched, no new statement, deadlock-free among such
+    batches). It was faster at concurrency 1 (64 partitions, `synchronous_commit = off`, 419–665 → 757–920
+    batches/s; 1.2 ms of planning and 2.1 ms of execution for the batch statement against 0.06 ms of
+    execution for each partition statement) but slower at 16, where the 16 round trips per batch cost more
+    than the planning: 4.4–5.1k → 3.9–4.6k (four rounds), durable 2.4–3.0k → 2.0–2.7k, and a nearly empty
+    store's new streams 8.3–8.9k → 5.9–6.6k. It would also have made two lock orders (stream by stream on
+    stores that route, the batch statement on those that do not) that can deadlock each other, and needed a
+    store that routes. One statement per partition over arrays, grouped in Rust: a `many_head.sql` per
+    partition doubles the partition statements per connection, so 64 partitions no longer fit sqlx's
+    default cache with the reserve, and it still costs a round trip per partition touched (about 14 of 16
+    streams at 64 partitions). The batch unprepared: 20–25% slower at concurrency 1 (earlier).
+  - The single append keeps the plan cache's choice: a routed append names its partition, and the fallback
+    through `streams` runs in autocommit, with no `BEGIN` to carry the setting.
 
 ## Open decisions
 

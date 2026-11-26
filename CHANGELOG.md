@@ -17,6 +17,18 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crates
   appends go through `streams` as before. `StoreConfig::append_routing` (`AppendRouting::Auto`, the default,
   or `Streams`) turns it off.
 
+### Changed
+
+- **`append_many` plans for its streams** (`pges-postgres`). The batch statement runs with
+  `plan_cache_mode = force_custom_plan`, so it locks only the partitions of `streams` its streams live in
+  (4 locks each) whatever the planner's statistics and the role's or session's `plan_cache_mode`. Before, a
+  generic plan, which the plan cache kept for a store analyzed nearly empty or under `force_generic_plan`,
+  locked every partition, and at 1M streams ran 1.5x to 6x slower. In its own transaction the setting is
+  part of `BEGIN` (no extra round trip) and ends with the transaction; inside a unit of work it is set
+  before the batch and the transaction's previous value is put back after it (two more round trips, and one
+  more prepared statement on that connection). Stores where the plan cache chose a cheap generic plan now
+  plan every batch: about 1 ms more per batch of 16.
+
 ## [0.1.0] - Unreleased
 
 The first release: `pges`, `pges-core`, `pges-derive`, `pges-postgres`, `pges-subscribe`, `pges-sequencer`,

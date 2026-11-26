@@ -25,6 +25,7 @@ pub fn store_name(store: &store::Store) -> &core_store::StoreName {
 pub(crate) struct StoreSql {
     append: Append,
     pub(crate) append_many: typed::Rendered<statement::append_many::Query>,
+    pub(crate) plan_mode: typed::Rendered<statement::plan_mode::Query>,
     pub(crate) classify: typed::Rendered<statement::classify::Query>,
     pub(crate) lock_stream: typed::Rendered<statement::lock_stream::Query>,
     pub(crate) try_lock_stream: typed::Rendered<statement::lock_stream::Query>,
@@ -75,6 +76,7 @@ impl StoreSql {
         Self {
             append,
             append_many,
+            plan_mode: statement::plan_mode::Query::fixed(),
             classify: statement::classify::Query::render(&values),
             lock_stream: statement::lock_stream::Query::render(&values),
             try_lock_stream: typed::Rendered::variant::<statement::try_lock_stream::Query>(&values),

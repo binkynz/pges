@@ -14,7 +14,8 @@
 --
 -- `bumped` repeats the `stream_id = ANY($1)` of `locked`: the join alone does not prune the hash partitions of
 -- streams, so without it every custom plan expands the update over all of them. Every i.stream_id comes from
--- unnest($1), so the filter changes nothing else.
+-- unnest($1), so the filter changes nothing else. The statement always runs with custom plans
+-- (append/begin_many.sql, append/plan_mode.sql): a generic plan locks every partition.
 WITH locked AS MATERIALIZED (
   SELECT s.stream_id FROM {store}.streams s
   WHERE s.stream_id = ANY($1::uuid[])

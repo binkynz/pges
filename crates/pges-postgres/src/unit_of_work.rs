@@ -13,7 +13,8 @@ use crate::{append, error, sql, store};
 ///
 /// Separate [`UnitOfWork::append`] calls lock streams in call order, so two units of work appending to the
 /// same streams in different orders can deadlock; the loser fails with a retryable database error.
-/// [`UnitOfWork::append_many`] locks in stream id order.
+/// [`UnitOfWork::append_many`] locks in stream id order. It sets `plan_cache_mode = force_custom_plan` for
+/// its own statements and puts the transaction's previous value back after them.
 ///
 /// After an append fails in a way that aborts or partly writes the transaction (a database error, a
 /// duplicate or skewed commit id, or any [`UnitOfWork::append_many`] failure), or a statement of the caller's

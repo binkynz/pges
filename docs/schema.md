@@ -86,8 +86,7 @@ types travel inside the payload frame instead, and subscribers filter after deco
 fixed for the life of the store. 64 suits up to about 1B streams (about 2.9 GB of heap and primary key per
 partition there, still 3–4 B-tree levels). More partitions do not slow single appends, which name their
 stream's partition (Append (one stream)) whatever the statistics, but `append_many` locks 4 relations per
-partition it touches, and every partition when the plan cache keeps a generic plan for it (Append (several
-streams)). Single appends keep one prepared statement per partition on each connection when the pool's
+partition it touches (Append (several streams)). Single appends keep one prepared statement per partition on each connection when the pool's
 statement cache holds them with 36 entries to spare (sqlx's default of 100 holds 64); with more partitions,
 or with `StoreConfig::append_routing` set to `AppendRouting::Streams`, they go through `streams` with one
 prepared statement (Append (one stream)).
@@ -327,6 +326,17 @@ row.
 - Outbox stores add the `pending` insert as for one stream, ordered by `commit_id`.
 - Outside a unit of work the statement runs in its own transaction (BEGIN, statement, COMMIT), because one
   statement can partly apply. All succeed or the crate rolls the transaction back.
+- Custom plans, whatever the statistics and the role's or session's `plan_cache_mode`. The statement goes
+  through `streams`, and only a custom plan prunes its hash partitions: PostgreSQL 18 locks every partition
+  of a generic plan before run-time pruning. So the transaction begins with
+  `crates/pges-postgres/sql/append/begin_many.sql`, `BEGIN; SET LOCAL plan_cache_mode = force_custom_plan`
+  in one simple-query round trip (`Connection::begin_with`), and its classification and retry statements
+  are custom-planned too. The setting ends with the transaction. Inside a unit of work the caller owns the
+  transaction, so the batch sets the mode with `crates/pges-postgres/sql/append/plan_mode.sql`, which
+  returns the previous value, and sets that back after the batch: two more round trips, and one more
+  prepared statement on connections that run it. If the batch fails, its error is returned and the
+  transaction must be rolled back anyway; a unit of work dropped between the two keeps `force_custom_plan`
+  until its transaction ends.
 - Streams missing from `RETURNING` are classified one by one with the single-stream query. Before a
   retryable stream is sent again (alone, in the same transaction), the crate locks its row, and for an
   out-of-order generated id picks the new id under that lock. `locked` locks only the streams that existed
@@ -356,20 +366,22 @@ row.
 - `bumped` repeats `stream_id = ANY($1)`: the join alone does not prune `streams`' hash partitions, so custom
   plans would plan the update over all of them (0.8–1.7 ms of planning per call at 64 partitions; 0.36 ms
   with it). Semantics are unchanged: every `i.stream_id` comes from `unnest($1)`.
-- After a store is created, connections that ran `append_many` on empty tables can keep a generic plan with a
-  sequential scan and hash join over every `streams` partition (about 6 ms per batch at 100k streams) until
-  autovacuum analyses a `streams` leaf (not yet addressed).
-- Locks (64 partitions; pinned by `a_batch_locks_the_streams_partitions_it_touches`): with a custom plan, 4
-  per partition the batch touches (`locked` and `bumped`, each on the partition and its key; 13 relation
-  locks in all for one stream, 169 for 64 streams over 40 partitions). The batch still goes through
-  `streams`, so a generic plan locks every partition: 128 locks on partitions when they were analyzed with 3
-  streams in all, 256 with `force_generic_plan`. The plan cache also kept the generic plan for batches of 16
-  on a store of 2,000 streams (about 30 per partition) created by one batch and analyzed, though not for the
-  same store built by single appends. Not fixed: running the batch unprepared gives custom plans in every
-  statistics regime (128 → 10 partition locks nearly empty), but cost 20–25% of batches per second at
-  concurrency 1 (batches of 16, 545 → 420/s) and about 7% at concurrency 16; naming partitions would need a
-  statement text per set of partitions, so unprepared too, and a lock order by partition. A batch's 4 locks
-  per partition are two lock modes on two relations, inherent to locking rows before updating them.
+- After a store is created, connections that ran `append_many` on empty tables could keep a generic plan
+  with a sequential scan and hash join over every `streams` partition (about 6 ms per batch at 100k
+  streams) until autovacuum analysed a `streams` leaf. Custom plans (above) end that.
+- Locks (64 partitions; pinned by `a_batch_locks_the_streams_partitions_it_touches` and
+  `a_batch_in_its_own_transaction_plans_for_its_streams`): 4 per partition the batch touches (`locked` and
+  `bumped`, each on the partition and its key; 13 relation locks in all for one stream, 169 for 64 streams
+  over 40 partitions), with statistics never gathered, gathered nearly empty, and under
+  `force_generic_plan`, with routing on or off. With the plan cache's own choice a generic plan locked every
+  partition: 128 locks on partitions when they were analyzed with 3 streams in all, 256 with
+  `force_generic_plan`; the plan cache also kept the generic plan for batches of 16 on a store of 2,000
+  streams (about 30 per partition) created by one batch and analyzed. A batch's 4 locks per partition are
+  two lock modes on two relations, inherent to locking rows before updating them.
+- Cost: a populated store's batches were custom-planned already (about 1.2 ms of planning and 2.1 ms of
+  execution per batch of 16 at 1M streams and 64 partitions), so forcing custom plans costs nothing there;
+  where the plan cache chose a generic plan it was slower than the custom one at 1M streams (it reads
+  every partition). Batches per second: design.md, Decided, `append_many` plans for its streams.
 
 ### Read one stream
 
