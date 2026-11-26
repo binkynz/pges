@@ -10,9 +10,11 @@ pub mod statement;
 pub mod template;
 pub mod typed;
 
+use uuid::Uuid;
+
 use pges_core::{category, store as core_store};
 
-use crate::{sql::typed::Query as _, store};
+use crate::{route, sql::typed::Query as _, store};
 
 /// The validated name of an opened store, for rendering another crate's statements.
 pub fn store_name(store: &store::Store) -> &core_store::StoreName {
@@ -21,7 +23,7 @@ pub fn store_name(store: &store::Store) -> &core_store::StoreName {
 
 /// The statements a store runs on its hot paths, rendered once when it is opened.
 pub(crate) struct StoreSql {
-    pub(crate) append: typed::Rendered<statement::append::Query>,
+    append: Append,
     pub(crate) append_many: typed::Rendered<statement::append_many::Query>,
     pub(crate) classify: typed::Rendered<statement::classify::Query>,
     pub(crate) lock_stream: typed::Rendered<statement::lock_stream::Query>,
@@ -40,17 +42,34 @@ pub(crate) struct StoreSql {
 }
 
 impl StoreSql {
-    pub(crate) fn new(store: &core_store::StoreName, outbox: store::Outbox) -> Self {
+    /// The statements of `store`. With `leaves`, a single append names its stream's partition of `streams`
+    /// (`route`), one prepared statement per partition, when they fit in `cache_capacity` (the pool's
+    /// statement cache per connection) with [`STATEMENT_CACHE_RESERVE`] to spare. Otherwise it goes through
+    /// `streams` itself, one prepared statement: more partition statements than the cache holds would evict
+    /// each other and every other statement.
+    pub(crate) fn new(
+        store: &core_store::StoreName,
+        outbox: store::Outbox,
+        leaves: Option<route::Leaves>,
+        cache_capacity: usize,
+    ) -> Self {
         let values = template::Values::new().store(store);
-        let (append, append_many) = match outbox {
-            store::Outbox::Disabled => (
-                statement::append::Query::render(&values),
-                statement::append_many::Query::render(&values),
-            ),
-            store::Outbox::Enabled => (
-                typed::Rendered::variant::<statement::append_outbox::Query>(&values),
-                typed::Rendered::variant::<statement::append_many_outbox::Query>(&values),
-            ),
+        let append_many = match outbox {
+            store::Outbox::Disabled => statement::append_many::Query::render(&values),
+            store::Outbox::Enabled => {
+                typed::Rendered::variant::<statement::append_many_outbox::Query>(&values)
+            }
+        };
+        let append = match leaves.filter(|leaves| fits(leaves, cache_capacity)) {
+            Some(leaves) => Append::Routed {
+                appends: leaves
+                    .names()
+                    .iter()
+                    .map(|leaf| render_append(&values.clone().stream_table(Some(leaf)), outbox))
+                    .collect(),
+                leaves,
+            },
+            None => Append::Parent(render_append(&values.clone().stream_table(None), outbox)),
         };
 
         Self {
@@ -72,6 +91,34 @@ impl StoreSql {
             delete_snapshot: statement::delete_snapshot::Query::render(&values),
         }
     }
+}
+
+impl StoreSql {
+    /// The single append for `stream_id`: the one naming its partition when the store routes appends.
+    pub(crate) fn append(&self, stream_id: Uuid) -> &typed::Rendered<statement::append::Query> {
+        match &self.append {
+            Append::Parent(append) => append,
+            Append::Routed { leaves, appends } => &appends[leaves.index(stream_id)],
+        }
+    }
+}
+
+/// Whether one prepared append per partition of `leaves` fits a statement cache of `capacity` per
+/// connection, with [`STATEMENT_CACHE_RESERVE`] to spare.
+fn fits(leaves: &route::Leaves, capacity: usize) -> bool {
+    leaves.names().len() + STATEMENT_CACHE_RESERVE <= capacity
+}
+
+/// Statement cache entries per connection left to the other statements when the per-partition appends are
+/// kept prepared: the store's own (about 20, one stream read per category) and the application's. sqlx's
+/// default capacity of 100 keeps the default 64 partitions prepared.
+pub(crate) const STATEMENT_CACHE_RESERVE: usize = 36;
+
+/// Lists the hash partitions of a store's `streams`, for [`route::Leaves::from_catalog`].
+pub(crate) fn stream_leaves(
+    store: &core_store::StoreName,
+) -> typed::Rendered<statement::stream_leaves::Query> {
+    statement::stream_leaves::Query::render(&template::Values::new().store(store))
 }
 
 /// Reads one stream's commits from its category's partition, one page at a time. Rendered once per category
@@ -123,5 +170,97 @@ impl AdminSql {
             raise_scan_from: statement::raise_scan_from::Query::render(&values),
             prune_category: statement::prune_category::Query::render(&values),
         }
+    }
+}
+
+/// How a store's single appends reach `streams`.
+enum Append {
+    /// Through the partitioned table. The plan cache decides whether a plan prunes it to one partition: a
+    /// generic plan locks every partition.
+    Parent(typed::Rendered<statement::append::Query>),
+    /// To the partition holding the stream: one statement per partition, by remainder.
+    Routed {
+        leaves: route::Leaves,
+        appends: Vec<typed::Rendered<statement::append::Query>>,
+    },
+}
+
+fn render_append(
+    values: &template::Values,
+    outbox: store::Outbox,
+) -> typed::Rendered<statement::append::Query> {
+    match outbox {
+        store::Outbox::Disabled => statement::append::Query::render(values),
+        store::Outbox::Enabled => {
+            typed::Rendered::variant::<statement::append_outbox::Query>(values)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The table the append of a store with `partitions` updates, when its pool's connections cache
+    /// `capacity` statements.
+    fn append_target(partitions: u16, capacity: usize) -> String {
+        let probes = route::probes();
+        let rows: Vec<statement::stream_leaves::Row> = (0..partitions)
+            .map(|remainder| statement::stream_leaves::Row {
+                leaf: format!("streams_p{remainder:03}"),
+                modulus: Some(i32::from(partitions)),
+                remainder: Some(i32::from(remainder)),
+                probes: Some(
+                    (1..)
+                        .zip(&probes)
+                        .filter(|(_, probe)| route::remainder(**probe, partitions) == remainder)
+                        .map(|(position, _)| position)
+                        .collect(),
+                ),
+            })
+            .collect();
+        let leaves = route::Leaves::from_catalog(&rows, &probes);
+        assert!(leaves.is_some());
+        let sql = StoreSql::new(
+            &pges_core::store_name!("es"),
+            store::Outbox::Disabled,
+            leaves,
+            capacity,
+        );
+        let append = sql.append(probes[0]).as_str();
+        let start = append.find("UPDATE es.").expect("an update of streams") + "UPDATE es.".len();
+
+        append[start..]
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_owned()
+    }
+
+    #[test]
+    fn appends_name_partitions_only_while_their_statements_fit_the_statement_cache() {
+        let partition_64 = format!("streams_p{:03}", route::remainder(route::probes()[0], 64));
+        let partition_256 = format!("streams_p{:03}", route::remainder(route::probes()[0], 256));
+
+        assert_eq!(append_target(64, 100), partition_64);
+        assert_eq!(append_target(64, 99), "streams");
+        assert_eq!(append_target(64, 0), "streams");
+        assert_eq!(append_target(256, 100), "streams");
+        assert_eq!(append_target(256, 291), "streams");
+        assert_eq!(append_target(256, 292), partition_256);
+    }
+
+    #[test]
+    fn without_partitions_the_append_goes_through_streams() {
+        let sql = StoreSql::new(
+            &pges_core::store_name!("es"),
+            store::Outbox::Enabled,
+            None,
+            100,
+        );
+        let append = sql.append(uuid::Uuid::nil());
+
+        assert!(append.as_str().contains("UPDATE es.streams s"));
+        assert!(append.as_str().contains("INSERT INTO es.pending"));
     }
 }

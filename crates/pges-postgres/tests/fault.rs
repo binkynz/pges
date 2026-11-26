@@ -16,7 +16,8 @@ use pges_testing::proxy;
 use common::{Fixture, JobEvent, v};
 
 /// A store on a one-connection pool through the proxy, with `JobEvent` registered and the append statement
-/// prepared on that connection, so a held response does not stop the next append before it is sent.
+/// of every `streams` partition prepared on that connection, so a held response does not stop the next
+/// append before it is sent (preparing one waits for the server's answer).
 async fn proxied_store(f: &Fixture, proxy: &proxy::Proxy) -> Result<(PgPool, store::Store)> {
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
@@ -25,12 +26,25 @@ async fn proxied_store(f: &Fixture, proxy: &proxy::Proxy) -> Result<(PgPool, sto
         .await?;
     let s = store::Store::open(pool.clone(), store::StoreConfig::new(common::STORE_NAME)).await?;
     s.register::<JobEvent>().await?;
-    s.append(
-        stream::StreamId::new_v7(),
-        version::ExpectedVersion::NoStream,
-        &[JobEvent::created("warm-up")],
+    let partitions: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_inherits WHERE inhparent = 'es.streams'::regclass",
     )
+    .fetch_one(&f.pool)
     .await?;
+    loop {
+        let written: i64 = sqlx::query_scalar("SELECT count(DISTINCT tableoid) FROM es.streams")
+            .fetch_one(&f.pool)
+            .await?;
+        if written == partitions {
+            break;
+        }
+        s.append(
+            stream::StreamId::new_v7(),
+            version::ExpectedVersion::NoStream,
+            &[JobEvent::created("warm-up")],
+        )
+        .await?;
+    }
     // sqlx pings a connection as it returns to the pool; that answer must not be held.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while pool.num_idle() == 0 {

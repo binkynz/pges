@@ -11,7 +11,7 @@ use sqlx::{Connection, PgConnection, PgPool};
 use uuid::Uuid;
 
 use pges_core::{stream, version};
-use pges_postgres::{append, store};
+use pges_postgres::{append, store, unit_of_work};
 
 use common::{Fixture, JobEvent, v};
 
@@ -310,4 +310,104 @@ async fn batches_creating_the_same_streams_never_deadlock() -> Result<()> {
     hashed_pool.close().await;
     pool.close().await;
     f.finish().await
+}
+
+/// The planner's view of `streams` when a batch runs.
+#[derive(Debug, Clone, Copy)]
+enum Regime {
+    /// Never analyzed.
+    Never,
+    /// Analyzed with 3 streams in all.
+    NearlyEmpty,
+    /// The session sets `plan_cache_mode = force_generic_plan`.
+    ForcedGeneric,
+}
+
+/// Relation locks a batch takes on the partitions of `streams`, pinned per regime. With custom plans a batch
+/// locks 4 entries per partition it touches (the row lock step and the update, each on the partition and its
+/// key). A generic plan, which the plan cache keeps for a nearly empty analyzed store and which
+/// `force_generic_plan` forces, locks every partition: the batch statement goes through `streams`, so this
+/// is a known limit (docs/schema.md, Append (several streams)).
+#[tokio::test]
+async fn a_batch_locks_the_streams_partitions_it_touches() -> Result<()> {
+    for (regime, streams, batch) in [
+        (Regime::Never, 64_usize, 1_usize),
+        (Regime::Never, 64, 4),
+        (Regime::Never, 64, 16),
+        (Regime::NearlyEmpty, 3, 2),
+        (Regime::ForcedGeneric, 64, 4),
+    ] {
+        let case = format!("{regime:?}, batch of {batch}");
+        let mut definition = pges_testing::definition(store::Outbox::Disabled);
+        definition.stream_partitions = std::num::NonZeroU16::new(64).unwrap();
+        let f = Fixture::with_definition(definition).await?;
+        let ids: Vec<stream::StreamId> = (0..streams).map(|_| stream::StreamId::new_v7()).collect();
+        let events = [JobEvent::assigned()];
+        f.store
+            .append_many(ids.iter().map(|id| {
+                append::AppendEntry::new(*id, version::ExpectedVersion::NoStream, &events)
+            }))
+            .await?;
+        if let Regime::NearlyEmpty = regime {
+            sqlx::query("ANALYZE es.streams").execute(&f.pool).await?;
+        }
+        let mut conn = f.pool.acquire().await?;
+        if let Regime::ForcedGeneric = regime {
+            sqlx::query("SET plan_cache_mode = force_generic_plan")
+                .execute(&mut *conn)
+                .await?;
+        }
+
+        // Ten batches, past the sixth execution, from which the plan cache weighs a generic plan; the last is
+        // counted.
+        let mut counted = (0, 0);
+        for round in 0..10 {
+            let batch_ids: Vec<stream::StreamId> = (0..batch)
+                .map(|i| ids[(round * batch + i) % ids.len()])
+                .collect();
+            let mut tx = conn.begin().await?;
+            let mut work = unit_of_work::UnitOfWork::wrap(&f.store, &mut tx);
+            work.append_many(
+                batch_ids.iter().map(|id| {
+                    append::AppendEntry::new(*id, version::ExpectedVersion::Any, &events)
+                }),
+            )
+            .await?;
+            work.finish().await?;
+            let partition_locks: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
+                 WHERE l.pid = pg_backend_pid() AND c.relnamespace = 'es'::regnamespace
+                   AND c.relname ~ '^streams_p[0-9]'",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            let touched: i64 = sqlx::query_scalar(
+                "SELECT count(DISTINCT tableoid) FROM es.streams WHERE stream_id = ANY($1)",
+            )
+            .bind(batch_ids.iter().map(|id| id.as_uuid()).collect::<Vec<_>>())
+            .fetch_one(&mut *tx)
+            .await?;
+            tx.rollback().await?;
+            counted = (partition_locks, touched);
+        }
+
+        let (partition_locks, touched) = counted;
+        let expected = match regime {
+            Regime::Never => 4 * touched,
+            Regime::NearlyEmpty => 2 * 64,
+            Regime::ForcedGeneric => 4 * 64,
+        };
+        assert_eq!(
+            partition_locks, expected,
+            "{case}, {touched} partitions touched"
+        );
+
+        sqlx::query("RESET plan_cache_mode")
+            .execute(&mut *conn)
+            .await?;
+        drop(conn);
+        f.finish().await?;
+    }
+
+    Ok(())
 }

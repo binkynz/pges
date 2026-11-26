@@ -205,6 +205,9 @@ pub enum Placeholder {
     Database,
     /// The name of a template database.
     Template,
+    /// The table an append writes a stream's head to: `streams`, or the hash partition of it that holds the
+    /// stream, such as `streams_p017`. Set with [`Values::stream_table`].
+    StreamTable,
 }
 
 /// The placeholders that take an [`Ident`], set with [`Values::ident`].
@@ -270,6 +273,13 @@ impl Values {
     /// Sets `{category_id}`.
     pub fn category_id(self, id: category::CategoryId) -> Self {
         self.with(Placeholder::CategoryId, id.get().to_string())
+    }
+
+    /// Sets `{stream_table}`: `streams` for `None`, otherwise the partition of `streams` named.
+    pub fn stream_table(self, partition: Option<&Ident>) -> Self {
+        let table = partition.map_or("streams", Ident::as_str);
+
+        self.with(Placeholder::StreamTable, table.to_owned())
     }
 
     /// Sets an identifier placeholder.

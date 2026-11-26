@@ -77,6 +77,17 @@ async fn queries_match_their_registry_types() -> Result<()> {
             failures.push(format!("{error:#}"));
         }
     }
+    // A store that routes its appends runs them on one partition of streams.
+    let partition = values.clone().stream_table(Some(&ident("streams_p000")));
+    for shape in statement::TYPED.iter().filter(|shape| {
+        shape.statement.name == statement::APPEND.name
+            || shape.statement.name == statement::APPEND_OUTBOX.name
+    }) {
+        if let Err(error) = pges_testing::statement::check_typed(&mut conn, shape, &partition).await
+        {
+            failures.push(format!("{error:#}"));
+        }
+    }
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 
     pool.close().await;
@@ -293,6 +304,7 @@ fn every_value(leaf: &template::Ident, category_id: category::CategoryId) -> tem
         .ident(template::IdentPlaceholder::Index, &ident("commits_jobs_s"))
         .ident(template::IdentPlaceholder::Bound, &ident("bound"))
         .range(&template::Literal::int(0), &template::Literal::int(1))
+        .stream_table(None)
 }
 
 fn ident(name: &str) -> template::Ident {

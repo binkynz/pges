@@ -6,6 +6,17 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crates
 
 ## [Unreleased]
 
+### Added
+
+- **Append partition routing** (`pges-postgres`). A single append names its stream's hash partition of
+  `streams`, so it locks only that partition whatever the planner's statistics and `plan_cache_mode`, and
+  reuses its plan (about 3x the appends per second at concurrency 1). It needs one prepared statement per
+  partition on each connection, about 130 KB of server plan-cache memory each (8.6 MB at 64 partitions), and
+  runs only while they fit sqlx's statement cache (`statement-cache-capacity >= stream_partitions + 36`; the
+  default 100 holds the default 64 partitions) and the role may write every partition directly. Otherwise
+  appends go through `streams` as before. `StoreConfig::append_routing` (`AppendRouting::Auto`, the default,
+  or `Streams`) turns it off.
+
 ## [0.1.0] - Unreleased
 
 The first release: `pges`, `pges-core`, `pges-derive`, `pges-postgres`, `pges-subscribe`, `pges-sequencer`,

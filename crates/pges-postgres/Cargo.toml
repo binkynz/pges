@@ -38,6 +38,7 @@ anyhow = "1.0.105"
 opentelemetry = { version = "0.33.1", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace"] }
 pges-testing = { path = "../pges-testing" }
+proptest = "1.11"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1.44", features = ["macros", "rt-multi-thread", "time"] }
 tracing = "0.1.41"

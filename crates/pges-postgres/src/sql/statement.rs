@@ -128,6 +128,23 @@ crate::typed_query! {
 }
 
 crate::typed_query! {
+    /// Lists the hash partitions of `streams` and the probes each holds, to route appends.
+    pub STREAM_LEAVES, mod stream_leaves {
+        name: "append/stream_leaves",
+        files: [sql_file!("append/stream_leaves.sql")],
+        params<'q> {
+            probes: &'q [Uuid],
+        },
+        row {
+            leaf: String,
+            modulus: Option<i32>,
+            remainder: Option<i32>,
+            probes: Option<Vec<i32>>,
+        },
+    }
+}
+
+crate::typed_query! {
     /// Reads a stream's bounds.
     pub STREAM_HEAD, mod stream_head {
         name: "read/stream_head",
@@ -1293,6 +1310,7 @@ pub const ALL: &[&template::Statement] = &[
     &CLASSIFY,
     &LOCK_STREAM,
     &TRY_LOCK_STREAM,
+    &STREAM_LEAVES,
     &STREAM_HEAD,
     &READ_STREAM,
     &SNAPSHOT_READ,
@@ -1390,6 +1408,7 @@ pub const TYPED: &[typed::Shape] = &[
     typed::Shape::of::<classify::Query>(),
     typed::Shape::of::<lock_stream::Query>(),
     typed::Shape::of::<try_lock_stream::Query>(),
+    typed::Shape::of::<stream_leaves::Query>(),
     typed::Shape::of::<stream_head::Query>(),
     typed::Shape::of::<read_stream::Query>(),
     typed::Shape::of::<snapshot_read::Query>(),

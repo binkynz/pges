@@ -84,10 +84,13 @@ types travel inside the payload frame instead, and subscribers filter after deco
 
 `stream_partitions` is a store-creation parameter (`StoreDefinition::stream_partitions`, default 64). It is
 fixed for the life of the store. 64 suits up to about 1B streams (about 2.9 GB of heap and primary key per
-partition there, still 3–4 B-tree levels). More partitions no longer slow single appends, which prune to
-their stream's partition (Append (one stream)), but `append_many` still locks 4 relations per partition it
-touches, and generic plans lock them all. A store analyzed while nearly empty still locks every partition per
-append until its partitions hold a few dozen streams.
+partition there, still 3–4 B-tree levels). More partitions do not slow single appends, which name their
+stream's partition (Append (one stream)) whatever the statistics, but `append_many` locks 4 relations per
+partition it touches, and every partition when the plan cache keeps a generic plan for it (Append (several
+streams)). Single appends keep one prepared statement per partition on each connection when the pool's
+statement cache holds them with 36 entries to spare (sqlx's default of 100 holds 64); with more partitions,
+or with `StoreConfig::append_routing` set to `AppendRouting::Streams`, they go through `streams` with one
+prepared statement (Append (one stream)).
 
 `streams` partitions are created with `fillfactor = 70`, `autovacuum_vacuum_scale_factor` 0.02, as
 `snapshots` has, and `autovacuum_vacuum_insert_scale_factor` 0.05, as leaves and log partitions have. With PostgreSQL's 0.2, a partition of 1.56M rows (100M streams)
@@ -183,18 +186,55 @@ outbox stores. `input` holds the stream, category, expected version (-1 `NoStrea
 `created` inserts a new stream, `bumped` updates an existing one, and the commit is inserted for whichever
 returned a row.
 
-- `bumped` filters on `s.stream_id = $1` besides the join with the materialized `input`, so a custom plan
-  prunes `streams` to the stream's hash partition when it is planned: 9 relation locks per append, against
-  134 at 64 partitions and 518 at 256 before. `created` locks only its partition: an insert routes its row
-  when it runs. The plan cache keeps custom plans because the generic plan costs the update of every
-  partition. It plans a generic one once per connection (6th execution, and again after an invalidation such
-  as an autoanalyze), which locks every partition in that transaction. PG18 locks every partition of a
-  generic plan before run-time pruning, so `plan_cache_mode = force_generic_plan` on the writer role brings
-  the fan-out back (71 locks). Exception: when the `streams` partitions were analyzed nearly empty (a few
-  streams each), the generic plan looks cheaper and is kept; it locks every partition but not their indexes
-  (70 at 64 partitions). From about 15 streams per partition (1,000 streams at 64 partitions), custom plans
-  win. Measured at 1M streams and concurrency 64: 256 partitions went from 2.4–5.7k to 12.5–14.7k appends/s,
-  the same as 64.
+- The append names the hash partition of `streams` that holds the stream (`{stream_table}`, such as
+  `streams_p017`), so no plan has partitions to prune and the append's locks do not depend on statistics or
+  `plan_cache_mode`: 7 relation locks (9 with the outbox) in every regime measured (`streams` never
+  analyzed, analyzed at 30 streams per partition, analyzed with 3 streams in all, `force_generic_plan`). The insert into a partition also takes a lock on `streams` itself, to check the
+  partition's bound. Through `streams`, a custom plan prunes to the stream's partition (9 locks), but the
+  plan cache keeps a generic plan when the partitions were analyzed nearly empty, and PG18 locks every
+  partition of a generic plan before run-time pruning: 70 locks at 64 partitions, 71 with
+  `force_generic_plan` (135 unprepared), and every sixth execution planned a generic plan once (again after
+  each autoanalyze invalidated it), locking every partition in that transaction.
+- Routing (`crates/pges-postgres/src/route.rs`): PostgreSQL routes a row to remainder
+  `hash_combine64(0, uuid_hash_extended(id, HASH_PARTITION_SEED)) % modulus` (`partbounds.c`); the crate
+  computes the same, a port of lookup3 for 16 bytes on a little-endian server. `Store::open` lists the
+  partitions with `crates/pges-postgres/sql/append/stream_leaves.sql`, with 32 fixed probe ids, and routes
+  only when every partition has one modulus, each remainder below it has one plain partition in the store's
+  schema whose name needs no quoting and that the current role may select, insert and update directly
+  (privileges granted on `streams` cover only statements through it), and `satisfies_hash_partition` puts
+  every probe where the crate does. Otherwise (a big-endian server, a partition detached, being detached or
+  renamed, a role granted only `streams`) the append goes through `streams` as above, and so it does when
+  the partition statements do not fit the statement cache (below) or `StoreConfig::append_routing` is
+  `AppendRouting::Streams`. The routing is read
+  once at open: DDL that moves partitions afterwards (which the crate never runs) makes appends fail (a new
+  stream's with a partition constraint violation, 23514), or, for a detached partition, write to the
+  detached table, until the store is opened again. A property
+  test checks the hash against `satisfies_hash_partition` for random ids at every modulus from 1 to 256,
+  and against the `tableoid` of inserted rows.
+- One statement text per partition, so they cost statement cache entries and server memory: about 130 KB of
+  plan cache per prepared partition statement and connection (8.6 MB for 64, against 0.6 MB for the one
+  statement through `streams`, most of it the generic plan of 64 partitions it planned once). The store
+  routes appends only when the partition statements fit in the pool's statement cache
+  (`statement-cache-capacity`, read at open from the pool's options) with 36 entries to spare for its other
+  statements and the application's (`stream_partitions + 36 <= capacity`); otherwise the append goes through
+  `streams` with one prepared statement, as before routing, so they do not evict each other. sqlx's default of
+  100 holds the default 64 partitions. Running the partition statements unprepared instead was measured and
+  rejected: a Parse round trip per append made 256 partitions with the default cache 30–35% slower than the
+  prepared statement through `streams` (below). A pool that several stores share, or that runs many
+  statements of its own, should raise the capacity by `stream_partitions` per store, or turn routing off.
+- A prepared partition statement is planned only for its first five runs on a connection; the plan cache
+  then keeps its generic plan, which is as good as a custom one. Through `streams` every append was planned
+  (custom plans). Concurrency 1, 1M streams, `synchronous_commit = off` (so the WAL flush does not hide the
+  CPU): 64 partitions 5.0k → 15.0k appends/s (p50 0.2 → 0.1 ms); 256 partitions with
+  `statement-cache-capacity=400` 14.5k/s (with the default cache they go through `streams`, 5.0k/s as
+  before; unprepared partition statements measured 3.5k/s). With 3 streams analyzed (new streams): 5.6–7.2k
+  → 17.8k/s. Under `force_generic_plan` the statement through `streams` was not planned per append either:
+  64 partitions 13.3k → 14.5k/s; 256 partitions 10.3k/s through `streams` (unprepared partition statements
+  3.3k/s, 14.4k/s prepared with a cache of 400). At concurrency 64 with durable commits the
+  runs are bound by the WAL flush and within the box's noise (12–28k/s before and after, every regime).
+- `bumped` also filters on `s.stream_id = $1` besides the join with the materialized `input`: through
+  `streams`, the join alone would not prune even a custom plan (134 locks at 64 partitions, 518 at 256).
+  `created` locks only its partition: an insert routes its row when it runs.
 - The client always generates the commit id (uuidv7 from the `uuid` crate), so the crate can retry after a
   lost response. `pges.check_commit_id` raises SQLSTATE `PGE01` when the id's timestamp is more than the
   writer's skew (`$9`: `StoreConfig::max_clock_skew`, or the store's recorded value when `None`) from
@@ -319,6 +359,17 @@ row.
 - After a store is created, connections that ran `append_many` on empty tables can keep a generic plan with a
   sequential scan and hash join over every `streams` partition (about 6 ms per batch at 100k streams) until
   autovacuum analyses a `streams` leaf (not yet addressed).
+- Locks (64 partitions; pinned by `a_batch_locks_the_streams_partitions_it_touches`): with a custom plan, 4
+  per partition the batch touches (`locked` and `bumped`, each on the partition and its key; 13 relation
+  locks in all for one stream, 169 for 64 streams over 40 partitions). The batch still goes through
+  `streams`, so a generic plan locks every partition: 128 locks on partitions when they were analyzed with 3
+  streams in all, 256 with `force_generic_plan`. The plan cache also kept the generic plan for batches of 16
+  on a store of 2,000 streams (about 30 per partition) created by one batch and analyzed, though not for the
+  same store built by single appends. Not fixed: running the batch unprepared gives custom plans in every
+  statistics regime (128 → 10 partition locks nearly empty), but cost 20–25% of batches per second at
+  concurrency 1 (batches of 16, 545 → 420/s) and about 7% at concurrency 16; naming partitions would need a
+  statement text per set of partitions, so unprepared too, and a lock order by partition. A batch's 4 locks
+  per partition are two lock modes on two relations, inherent to locking rows before updating them.
 
 ### Read one stream
 
