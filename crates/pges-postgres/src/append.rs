@@ -66,8 +66,10 @@ impl store::Store {
 
     /// Appends to several streams in one statement and one transaction: all succeed or none do.
     ///
-    /// The entries are sorted by stream id, so concurrent calls lock streams in the same order. A batch
-    /// naming a stream twice fails with [`AppendError::DuplicateStream`]. The results are in entry order.
+    /// The entries are sorted by stream id, so concurrent calls lock streams in the same order. The statement
+    /// is planned for its streams (a custom plan) whatever the planner's statistics and `plan_cache_mode`,
+    /// so a batch locks only the partitions of `streams` its streams live in. A batch naming a stream twice
+    /// fails with [`AppendError::DuplicateStream`]. The results are in entry order.
     pub fn append_many<'a>(
         &'a self,
         entries: impl IntoIterator<Item = AppendEntry<'a>>,
@@ -486,13 +488,7 @@ impl<'a> AppendMany<'a> {
             Target::Connection {
                 store, conn, state, ..
             } => {
-                let result = match append_many_on(store, conn, &mut prepared, LockWait::Wait).await
-                {
-                    Ok(Batch::Written(results)) => Ok(results),
-                    // Waiting for locks never asks for a restart.
-                    Ok(Batch::Restart) => Err(out_of_order(&prepared[0])),
-                    Err(error) => Err(error),
-                };
+                let result = append_many_with_custom_plans(store, conn, &mut prepared).await;
                 // A failed batch may have written some of its streams; only a rollback undoes that.
                 if let (Err(_), Some(state)) = (&result, state) {
                     *state = unit_of_work::State::Failed;
@@ -1375,7 +1371,7 @@ async fn append_many_pooled(
         let mut conn = store.inner.pool.acquire().await?;
         let result = async {
             loop {
-                let mut tx = conn.begin().await?;
+                let mut tx = conn.begin_with(statement::BEGIN_MANY.sql()).await?;
                 match append_many_on(store, &mut tx, prepared, LockWait::Skip).await? {
                     Batch::Written(results) => {
                         tx.commit().await?;
@@ -1397,6 +1393,51 @@ async fn append_many_pooled(
             other => return other,
         }
     }
+}
+
+/// Appends a batch in the caller's transaction, with custom plans for its statements
+/// (`append/plan_mode.sql`); the transaction's plan mode is put back afterwards.
+async fn append_many_with_custom_plans(
+    store: &store::Store,
+    conn: &mut PgConnection,
+    prepared: &mut [Prepared],
+) -> Result<Vec<AppendResult>, AppendError> {
+    let previous = set_plan_mode(store, conn, CUSTOM_PLANS).await?;
+
+    let result = match append_many_on(store, conn, prepared, LockWait::Wait).await {
+        Ok(Batch::Written(results)) => Ok(results),
+        // Waiting for locks never asks for a restart.
+        Ok(Batch::Restart) => Err(out_of_order(&prepared[0])),
+        Err(error) => Err(error),
+    };
+    // After a failure the transaction may be aborted, and must be rolled back anyway: the batch's error is
+    // the one to report.
+    let restored = set_plan_mode(store, conn, &previous).await;
+
+    let results = result?;
+    restored?;
+    Ok(results)
+}
+
+/// The `plan_cache_mode` an `append_many` runs its statements with: custom plans prune `streams` to the
+/// batch's partitions whatever the statistics (`append/begin_many.sql`).
+const CUSTOM_PLANS: &str = "force_custom_plan";
+
+/// Sets `plan_cache_mode` until the transaction ends and returns the value it had.
+async fn set_plan_mode(
+    store: &store::Store,
+    conn: &mut PgConnection,
+    mode: &str,
+) -> Result<String, sqlx::Error> {
+    let row = store
+        .inner
+        .sql
+        .plan_mode
+        .bind(statement::plan_mode::Params { mode })
+        .fetch_one(conn)
+        .await?;
+
+    Ok(row.previous)
 }
 
 /// Runs the batch statement, then classifies each stream it did not write. Streams that should be retried

@@ -1,4 +1,5 @@
-//! `append_many` under concurrency: the SKIP LOCKED restart and lock order (`append/many_head.sql`).
+//! `append_many` under concurrency: the SKIP LOCKED restart and lock order (`append/many_head.sql`), and the
+//! partitions a batch locks in every planner regime (`append/begin_many.sql`, `append/plan_mode.sql`).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -313,7 +314,7 @@ async fn batches_creating_the_same_streams_never_deadlock() -> Result<()> {
 }
 
 /// The planner's view of `streams` when a batch runs.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Regime {
     /// Never analyzed.
     Never,
@@ -323,36 +324,74 @@ enum Regime {
     ForcedGeneric,
 }
 
-/// Relation locks a batch takes on the partitions of `streams`, pinned per regime. With custom plans a batch
-/// locks 4 entries per partition it touches (the row lock step and the update, each on the partition and its
-/// key). A generic plan, which the plan cache keeps for a nearly empty analyzed store and which
-/// `force_generic_plan` forces, locks every partition: the batch statement goes through `streams`, so this
-/// is a known limit (docs/schema.md, Append (several streams)).
+/// A store with 64 partitions whose `streams` hold `streams` streams, created by one batch, in `regime`.
+async fn regime_store(
+    regime: Regime,
+    outbox: store::Outbox,
+    routing: store::AppendRouting,
+    streams: usize,
+) -> Result<(Fixture, store::Store, Vec<stream::StreamId>)> {
+    let mut definition = pges_testing::definition(outbox);
+    definition.stream_partitions = std::num::NonZeroU16::new(64).unwrap();
+    let f = Fixture::with_definition(definition).await?;
+    let mut config = store::StoreConfig::new(common::STORE_NAME);
+    config.append_routing = routing;
+    let store = store::Store::open(f.pool.clone(), config).await?;
+    let ids: Vec<stream::StreamId> = (0..streams).map(|_| stream::StreamId::new_v7()).collect();
+    let events = [JobEvent::assigned()];
+    store
+        .append_many(
+            ids.iter().map(|id| {
+                append::AppendEntry::new(*id, version::ExpectedVersion::NoStream, &events)
+            }),
+        )
+        .await?;
+    if regime == Regime::NearlyEmpty {
+        sqlx::query("ANALYZE es.streams").execute(&f.pool).await?;
+    }
+
+    Ok((f, store, ids))
+}
+
+/// Relation locks a batch takes on the partitions of `streams`, pinned per regime: 4 per partition it
+/// touches (the row lock step and the update, each on the partition and its key), whatever the statistics
+/// and the session's `plan_cache_mode`, with routing on or off and with the outbox. The batch statement goes
+/// through `streams` and prunes its partitions only in a custom plan; inside a unit of work it sets
+/// `force_custom_plan` for itself and puts the transaction's mode back. With the plan cache's own choice, a
+/// store analyzed nearly empty locked all 64 partitions twice (128) and `force_generic_plan` 256.
 #[tokio::test]
 async fn a_batch_locks_the_streams_partitions_it_touches() -> Result<()> {
-    for (regime, streams, batch) in [
-        (Regime::Never, 64_usize, 1_usize),
-        (Regime::Never, 64, 4),
-        (Regime::Never, 64, 16),
-        (Regime::NearlyEmpty, 3, 2),
-        (Regime::ForcedGeneric, 64, 4),
+    use store::AppendRouting::{Auto, Streams};
+
+    for (regime, outbox, routing, streams, batch) in [
+        (
+            Regime::Never,
+            store::Outbox::Disabled,
+            Auto,
+            64_usize,
+            1_usize,
+        ),
+        (Regime::Never, store::Outbox::Disabled, Auto, 64, 4),
+        (Regime::Never, store::Outbox::Disabled, Auto, 64, 16),
+        (Regime::NearlyEmpty, store::Outbox::Disabled, Auto, 3, 2),
+        (Regime::NearlyEmpty, store::Outbox::Enabled, Auto, 3, 2),
+        (Regime::NearlyEmpty, store::Outbox::Disabled, Streams, 3, 2),
+        (Regime::ForcedGeneric, store::Outbox::Disabled, Auto, 64, 4),
+        (Regime::ForcedGeneric, store::Outbox::Disabled, Auto, 64, 16),
+        (Regime::ForcedGeneric, store::Outbox::Enabled, Auto, 64, 16),
+        (
+            Regime::ForcedGeneric,
+            store::Outbox::Disabled,
+            Streams,
+            64,
+            4,
+        ),
     ] {
-        let case = format!("{regime:?}, batch of {batch}");
-        let mut definition = pges_testing::definition(store::Outbox::Disabled);
-        definition.stream_partitions = std::num::NonZeroU16::new(64).unwrap();
-        let f = Fixture::with_definition(definition).await?;
-        let ids: Vec<stream::StreamId> = (0..streams).map(|_| stream::StreamId::new_v7()).collect();
+        let case = format!("{regime:?}, {outbox:?}, {routing:?}, batch of {batch}");
+        let (f, store, ids) = regime_store(regime, outbox, routing, streams).await?;
         let events = [JobEvent::assigned()];
-        f.store
-            .append_many(ids.iter().map(|id| {
-                append::AppendEntry::new(*id, version::ExpectedVersion::NoStream, &events)
-            }))
-            .await?;
-        if let Regime::NearlyEmpty = regime {
-            sqlx::query("ANALYZE es.streams").execute(&f.pool).await?;
-        }
         let mut conn = f.pool.acquire().await?;
-        if let Regime::ForcedGeneric = regime {
+        if regime == Regime::ForcedGeneric {
             sqlx::query("SET plan_cache_mode = force_generic_plan")
                 .execute(&mut *conn)
                 .await?;
@@ -366,7 +405,7 @@ async fn a_batch_locks_the_streams_partitions_it_touches() -> Result<()> {
                 .map(|i| ids[(round * batch + i) % ids.len()])
                 .collect();
             let mut tx = conn.begin().await?;
-            let mut work = unit_of_work::UnitOfWork::wrap(&f.store, &mut tx);
+            let mut work = unit_of_work::UnitOfWork::wrap(&store, &mut tx);
             work.append_many(
                 batch_ids.iter().map(|id| {
                     append::AppendEntry::new(*id, version::ExpectedVersion::Any, &events)
@@ -387,18 +426,25 @@ async fn a_batch_locks_the_streams_partitions_it_touches() -> Result<()> {
             .bind(batch_ids.iter().map(|id| id.as_uuid()).collect::<Vec<_>>())
             .fetch_one(&mut *tx)
             .await?;
+            let mode: String = sqlx::query_scalar("SELECT current_setting('plan_cache_mode')")
+                .fetch_one(&mut *tx)
+                .await?;
+            let expected_mode = match regime {
+                Regime::ForcedGeneric => "force_generic_plan",
+                _ => "auto",
+            };
+            assert_eq!(
+                mode, expected_mode,
+                "{case}: the transaction's plan mode is put back"
+            );
             tx.rollback().await?;
             counted = (partition_locks, touched);
         }
 
         let (partition_locks, touched) = counted;
-        let expected = match regime {
-            Regime::Never => 4 * touched,
-            Regime::NearlyEmpty => 2 * 64,
-            Regime::ForcedGeneric => 4 * 64,
-        };
         assert_eq!(
-            partition_locks, expected,
+            partition_locks,
+            4 * touched,
             "{case}, {touched} partitions touched"
         );
 
@@ -406,6 +452,76 @@ async fn a_batch_locks_the_streams_partitions_it_touches() -> Result<()> {
             .execute(&mut *conn)
             .await?;
         drop(conn);
+        f.finish().await?;
+    }
+
+    Ok(())
+}
+
+/// A batch in its own transaction runs with custom plans whatever the statistics and the role's or
+/// session's `plan_cache_mode`, so the batch statement prunes `streams` to the batch's partitions, and the
+/// setting ends with the transaction. On a one-connection pool whose sessions force generic plans, and on a
+/// store analyzed nearly empty, ten batches plan the batch statement ten times as custom plans and never
+/// as a generic one (`pg_prepared_statements`); the session keeps its own mode.
+#[tokio::test]
+async fn a_batch_in_its_own_transaction_plans_for_its_streams() -> Result<()> {
+    for regime in [Regime::NearlyEmpty, Regime::ForcedGeneric] {
+        let (f, _, ids) = regime_store(
+            regime,
+            store::Outbox::Disabled,
+            store::AppendRouting::Auto,
+            64,
+        )
+        .await?;
+        let forced = regime == Regime::ForcedGeneric;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .after_connect(move |conn, _| {
+                Box::pin(async move {
+                    if forced {
+                        sqlx::Executor::execute(conn, "SET plan_cache_mode = force_generic_plan")
+                            .await?;
+                    }
+                    Ok(())
+                })
+            })
+            .connect(f.db.url())
+            .await?;
+        let store =
+            store::Store::open(pool.clone(), store::StoreConfig::new(common::STORE_NAME)).await?;
+        let events = [JobEvent::assigned()];
+
+        for round in 0..10 {
+            store
+                .append_many((0..4).map(|i| {
+                    append::AppendEntry::new(
+                        ids[(round * 4 + i) % ids.len()],
+                        version::ExpectedVersion::Any,
+                        &events,
+                    )
+                }))
+                .await?;
+        }
+
+        let mut conn = pool.acquire().await?;
+        let (generic, custom): (i64, i64) = sqlx::query_as(
+            "SELECT generic_plans, custom_plans FROM pg_prepared_statements
+             WHERE statement LIKE 'WITH locked AS MATERIALIZED%'",
+        )
+        .fetch_one(&mut *conn)
+        .await?;
+        let mode: String = sqlx::query_scalar("SELECT current_setting('plan_cache_mode')")
+            .fetch_one(&mut *conn)
+            .await?;
+        assert_eq!((generic, custom), (0, 10), "{regime:?}");
+        assert_eq!(
+            mode,
+            if forced { "force_generic_plan" } else { "auto" },
+            "{regime:?}"
+        );
+
+        drop(conn);
+        pool.close().await;
         f.finish().await?;
     }
 

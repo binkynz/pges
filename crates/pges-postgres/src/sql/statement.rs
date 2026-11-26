@@ -84,6 +84,30 @@ crate::typed_query! {
     }
 }
 
+/// Begins an `append_many` transaction whose statements are planned for their parameters.
+pub const BEGIN_MANY: template::Statement = template::Statement {
+    name: "append/begin_many",
+    files: &[sql_file!("append/begin_many.sql")],
+    kind: template::Kind::Ddl,
+    params: &[],
+    columns: &[],
+};
+
+crate::typed_query! {
+    /// Sets `plan_cache_mode` for the rest of the transaction and returns its previous value.
+    pub PLAN_MODE, mod plan_mode {
+        name: "append/plan_mode",
+        files: [sql_file!("append/plan_mode.sql")],
+        params<'q> {
+            mode: &'q str,
+        },
+        row {
+            previous: String,
+            current: String,
+        },
+    }
+}
+
 crate::typed_query! {
     /// Finds out why an append returned no row.
     pub CLASSIFY, mod classify {
@@ -1307,6 +1331,8 @@ pub const ALL: &[&template::Statement] = &[
     &APPEND_OUTBOX,
     &APPEND_MANY,
     &APPEND_MANY_OUTBOX,
+    &BEGIN_MANY,
+    &PLAN_MODE,
     &CLASSIFY,
     &LOCK_STREAM,
     &TRY_LOCK_STREAM,
@@ -1405,6 +1431,7 @@ pub const TYPED: &[typed::Shape] = &[
     typed::Shape::of::<append_outbox::Query>(),
     typed::Shape::of::<append_many::Query>(),
     typed::Shape::of::<append_many_outbox::Query>(),
+    typed::Shape::of::<plan_mode::Query>(),
     typed::Shape::of::<classify::Query>(),
     typed::Shape::of::<lock_stream::Query>(),
     typed::Shape::of::<try_lock_stream::Query>(),

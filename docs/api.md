@@ -520,7 +520,8 @@ pub struct StoreDefinition {                             // what a store is crea
   ones the store was created with. Routing is fixed at open. `AppendRouting::Streams`: appends always go
   through `streams` with one prepared statement; a generic plan (a nearly empty analyzed store, or
   `plan_cache_mode = force_generic_plan`) then locks every partition. `append_many` always goes through
-  `streams`.
+  `streams`, with custom plans whatever the statistics and `plan_cache_mode`, so it locks only the
+  partitions of its streams (4 locks each).
 
 Statement cache and memory: routed appends prepare one statement per partition on each connection. Each costs
 about 130 KB of server plan-cache memory per connection: about 8.6 MB per connection at the default 64
@@ -553,8 +554,10 @@ set `append_routing` to `AppendRouting::Streams`.
   concurrent batches lock in the same order whatever plan PostgreSQL picks. It is all or nothing and returns
   per-stream results in entry order. A batch naming a stream twice fails with `AppendError::DuplicateStream`.
   A tuple array cannot mix event types, hence `AppendEntry`. `.metadata(m)` applies to every commit. Outside
-  a unit of work it runs in its own transaction (BEGIN, statement, COMMIT: three round trips), and starts
-  over in a new transaction when a stream it must retry is locked by another one (schema.md, Several
+  a unit of work it runs in its own transaction (BEGIN with `SET LOCAL plan_cache_mode =
+  force_custom_plan`, statement, COMMIT: three round trips), and starts over in a new transaction when a
+  stream it must retry is locked by another one. Inside a unit of work it sets `force_custom_plan` before
+  the statement and the transaction's previous mode after it (two more round trips) (schema.md, Several
   streams).
 - `UnitOfWork`: after a `DuplicateCommit`, a `CommitIdSkew`, a database error or any `append_many` failure,
   the transaction is unusable. `commit()` then rolls back and returns `TransactionError::Aborted` (also when
