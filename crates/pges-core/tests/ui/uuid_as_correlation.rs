@@ -2,5 +2,6 @@ use pges_core::metadata;
 
 fn main() {
     let mut meta = metadata::Metadata::default();
-    meta.correlation_id = Some(uuid::Uuid::now_v7());
+    let correlation: metadata::CorrelationId = uuid::Uuid::now_v7();
+    meta.correlation_id = Some(correlation);
 }
