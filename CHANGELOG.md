@@ -29,6 +29,13 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crates
   more prepared statement on that connection). Stores where the plan cache chose a cheap generic plan now
   plan every batch: about 1 ms more per batch of 16.
 
+### Fixed
+
+- **The logical source ends only walsenders** (`pges-sequencer`). Before `START_REPLICATION` it ended
+  whichever process held the slot, including a session running `pg_drop_replication_slot` or another slot
+  function. A drop ended mid-call could remove the slot while its client saw an error. Now only a walsender
+  holding the slot is ended; another session is waited for, as before, up to `LogicalConfig::start_timeout`.
+
 ## [0.1.0] - Unreleased
 
 The first release: `pges`, `pges-core`, `pges-derive`, `pges-postgres`, `pges-subscribe`, `pges-sequencer`,

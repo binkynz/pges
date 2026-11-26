@@ -666,6 +666,9 @@ The logical source, before every `START_REPLICATION`, ends the walsender still h
 leader's, or its own previous connection's), which would otherwise hold it until `wal_sender_timeout`
 (`crates/pges-sequencer/sql/logical/terminate_holder.sql`).
 
+- It ends only a walsender (`pg_stat_replication`). Another session holds the slot only while it runs a
+  slot function such as `pg_drop_replication_slot`. Ending it mid-call can complete the drop while its
+  client sees `terminating connection` (57P01), so the operator retries and finds the slot gone.
 - It retries `START_REPLICATION` while the slot is still active (55006), ending the holder again before each
   try, with a pause doubling from 10 ms to 1 s, for up to `LogicalConfig::start_timeout` (30 s), then fails
   transiently. Every retry opens a new replication connection (`START_REPLICATION` consumes it).
