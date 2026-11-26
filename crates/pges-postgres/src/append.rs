@@ -1118,7 +1118,7 @@ async fn run_append(
     let row = store
         .inner
         .sql
-        .append
+        .append(prepared.stream_id.as_uuid())
         .bind(statement::append::Params {
             stream_id: prepared.stream_id.as_uuid(),
             category_id: prepared.category.id.get(),

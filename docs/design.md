@@ -1736,12 +1736,45 @@ the halt, 43 recovered, 335 after.
 - Append and stream-read pruning (2026-11-26; schema.md, Append (one stream), Read one
   stream):
   - Single appends prune `streams` by a parameter filter (`s.stream_id = $1`) and rely on custom plans,
-    because PG18 locks every partition of a generic plan. Custom plans are chosen by cost, so tiny (nearly
-    empty, analyzed) stores and `force_generic_plan` keep the fan-out. Unnamed statements
-    (`persistent(false)`, a parse per append) or routing to the hash partition in Rust (replicating
-    `hash_uuid_extended`, 64–256 statement texts) would fix that; not done yet.
+    because PG18 locks every partition of a generic plan. Superseded for single appends by the routing below
+   ; still how `append_many` prunes.
   - Stream reads are bounded above by `last_commit_id`, and a read is a cut at its head: commits appended
     while it pages are not returned, as snapshots are already checked against `streams.version`.
+- Single appends name their stream's partition (2026-11-26; schema.md, Append (one
+  stream)):
+  - The client computes PostgreSQL's hash partition routing for the stream id (`uuid_hash_extended` with
+    the partition seed, `hash_combine64`, modulo) and the append statement names `streams_pNNN`. No plan has
+    partitions to prune, so the locks (7, 9 with the outbox) are the same with statistics never gathered,
+    gathered nearly empty, and under `force_generic_plan`, where the statement through `streams` locked
+    70–71 (135 unprepared).
+  - Safe fallback: `Store::open` lists the partitions and checks 32 probe ids with
+    `satisfies_hash_partition`; any mismatch (another hash, such as a big-endian server's, mixed moduli, a
+    missing, renamed or detaching partition) keeps the statement through `streams`. Routing also requires
+    the role to select, insert and update every partition directly (a grant on `streams` covers only
+    statements through it) and the partitions to be in the store's schema; otherwise the store falls back,
+    silently, as for the other mismatches. Routing is fixed at open.
+  - Fit or fall back (2026-11-26): one prepared statement per partition while they fit in
+    the pool's statement cache with 36 entries to spare (`stream_partitions + 36 <= statement-cache-capacity`;
+    sqlx's default 100 holds 64). When they do not fit, the append goes through `streams` with its one
+    prepared statement, the path before routing; never unprepared partition statements. The
+    numbers at 256 partitions with the default cache, concurrency 1, `synchronous_commit = off`: unprepared
+    partition statements 3.0–3.1k appends/s against 4.4–4.9k/s through `streams` (3.4k against 5.9k under
+    `force_generic_plan`), and 9.6–10.8k/s prepared with a cache of 400. Prepared, an append is not planned
+    after its sixth run on a connection: 3x the appends per second at concurrency 1 at 64 partitions. The
+    price is plan-cache memory, about 130 KB per partition statement and connection (8.6 MB at 64
+    partitions against 0.6 MB).
+  - `StoreConfig::append_routing` (`AppendRouting::Auto`, the default, or `Streams`) turns routing off, for
+    a pool shared by many stores or an application that would rather spend neither the cache entries nor the
+    memory; appends then always use the prepared statement through `streams`.
+  - Rejected: unnamed statements through `streams` (custom plans whatever the statistics, but
+    `force_generic_plan` gives 135 locks, plus the round trip); `plan_cache_mode = force_custom_plan` (a
+    setting of the role or session, so not the crate's to guarantee; per transaction it costs a statement);
+    a SQL function with `SET plan_cache_mode = force_custom_plan` (9 locks in every regime and as fast as
+    today, but a store schema change, and the statement would live in a migration instead of `sql/`);
+    `satisfies_hash_partition` in the query (the planner does not prune on it).
+  - `append_many` stays as it was (one prepared statement through `streams`, 4 locks per touched partition,
+    every partition under a generic plan): running it unprepared fixes the statistics regimes but cost
+    20–25% of batches per second at concurrency 1.
 
 ## Open decisions
 

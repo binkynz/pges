@@ -2037,6 +2037,7 @@ dependencies = [
  "opentelemetry_sdk",
  "pges-core",
  "pges-testing",
+ "proptest",
  "serde",
  "serde_json",
  "sha2 0.10.9",

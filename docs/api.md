@@ -495,6 +495,8 @@ pub struct StoreConfig {                                 // how a writer opens a
     pub write_format: frame::Format,
     pub migrate: store::AutoMigrate,                     // CreateOrMigrate(StoreDefinition)
                                                          // | Disabled (default)
+    pub append_routing: store::AppendRouting,            // Auto (default): name the stream's partition
+                                                         // when it fits | Streams: through `streams`
 }
 
 #[non_exhaustive]
@@ -511,6 +513,23 @@ pub struct StoreDefinition {                             // what a store is crea
   and only to create a missing store: an existing store keeps its own. `Store::name() -> &StoreName`.
 - DCB is not a public option. A DCB store made by another build is refused at open
   (`OpenError::StoreRequiresFeature("dcb")`).
+- `AppendRouting::Auto`: a single append names its stream's hash partition of `streams`, so it locks only
+  that partition whatever the planner's statistics and `plan_cache_mode`, and reuses its plan. `Store::open`
+  falls back to `Streams` when the partition statements do not fit the pool's statement cache (below), when
+  the role may not select, insert and update every partition directly, or when the partitions are not the
+  ones the store was created with. Routing is fixed at open. `AppendRouting::Streams`: appends always go
+  through `streams` with one prepared statement; a generic plan (a nearly empty analyzed store, or
+  `plan_cache_mode = force_generic_plan`) then locks every partition. `append_many` always goes through
+  `streams`.
+
+Statement cache and memory: routed appends prepare one statement per partition on each connection. Each costs
+about 130 KB of server plan-cache memory per connection: about 8.6 MB per connection at the default 64
+partitions (0.6 MB through `streams`). Routing runs only when sqlx's `statement-cache-capacity` (default 100)
+is at least `stream_partitions + 36`; the default 64 partitions fit. For a pool that several stores share,
+size the capacity at `stream_partitions + 36` per store; an application that runs many statements of its own
+on the pool, or reads many categories, needs more. Otherwise the partition statements evict each other and a
+round trip comes back on each evicted statement's next use. To spend neither the cache entries nor the memory,
+set `append_routing` to `AppendRouting::Streams`.
 
 - The commit id is always generated on the client, so the crate can retry by itself. Outside a unit of
   work, an append that loses its connection is retried once on a new one; if the first attempt committed,

@@ -856,45 +856,130 @@ async fn append_in_uses_the_callers_connection() -> Result<()> {
     f.finish().await
 }
 
-/// Whether `streams` has planner statistics when the appends start.
+/// The planner's view of `streams` when the appends start.
 #[derive(Debug, Clone, Copy)]
-enum StreamStats {
+enum Regime {
     /// Never analyzed: the planner guesses the partitions' sizes.
     Never,
     /// Analyzed with about 30 streams per partition.
     Small,
+    /// Analyzed with 3 streams in all. Through `streams`, the plan cache then keeps a generic plan, which
+    /// locks every partition.
+    NearlyEmpty,
+    /// The session sets `plan_cache_mode = force_generic_plan`.
+    ForcedGeneric,
 }
 
-/// An append locks the stream's partition of `streams` and its index, not every partition: with 64
-/// partitions, locking them all would take 128 of the 256 fast-path lock slots of a backend. The plan cache
-/// keeps the custom plans that prune, with or without statistics. (Analyzed while nearly empty, a few streams
-/// per partition, the generic plan looks cheaper and it locks every partition, though not their indexes.)
+/// How the store reaches `streams` in the lock test.
+#[derive(Debug, Clone, Copy)]
+enum Appends {
+    /// sqlx's default statement cache, which holds the 64 per-partition appends: appends are routed.
+    Routed,
+    /// A statement cache of 99, one short of 64 partition statements and the reserve of 36: appends go
+    /// through `streams`.
+    SmallCache,
+    /// [`store::AppendRouting::Streams`].
+    RoutingOff,
+}
+
+/// A routed append locks its stream's partition of `streams` and that partition's key, never another
+/// partition, and takes the same relation locks whatever the planner's statistics and the session's
+/// `plan_cache_mode`: it names the partition, so no plan has partitions to prune. Unrouted appends (a
+/// statement cache too small for the partition statements, or routing turned off) go through `streams`
+/// with one prepared statement, where a forced generic plan locks all 64 partitions.
 #[tokio::test]
 async fn an_append_locks_only_the_streams_partition_it_writes() -> Result<()> {
-    for (outbox, stats) in [
-        (store::Outbox::Disabled, StreamStats::Never),
-        (store::Outbox::Enabled, StreamStats::Never),
-        (store::Outbox::Disabled, StreamStats::Small),
+    for (outbox, regime, appends) in [
+        (store::Outbox::Disabled, Regime::Never, Appends::Routed),
+        (store::Outbox::Enabled, Regime::Never, Appends::Routed),
+        (store::Outbox::Disabled, Regime::Small, Appends::Routed),
+        (
+            store::Outbox::Disabled,
+            Regime::NearlyEmpty,
+            Appends::Routed,
+        ),
+        (store::Outbox::Enabled, Regime::NearlyEmpty, Appends::Routed),
+        (
+            store::Outbox::Disabled,
+            Regime::ForcedGeneric,
+            Appends::Routed,
+        ),
+        (
+            store::Outbox::Enabled,
+            Regime::ForcedGeneric,
+            Appends::Routed,
+        ),
+        (
+            store::Outbox::Disabled,
+            Regime::NearlyEmpty,
+            Appends::SmallCache,
+        ),
+        (
+            store::Outbox::Disabled,
+            Regime::ForcedGeneric,
+            Appends::SmallCache,
+        ),
+        (
+            store::Outbox::Enabled,
+            Regime::ForcedGeneric,
+            Appends::RoutingOff,
+        ),
     ] {
+        let case = format!("{outbox:?}, {regime:?}, {appends:?}");
         let mut definition = pges_testing::definition(outbox);
         definition.stream_partitions = std::num::NonZeroU16::new(64).unwrap();
         let f = Fixture::with_definition(definition).await?;
-        if let StreamStats::Small = stats {
-            sqlx::query(
-                "INSERT INTO es.streams (version, stream_id, first_commit_id, last_commit_id, category_id)
-                 SELECT 1, gen_random_uuid(), uuidv7(), uuidv7(), 1 FROM generate_series(1, 2000)",
-            )
-            .execute(&f.pool)
-            .await?;
-            sqlx::query("ANALYZE es.streams").execute(&f.pool).await?;
-        }
+        let mut config = store::StoreConfig::new(common::STORE_NAME);
+        let pool = match appends {
+            Appends::Routed => f.pool.clone(),
+            Appends::RoutingOff => {
+                config.append_routing = store::AppendRouting::Streams;
+                f.pool.clone()
+            }
+            Appends::SmallCache => {
+                let options: sqlx::postgres::PgConnectOptions = f.db.url().parse()?;
+                sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(2)
+                    .connect_with(options.statement_cache_capacity(99))
+                    .await?
+            }
+        };
+        let store = store::Store::open(pool.clone(), config).await?;
         let id = stream::StreamId::new_v7();
-        let mut conn = f.pool.acquire().await?;
+        match regime {
+            Regime::Never | Regime::ForcedGeneric => {}
+            Regime::Small => {
+                sqlx::query(
+                    "INSERT INTO es.streams (version, stream_id, first_commit_id, last_commit_id, category_id)
+                     SELECT 1, gen_random_uuid(), uuidv7(), uuidv7(), 1 FROM generate_series(1, 2000)",
+                )
+                .execute(&f.pool)
+                .await?;
+                sqlx::query("ANALYZE es.streams").execute(&f.pool).await?;
+            }
+            Regime::NearlyEmpty => {
+                for stream_id in [id, stream::StreamId::new_v7(), stream::StreamId::new_v7()] {
+                    store
+                        .append(
+                            stream_id,
+                            version::ExpectedVersion::NoStream,
+                            &[JobEvent::assigned()],
+                        )
+                        .await?;
+                }
+                sqlx::query("ANALYZE es.streams").execute(&f.pool).await?;
+            }
+        }
+        let mut conn = pool.acquire().await?;
+        if let Regime::ForcedGeneric = regime {
+            sqlx::query("SET plan_cache_mode = force_generic_plan")
+                .execute(&mut *conn)
+                .await?;
+        }
 
-        // The plan cache plans a generic plan once, at the sixth execution, to weigh it against the custom
-        // ones; that planning locks every partition. The appends after it get custom plans.
+        // Past the sixth execution, from which the plan cache weighs a generic plan against custom ones.
         for _ in 0..10 {
-            f.store
+            store
                 .append_in(
                     &mut conn,
                     id,
@@ -904,7 +989,7 @@ async fn an_append_locks_only_the_streams_partition_it_writes() -> Result<()> {
                 .await?;
         }
         let mut tx = conn.begin().await?;
-        f.store
+        store
             .append_in(
                 &mut tx,
                 id,
@@ -912,6 +997,11 @@ async fn an_append_locks_only_the_streams_partition_it_writes() -> Result<()> {
                 &[JobEvent::assigned()],
             )
             .await?;
+        let relations: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_locks WHERE pid = pg_backend_pid() AND locktype = 'relation'",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
         let locked: Vec<String> = sqlx::query_scalar(
             "SELECT DISTINCT c.relname::text FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
              WHERE l.pid = pg_backend_pid() AND c.relnamespace = 'es'::regnamespace
@@ -920,19 +1010,331 @@ async fn an_append_locks_only_the_streams_partition_it_writes() -> Result<()> {
         )
         .fetch_all(&mut *tx)
         .await?;
+        let partition: String = sqlx::query_scalar(
+            "SELECT c.relname::text FROM es.streams s JOIN pg_class c ON c.oid = s.tableoid
+             WHERE s.stream_id = $1",
+        )
+        .bind(id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await?;
         tx.rollback().await?;
+        let statements = append_statements(&mut conn).await?;
 
-        assert_eq!(locked.len(), 2, "{outbox:?}, {stats:?}: {locked:?}");
-        assert_eq!(
-            format!("{}_pkey", locked[0]),
-            locked[1],
-            "{outbox:?}, {stats:?}"
-        );
+        assert!(locked.contains(&partition), "{case}: {locked:?}");
+        if let Appends::Routed = appends {
+            // Its key too when the plan reads the partition through it; small partitions are scanned.
+            let key = format!("{partition}_pkey");
+            assert!(
+                locked.iter().all(|name| *name == partition || *name == key),
+                "{case}: {locked:?}"
+            );
+            let most = match outbox {
+                store::Outbox::Disabled => APPEND_RELATION_LOCKS,
+                _ => APPEND_OUTBOX_RELATION_LOCKS,
+            };
+            assert!(relations <= most, "{case}: {relations} relation locks");
+            assert_eq!(statements.parent, 0, "{case}");
+            assert!(statements.partitions >= 1, "{case}");
+        } else {
+            assert_eq!(
+                statements,
+                AppendStatements {
+                    parent: 1,
+                    partitions: 0
+                },
+                "{case}"
+            );
+            if let Regime::ForcedGeneric = regime {
+                assert!(locked.len() >= 64, "{case}: {locked:?}");
+            }
+        }
+
+        sqlx::query("RESET plan_cache_mode")
+            .execute(&mut *conn)
+            .await?;
         drop(conn);
+        if let Appends::SmallCache = appends {
+            pool.close().await;
+        }
         f.finish().await?;
     }
 
     Ok(())
+}
+
+/// Most relation locks held after an append to an existing stream, counted before any other query in the
+/// transaction: the stream's partition of `streams` and its key, and the category's partition of `commits`,
+/// its leaf and their indexes.
+const APPEND_RELATION_LOCKS: i64 = 7;
+
+/// [`APPEND_RELATION_LOCKS`] in a store with the outbox, which also inserts into `pending`.
+const APPEND_OUTBOX_RELATION_LOCKS: i64 = 9;
+
+/// A store whose `streams` partitions the client cannot name exactly (here one needs quoting) appends
+/// through `streams` itself, to every partition.
+#[tokio::test]
+async fn appends_go_through_streams_when_its_partitions_cannot_be_named() -> Result<()> {
+    let f = Fixture::new().await?;
+    sqlx::query(r#"ALTER TABLE es.streams_p003 RENAME TO "Streams_P003""#)
+        .execute(&f.pool)
+        .await?;
+    let store =
+        store::Store::open(f.pool.clone(), store::StoreConfig::new(common::STORE_NAME)).await?;
+    let ids: Vec<stream::StreamId> = (0..64).map(|_| stream::StreamId::new_v7()).collect();
+    let mut conn = f.pool.acquire().await?;
+
+    for id in &ids {
+        store
+            .append_in(
+                &mut conn,
+                *id,
+                version::ExpectedVersion::NoStream,
+                &[JobEvent::assigned()],
+            )
+            .await?;
+        store
+            .append_in(
+                &mut conn,
+                *id,
+                version::ExpectedVersion::Exact(v(1)),
+                &[JobEvent::assigned()],
+            )
+            .await?;
+    }
+    let statements = append_statements(&mut conn).await?;
+    let in_renamed: i64 =
+        sqlx::query_scalar(r#"SELECT count(*) FROM es."Streams_P003" WHERE version = 2"#)
+            .fetch_one(&mut *conn)
+            .await?;
+    let versions: Vec<i64> = sqlx::query_scalar("SELECT version FROM es.streams")
+        .fetch_all(&mut *conn)
+        .await?;
+
+    assert_eq!(
+        statements,
+        AppendStatements {
+            parent: 1,
+            partitions: 0
+        }
+    );
+    assert!(in_renamed > 0, "no stream hashed to the renamed partition");
+    assert_eq!(versions, vec![2; ids.len()]);
+    drop(conn);
+    f.finish().await
+}
+
+/// A role granted `streams` but not one of its partitions may append only through `streams` (privileges on a
+/// partitioned table do not cover its partitions named directly), so its store does not route appends.
+#[tokio::test]
+async fn appends_go_through_streams_when_the_role_may_not_write_a_partition() -> Result<()> {
+    let f = Fixture::new().await?;
+    let role = format!("pges_writer_{}", Uuid::now_v7().simple());
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE ROLE {role};
+         GRANT USAGE ON SCHEMA es, pges TO {role};
+         GRANT ALL ON ALL TABLES IN SCHEMA es, pges TO {role};
+         GRANT ALL ON ALL SEQUENCES IN SCHEMA es, pges TO {role};
+         REVOKE ALL ON es.streams_p003 FROM {role};"
+    )))
+    .execute(&f.pool)
+    .await?;
+    let set_role = format!("SET ROLE {role}");
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .after_connect(move |conn, _| {
+            let set_role = set_role.clone();
+            Box::pin(async move {
+                sqlx::raw_sql(sqlx::AssertSqlSafe(set_role))
+                    .execute(conn)
+                    .await
+                    .map(drop)
+            })
+        })
+        .connect(f.db.url())
+        .await?;
+    let store =
+        store::Store::open(pool.clone(), store::StoreConfig::new(common::STORE_NAME)).await?;
+    let ids: Vec<stream::StreamId> = (0..64).map(|_| stream::StreamId::new_v7()).collect();
+    let mut conn = pool.acquire().await?;
+
+    for id in &ids {
+        store
+            .append_in(
+                &mut conn,
+                *id,
+                version::ExpectedVersion::NoStream,
+                &[JobEvent::assigned()],
+            )
+            .await?;
+        store
+            .append_in(
+                &mut conn,
+                *id,
+                version::ExpectedVersion::Exact(v(1)),
+                &[JobEvent::assigned()],
+            )
+            .await?;
+    }
+    let statements = append_statements(&mut conn).await?;
+    drop(conn);
+    pool.close().await;
+    let in_revoked: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM es.streams_p003 WHERE version = 2")
+            .fetch_one(&f.pool)
+            .await?;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "DROP OWNED BY {role}; DROP ROLE {role};"
+    )))
+    .execute(&f.pool)
+    .await?;
+
+    assert_eq!(
+        statements,
+        AppendStatements {
+            parent: 1,
+            partitions: 0
+        }
+    );
+    assert!(in_revoked > 0, "no stream hashed to the revoked partition");
+    f.finish().await
+}
+
+/// A store whose partitions the client can name prepares one append per partition it writes, and none
+/// through `streams`.
+#[tokio::test]
+async fn appends_name_their_streams_partition() -> Result<()> {
+    let f = Fixture::new().await?;
+    let mut conn = f.pool.acquire().await?;
+
+    for _ in 0..200 {
+        f.store
+            .append_in(
+                &mut conn,
+                stream::StreamId::new_v7(),
+                version::ExpectedVersion::NoStream,
+                &[JobEvent::assigned()],
+            )
+            .await?;
+    }
+    let statements = append_statements(&mut conn).await?;
+    let partitions_written: i64 =
+        sqlx::query_scalar("SELECT count(DISTINCT tableoid) FROM es.streams")
+            .fetch_one(&mut *conn)
+            .await?;
+
+    assert_eq!(statements.parent, 0);
+    assert_eq!(statements.partitions, partitions_written);
+    drop(conn);
+    f.finish().await
+}
+
+/// A store with 256 partitions on a pool with sqlx's default statement cache (100) appends through `streams`
+/// with one prepared statement, as before appends were routed; a cache of 256 + 36 routes them.
+#[tokio::test]
+async fn appends_go_through_streams_when_the_partition_statements_do_not_fit_the_cache()
+-> Result<()> {
+    let mut definition = pges_testing::definition(store::Outbox::Disabled);
+    definition.stream_partitions = std::num::NonZeroU16::new(256).unwrap();
+    let f = Fixture::with_definition(definition).await?;
+    let options: sqlx::postgres::PgConnectOptions = f.db.url().parse()?;
+
+    for (capacity, expected) in [
+        (
+            None,
+            AppendStatements {
+                parent: 1,
+                partitions: 0,
+            },
+        ),
+        (
+            Some(292),
+            AppendStatements {
+                parent: 0,
+                partitions: 1,
+            },
+        ),
+    ] {
+        let pool_options = match capacity {
+            None => options.clone(),
+            Some(capacity) => options.clone().statement_cache_capacity(capacity),
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(pool_options)
+            .await?;
+        let store =
+            store::Store::open(pool.clone(), store::StoreConfig::new(common::STORE_NAME)).await?;
+        let mut conn = pool.acquire().await?;
+        let id = stream::StreamId::new_v7();
+
+        for expected_version in [
+            version::ExpectedVersion::NoStream,
+            version::ExpectedVersion::Exact(v(1)),
+        ] {
+            store
+                .append_in(&mut conn, id, expected_version, &[JobEvent::assigned()])
+                .await?;
+        }
+        let statements = append_statements(&mut conn).await?;
+        drop(conn);
+        pool.close().await;
+
+        assert_eq!(statements, expected, "capacity {capacity:?}");
+    }
+
+    f.finish().await
+}
+
+/// With [`store::AppendRouting::Streams`], appends go through `streams` though the partition statements
+/// would fit the statement cache.
+#[tokio::test]
+async fn appends_go_through_streams_when_routing_is_off() -> Result<()> {
+    let f = Fixture::new().await?;
+    let mut config = store::StoreConfig::new(common::STORE_NAME);
+    config.append_routing = store::AppendRouting::Streams;
+    let store = store::Store::open(f.pool.clone(), config).await?;
+    let mut conn = f.pool.acquire().await?;
+
+    for _ in 0..32 {
+        store
+            .append_in(
+                &mut conn,
+                stream::StreamId::new_v7(),
+                version::ExpectedVersion::NoStream,
+                &[JobEvent::assigned()],
+            )
+            .await?;
+    }
+    let statements = append_statements(&mut conn).await?;
+
+    assert_eq!(
+        statements,
+        AppendStatements {
+            parent: 1,
+            partitions: 0
+        }
+    );
+    drop(conn);
+    f.finish().await
+}
+
+/// The single-append statements a connection has prepared, by the table they update.
+#[derive(Debug, PartialEq, Eq)]
+struct AppendStatements {
+    parent: i64,
+    partitions: i64,
+}
+
+async fn append_statements(conn: &mut sqlx::PgConnection) -> Result<AppendStatements> {
+    let (parent, partitions): (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE statement LIKE '%UPDATE es.streams s %'),
+                count(*) FILTER (WHERE statement LIKE '%UPDATE es.streams\\_p% s %')
+         FROM pg_prepared_statements WHERE statement LIKE 'WITH input%'",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+
+    Ok(AppendStatements { parent, partitions })
 }
 
 #[tokio::test]

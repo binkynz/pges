@@ -16,7 +16,7 @@ error[E0609]: no field `stream_partitions` on type `&mut StoreConfig`
 8 |     config.stream_partitions = NonZeroU16::MIN;
   |            ^^^^^^^^^^^^^^^^^ unknown field
   |
-  = note: available fields are: `name`, `max_clock_skew`, `write_format`, `migrate`
+  = note: available fields are: `name`, `max_clock_skew`, `write_format`, `migrate`, `append_routing`
 
 error[E0609]: no field `max_txn_age` on type `&mut StoreConfig`
  --> tests/ui/creation_options_need_a_definition.rs:9:12
@@ -24,4 +24,4 @@ error[E0609]: no field `max_txn_age` on type `&mut StoreConfig`
 9 |     config.max_txn_age = std::time::Duration::ZERO;
   |            ^^^^^^^^^^^ unknown field
   |
-  = note: available fields are: `name`, `max_clock_skew`, `write_format`, `migrate`
+  = note: available fields are: `name`, `max_clock_skew`, `write_format`, `migrate`, `append_routing`

@@ -7,11 +7,11 @@ use std::{
     time::Duration,
 };
 
-use sqlx::{PgConnection, PgPool, postgres::types::PgInterval};
+use sqlx::{ConnectOptions, PgConnection, PgPool, postgres::types::PgInterval};
 
 use pges_core::{category, event, frame, interval, store};
 
-use crate::{admin, catalog, error, migrate, sql, sql::typed::Query as _, unit_of_work};
+use crate::{admin, catalog, error, migrate, route, sql, sql::typed::Query as _, unit_of_work};
 
 /// A store: one PostgreSQL schema holding streams, commits and the log of one bounded context.
 ///
@@ -27,7 +27,9 @@ impl Store {
     /// With [`AutoMigrate::CreateOrMigrate`] it first applies the migrations, creating the store from the
     /// [`StoreDefinition`] if it does not exist. Then it checks that the shared `pges` schema and the store
     /// schema are at the version this crate needs and that their applied migrations match the embedded ones,
-    /// reads the store's `outbox` and `dcb` flags, and loads the ids of its categories and event types.
+    /// reads the store's `outbox` and `dcb` flags, lists the partitions of `streams` so each append can name
+    /// its stream's partition (with [`AppendRouting::Auto`], the default), and loads the ids of its
+    /// categories and event types.
     ///
     /// Fails with [`OpenError::StoreNotFound`] for a store that does not exist (and is not created), with
     /// [`OpenError::StoreRequiresFeature`] for a store that needs a feature this build lacks, and with
@@ -97,7 +99,21 @@ impl Store {
         } else {
             Outbox::Disabled
         };
-        let statements = sql::StoreSql::new(&store_name, outbox);
+        let leaves = match config.append_routing {
+            AppendRouting::Auto => {
+                let probes = route::probes();
+                let partitions = sql::stream_leaves(&store_name)
+                    .bind(sql::statement::stream_leaves::Params { probes: &probes })
+                    .fetch_all(&mut *conn)
+                    .await
+                    .map_err(OpenError::database)?;
+
+                route::Leaves::from_catalog(&partitions, &probes)
+            }
+            AppendRouting::Streams => None,
+        };
+        let statements =
+            sql::StoreSql::new(&store_name, outbox, leaves, statement_cache_capacity(&pool));
         let mut catalog = catalog::Catalog::default();
         let categories: Vec<(category::CategoryId, String)> = statements
             .categories
@@ -372,6 +388,9 @@ pub struct StoreConfig {
     pub write_format: frame::Format,
     /// Whether [`Store::open`] applies migrations first, and what it creates a missing store with.
     pub migrate: AutoMigrate,
+    /// Whether a single append names its stream's partition of `streams` or goes through `streams`. Default
+    /// [`AppendRouting::Auto`].
+    pub append_routing: AppendRouting,
 }
 
 impl StoreConfig {
@@ -383,6 +402,7 @@ impl StoreConfig {
             max_clock_skew: None,
             write_format: frame::Format::LATEST,
             migrate: AutoMigrate::Disabled,
+            append_routing: AppendRouting::Auto,
         }
     }
 
@@ -405,6 +425,12 @@ impl StoreConfig {
 pub struct StoreDefinition {
     /// Hash partitions of `streams` and `snapshots`. Default 64, enough for about 1B streams. More partitions
     /// cost [`Store::append_many`] batches that touch many of them, which lock each one they touch.
+    ///
+    /// A single append names its stream's partition ([`AppendRouting::Auto`]) only while one prepared
+    /// statement per partition fits each connection's statement cache with 36 entries to spare: sqlx's
+    /// `statement_cache_capacity` (default 100) at least `stream_partitions + 36`. The default 64 fit; with
+    /// more, appends go through `streams`, whose plans may lock every partition. Each partition statement
+    /// holds about 130 KB of plan cache per connection (8.6 MB at 64 partitions).
     pub stream_partitions: NonZeroU16,
     /// Whether appends also enqueue into `pending`, for the outbox sequencer source. All stores of a database
     /// must agree: creating a store that differs fails with [`migrate::MigrateError::OutboxMismatch`].
@@ -439,6 +465,27 @@ pub enum Outbox {
     /// No outbox queue.
     #[default]
     Disabled,
+}
+
+/// How a single append reaches its stream's row in `streams`. Batches ([`Store::append_many`]) always go
+/// through `streams`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum AppendRouting {
+    /// Name the stream's hash partition, so an append locks only that partition whatever the planner's
+    /// statistics and `plan_cache_mode`, and its plan is reused. Each connection prepares one statement per
+    /// partition, about 130 KB of plan cache each.
+    ///
+    /// [`Store::open`] falls back to [`AppendRouting::Streams`] when the statements do not fit the pool's
+    /// statement cache (`statement_cache_capacity` below [`StoreDefinition::stream_partitions`] + 36), when
+    /// the role may not select, insert and update every partition directly, or when the partitions are not
+    /// the plain hash partitions the store was created with. Routing is fixed when the store is opened.
+    #[default]
+    Auto,
+    /// Through the partitioned `streams`, with one prepared statement. A custom plan locks the stream's
+    /// partition; a generic plan (statistics of a nearly empty store, or `plan_cache_mode =
+    /// force_generic_plan`) locks every partition.
+    Streams,
 }
 
 /// Whether [`Store::open`] applies migrations.
@@ -593,6 +640,20 @@ async fn check_compatibility(
     }
 }
 
+/// The statement cache capacity of the pool's connections. sqlx exposes it only in the options' URL form; the
+/// default (100) when it is missing.
+fn statement_cache_capacity(pool: &PgPool) -> usize {
+    pool.connect_options()
+        .to_url_lossy()
+        .query_pairs()
+        .find(|(key, _)| key == "statement-cache-capacity")
+        .and_then(|(_, value)| value.parse().ok())
+        .unwrap_or(DEFAULT_STATEMENT_CACHE_CAPACITY)
+}
+
+/// sqlx's default statement cache capacity per connection.
+const DEFAULT_STATEMENT_CACHE_CAPACITY: usize = 100;
+
 /// An interval as a duration, a month counting 30 days and a day 24 hours, as PostgreSQL compares them.
 /// Negative intervals are zero.
 pub(crate) fn duration(interval: PgInterval) -> Duration {
@@ -609,5 +670,21 @@ pub(crate) fn interval(duration: Duration) -> PgInterval {
         months: 0,
         days: 0,
         microseconds: i64::try_from(duration.as_micros()).unwrap_or(i64::MAX),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_statement_cache_capacity_is_read_from_the_pool() -> anyhow::Result<()> {
+        let options: sqlx::postgres::PgConnectOptions = "postgres://user@localhost/db".parse()?;
+        let default = PgPool::connect_lazy_with(options.clone());
+        let small = PgPool::connect_lazy_with(options.statement_cache_capacity(7));
+
+        assert_eq!(statement_cache_capacity(&default), 100);
+        assert_eq!(statement_cache_capacity(&small), 7);
+        Ok(())
     }
 }

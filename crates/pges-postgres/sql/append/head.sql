@@ -16,14 +16,17 @@
 -- the update stays HOT. A created stream starts at version event_count. No row returned means the append did
 -- not apply; append/classify.sql finds out why.
 --
--- `bumped` filters on `s.stream_id = $1` besides the join: `input` is materialized, so the join alone does not
--- prune the hash partitions of streams, and the update would lock every partition and its index (134 locks
--- at 64 partitions, 518 at 256, past the 256 fast-path slots). With $1 a custom plan prunes to the stream's
--- partition when it is planned (9 locks). The plan cache keeps choosing custom plans: it plans a generic one
--- once per connection, at the sixth execution, and finds it costs the update of every partition. A generic
--- plan would lock every partition again, since PostgreSQL 18 locks them all before run-time pruning. It wins
--- only when the partitions were analyzed nearly empty (a few streams each); it then locks every partition
--- but not their indexes (70 locks at 64 partitions).
+-- {stream_table} is the hash partition of streams that holds $1 (`streams_p017`), which the store computes
+-- with PostgreSQL's partition hash, so no plan has partitions to prune. A plan through streams prunes only
+-- when it is custom: PostgreSQL 18 locks every partition of a generic plan before run-time pruning, and the
+-- plan cache keeps a generic plan when the partitions were analyzed nearly empty or under
+-- `force_generic_plan` (70 locks at 64 partitions, against 7 here). On the partition, the cached generic plan
+-- is as good as a custom one, so an append is not planned again after its sixth run on a connection. A store
+-- whose partitions it cannot name exactly renders streams here instead.
+--
+-- `bumped` also filters on `s.stream_id = $1` besides the join: `input` is materialized, so through streams
+-- the join alone would not prune its partitions even in a custom plan, and the update would lock every
+-- partition and its index (134 locks at 64 partitions, 518 at 256).
 -- `created` locks only its partition: an insert routes its row when it runs.
 WITH input AS MATERIALIZED (
   SELECT $1::uuid  AS stream_id,   $2::int4 AS category_id,
@@ -33,14 +36,14 @@ WITH input AS MATERIALIZED (
          pges.check_commit_id($8::uuid, $9::interval) AS commit_id
 ),
 created AS (
-  INSERT INTO {store}.streams (version, stream_id, first_commit_id, last_commit_id, category_id, stream_key)
+  INSERT INTO {store}.{stream_table} (version, stream_id, first_commit_id, last_commit_id, category_id, stream_key)
   SELECT event_count, stream_id, commit_id, commit_id, category_id, stream_key
   FROM input WHERE expected IN (-1, -2)
   ON CONFLICT (stream_id) DO NOTHING
   RETURNING version AS last_version
 ),
 bumped AS (
-  UPDATE {store}.streams s SET version         = s.version + i.event_count,
+  UPDATE {store}.{stream_table} s SET version         = s.version + i.event_count,
                                first_commit_id = least(s.first_commit_id, i.commit_id),
                                last_commit_id  = i.commit_id
   FROM input i

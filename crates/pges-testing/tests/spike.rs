@@ -63,7 +63,11 @@ fn skew() -> PgInterval {
 
 /// Renders `statement` for the store.
 fn render(statement: &template::Statement) -> String {
-    statement.render(&template::Values::new().store(&STORE_NAME))
+    statement.render(
+        &template::Values::new()
+            .store(&STORE_NAME)
+            .stream_table(None),
+    )
 }
 
 /// Runs the append. Returns `Some(last_version)` or `None` for "no row returned".

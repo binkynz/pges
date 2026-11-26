@@ -53,3 +53,4 @@ struct ReadmeDoctests;
 
 mod catalog;
 mod ident;
+mod route;
