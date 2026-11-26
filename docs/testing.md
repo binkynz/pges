@@ -267,7 +267,13 @@ The logical restart test (`crates/pges-sequencer/tests/logical.rs`) stores no to
 flushed unrelated WAL so keepalives arrive, and checks that `confirmed_flush_lsn` stays below the end of the
 first commit whose token is not stored. The bound is that commit's end, not the WAL position before it: a
 keepalive's `wal_end` may fall inside a transaction that commits later. The slow-batch test sets
-`ALTER DATABASE … SET wal_sender_timeout = '1s'`, which logical walsenders honour.
+`ALTER DATABASE … SET wal_sender_timeout = '1s'`, which logical walsenders honour. It waits for states, not
+for times: until the batch waits on the lock of the log (`pg_locks`), then, in the control run without status
+updates, until the slot's walsender is gone and the sequencer has reported the error. The sequencer notices
+the lost connection only when it next uses it, after its batch commits, so the batch's log rows can be
+visible before the error; reading the errors as soon as the rows appeared failed under load. The run with
+status updates checks that the slot keeps the same walsender while the batch waits three times
+`wal_sender_timeout`.
 
 `a_commit_racing_the_slot_creation_is_not_skipped` holds a unit of work open, starts the sequencer, waits
 until the walsender waits on a lock (`CREATE_REPLICATION_SLOT` waits for open transactions), then commits.
