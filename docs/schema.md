@@ -381,7 +381,9 @@ row.
 - Cost: a populated store's batches were custom-planned already (about 1.2 ms of planning and 2.1 ms of
   execution per batch of 16 at 1M streams and 64 partitions), so forcing custom plans costs nothing there;
   where the plan cache chose a generic plan it was slower than the custom one at 1M streams (it reads
-  every partition). Batches per second: design.md, Decided, `append_many` plans for its streams.
+  every partition). Where the plan cache chose a generic plan that was cheap to run (100k streams created
+  by batches, then analyzed), every batch is now planned: about 1 ms more per batch of 16. Batches per
+  second: design.md, Decided, `append_many` plans for its streams.
 
 ### Read one stream
 
