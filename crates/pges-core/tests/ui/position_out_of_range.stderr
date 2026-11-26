@@ -1,0 +1,7 @@
+error[E0080]: evaluation panicked: a position is at most i64::MAX
+ --> tests/ui/position_out_of_range.rs:4:16
+  |
+4 |     let _far = pges_core::position!(u64::MAX);
+  |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `main::POSITION` failed here
+  |
+  = note: this error originates in the macro `$crate::panic::panic_2021` which comes from the expansion of the macro `pges_core::position` (in Nightly builds, run with -Z macro-backtrace for more info)

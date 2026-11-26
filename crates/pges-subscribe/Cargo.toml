@@ -1,0 +1,65 @@
+[package]
+name = "pges-subscribe"
+description = "Subscriptions for pges: ordered category reads, exactly-once Postgres projections, wakers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+keywords = ["event-sourcing", "subscription", "projection", "postgres", "cqrs"]
+categories = ["database", "asynchronous"]
+include = ["src/**/*", "sql/**/*", "Cargo.toml", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["wake-grpc"]
+# Wakes from the sequencer's gRPC watch, pges.watch.v1.Watch (the sequencer's watch-grpc feature; tonic).
+wake-grpc = ["dep:pges-watch-proto", "dep:tonic"]
+# https endpoints for the gRPC waker: the system's root certificates or a given CA, and an optional client
+# certificate (rustls with ring, through tonic).
+wake-grpc-tls = ["wake-grpc", "dep:rustls", "dep:rustls-pki-types", "tonic/tls-ring", "tonic/tls-native-roots"]
+# Wakes from the sequencer's in-process watch channel (a `tokio::sync::watch::Receiver<HighWater>`).
+wake-inproc = []
+# Wakes by reading the newest log entry of each watched category on an interval, with backoff.
+wake-poll = []
+# Wakes from the sequencer's NOTIFY pges_<store> (the sequencer's watch-notify feature).
+wake-notify = []
+# RawEvent::trace_parent, and the appends' trace from the current span (pges-postgres's otel feature).
+otel = ["dep:opentelemetry", "pges-core/otel", "pges-postgres/otel"]
+
+[dependencies]
+futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
+opentelemetry = { version = "0.33.1", default-features = false, features = ["trace"], optional = true }
+pges-core = { path = "../pges-core", version = "0.1.0" }
+pges-postgres = { path = "../pges-postgres", version = "0.1.0" }
+pges-watch-proto = { path = "../pges-watch-proto", version = "0.1.0", features = ["client"], optional = true }
+rustls = { version = "0.23.46", default-features = false, features = ["std"], optional = true }
+rustls-pki-types = { version = "1.16", features = ["std"], optional = true }
+sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "postgres", "uuid"] }
+thiserror = "2"
+tracing = "0.1.41"
+time = "0.3"
+tokio = { version = "1.44", features = ["macros", "rt", "sync", "time"] }
+tonic = { version = "0.14.2", default-features = false, features = ["channel", "codegen"], optional = true }
+uuid = { version = "1.26.1", features = ["v7"] }
+
+[dev-dependencies]
+anyhow = "1.0.105"
+pges-derive = { path = "../pges-derive" }
+pges-replication = { path = "../pges-replication" }
+pges-sequencer = { path = "../pges-sequencer", features = ["watch-notify", "watch-grpc", "watch-grpc-tls"] }
+pges-testing = { path = "../pges-testing", features = ["tls"] }
+pges-watch-proto = { path = "../pges-watch-proto", features = ["client", "server"] }
+proptest = "1.11"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10.9"
+tonic = { version = "0.14.2", default-features = false, features = ["channel", "codegen", "server"] }
+tokio = { version = "1.44", features = ["macros", "rt-multi-thread", "sync", "time"] }
+trybuild = "1.0.105"
+uuid = { version = "1.26.1", features = ["serde", "v7"] }

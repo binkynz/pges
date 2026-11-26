@@ -1,0 +1,36 @@
+[package]
+name = "pges-testing"
+description = "Test support for pges: PostgreSQL 18 with logical replication, template databases, store fixtures"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+keywords = ["testing", "postgres", "testcontainers", "event-sourcing"]
+categories = ["development-tools::testing", "database"]
+include = ["src/**/*", "sql/**/*", "Cargo.toml", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
+
+[dependencies]
+anyhow = "1.0.105"
+pges-core = { path = "../pges-core", version = "0.1.0" }
+pges-postgres = { path = "../pges-postgres", version = "0.1.0" }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"], optional = true }
+sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "migrate"] }
+# `Executor::describe`, which `statement::check_typed` asks PostgreSQL with, needs the driver's `offline` feature
+# since 0.9; sqlx turns it on only with its `macros` feature, which would build the proc macros too.
+sqlx-postgres = { version = "0.9.1", default-features = false, features = ["offline"] }
+testcontainers = { version = "0.27", features = ["reusable-containers"] }
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
+tokio = { version = "1.54.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+uuid = { version = "1.26.1", features = ["v7"] }
+
+[features]
+# tls::Pki: throwaway certificates for TLS tests (rcgen).
+tls = ["dep:rcgen"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true

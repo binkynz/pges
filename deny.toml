@@ -1,0 +1,23 @@
+# cargo deny check: licences, advisories, bans, sources.
+
+[licenses]
+allow = [
+  "MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause",
+  "ISC", "Unicode-3.0", "Zlib", "CC0-1.0", "MPL-2.0", "CDLA-Permissive-2.0",
+]
+
+[advisories]
+yanked = "deny"
+ignore = [
+  # astral-tokio-tar is unmaintained; it reaches us only through testcontainers in pges-testing, which builds
+  # images and copies files into test containers. Revisit when testcontainers replaces it.
+  { id = "RUSTSEC-2026-0440", reason = "test-only, via testcontainers" },
+]
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+# Published crates only: crates.io rejects git dependencies.
+unknown-registry = "deny"
+unknown-git = "deny"

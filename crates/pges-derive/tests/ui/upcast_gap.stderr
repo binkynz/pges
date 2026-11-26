@@ -1,0 +1,11 @@
+error: missing upcaster for version 2: version 4 needs upcast(1 => ..., ..., 3 => ...)
+ --> tests/ui/upcast_gap.rs:6:48
+  |
+6 |     #[event(name = "job.created", version = 4, upcast(1 => up, 3 => up))]
+  |                                                ^^^^^^
+
+error: missing upcaster for version 1: version 2 needs upcast(1 => ...)
+ --> tests/ui/upcast_gap.rs:8:46
+  |
+8 |     #[event(name = "job.assigned", version = 2)]
+  |                                              ^

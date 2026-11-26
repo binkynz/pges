@@ -1,0 +1,15 @@
+error[E0080]: evaluation panicked: invalid source kind: it must match ^[a-z][a-z0-9_]{0,39}$
+ --> tests/ui/invalid_source_kind.rs:3:40
+  |
+3 | const UPPER_CASE: source::SourceKind = source_kind!("Replaying");
+  |                                        ^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `UPPER_CASE::KIND` failed here
+  |
+  = note: this error originates in the macro `$crate::panic::panic_2021` which comes from the expansion of the macro `source_kind` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+note: erroneous constant encountered
+ --> tests/ui/invalid_source_kind.rs:3:40
+  |
+3 | const UPPER_CASE: source::SourceKind = source_kind!("Replaying");
+  |                                        ^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this note originates in the macro `source_kind` (in Nightly builds, run with -Z macro-backtrace for more info)

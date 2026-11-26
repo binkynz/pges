@@ -1,0 +1,47 @@
+error: `skip_serializing_if` without `default` can write events that cannot be read back: add `default` to the same field
+ --> tests/ui/serde_unreadable_field.rs:8:17
+  |
+8 |         #[serde(skip_serializing_if = "Option::is_none")]
+  |                 ^^^^^^^^^^^^^^^^^^^
+
+error: `skip_serializing` without `default` can write events that cannot be read back: add `default` to the same field
+  --> tests/ui/serde_unreadable_field.rs:10:17
+   |
+10 |         #[serde(skip_serializing)]
+   |                 ^^^^^^^^^^^^^^^^
+
+error: `skip_deserializing` writes the field but never reads it back; use `skip` to leave it out of the stored data
+  --> tests/ui/serde_unreadable_field.rs:12:17
+   |
+12 |         #[serde(skip_deserializing)]
+   |                 ^^^^^^^^^^^^^^^^^^
+
+error: `serialize_with` without `deserialize_with` writes data the default decoder may not read: add `deserialize_with`, or use `with` for a module with both
+  --> tests/ui/serde_unreadable_field.rs:14:17
+   |
+14 |         #[serde(serialize_with = "ser")]
+   |                 ^^^^^^^^^^^^^^
+
+error: `deserialize_with` without `serialize_with` reads a shape the default encoder does not write: add `serialize_with`, or use `with` for a module with both
+  --> tests/ui/serde_unreadable_field.rs:16:17
+   |
+16 |         #[serde(deserialize_with = "de")]
+   |                 ^^^^^^^^^^^^^^^^
+
+error: a rename that differs between serialize and deserialize writes events that cannot be read back; use `rename = "..."`, and `alias` for more names to read
+  --> tests/ui/serde_unreadable_field.rs:18:17
+   |
+18 |         #[serde(rename(serialize = "a", deserialize = "b"))]
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: a rename that differs between serialize and deserialize writes events that cannot be read back; use `rename = "..."`, and `alias` for more names to read
+  --> tests/ui/serde_unreadable_field.rs:20:17
+   |
+20 |         #[serde(rename(serialize = "c"))]
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^
+
+error: unsupported serde field attribute in an event; supported: `rename`, `alias`, `default`, `skip`, `skip_serializing` or `skip_serializing_if` with `default`, `with`, `serialize_with` with `deserialize_with`, and `flatten`
+  --> tests/ui/serde_unreadable_field.rs:22:17
+   |
+22 |         #[serde(borrow, default)]
+   |                 ^^^^^^

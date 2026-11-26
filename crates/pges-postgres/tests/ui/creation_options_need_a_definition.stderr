@@ -1,0 +1,27 @@
+error[E0433]: cannot find `Dcb` in `store`
+  --> tests/ui/creation_options_need_a_definition.rs:13:12
+   |
+13 |     store::Dcb::Enabled
+   |            ^^^ could not find `Dcb` in `store`
+
+error[E0425]: cannot find type `Dcb` in module `store`
+  --> tests/ui/creation_options_need_a_definition.rs:12:20
+   |
+12 | fn dcb() -> store::Dcb {
+   |                    ^^^ not found in `store`
+
+error[E0609]: no field `stream_partitions` on type `&mut StoreConfig`
+ --> tests/ui/creation_options_need_a_definition.rs:8:12
+  |
+8 |     config.stream_partitions = NonZeroU16::MIN;
+  |            ^^^^^^^^^^^^^^^^^ unknown field
+  |
+  = note: available fields are: `name`, `max_clock_skew`, `write_format`, `migrate`
+
+error[E0609]: no field `max_txn_age` on type `&mut StoreConfig`
+ --> tests/ui/creation_options_need_a_definition.rs:9:12
+  |
+9 |     config.max_txn_age = std::time::Duration::ZERO;
+  |            ^^^^^^^^^^^ unknown field
+  |
+  = note: available fields are: `name`, `max_clock_skew`, `write_format`, `migrate`

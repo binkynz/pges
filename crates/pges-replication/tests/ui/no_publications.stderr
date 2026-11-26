@@ -1,0 +1,22 @@
+error[E0277]: `[PublicationName; 0]` is not a list of at least one publication
+ --> tests/ui/no_publications.rs:5:79
+  |
+5 |     connection::StartOptions::new(pges_replication::slot_name!("pges_16384"), none);
+  |     ----------------------------- required by a bound introduced by this call ^^^^ expected a `PublicationName`, an array of one to eight, or a `NonEmpty` list
+  |
+  = help: the trait `Publications` is not implemented for `[PublicationName; 0]`
+  = note: START_REPLICATION needs at least one publication; for a list known only at run time, use `NonEmpty::try_from(vec)`
+  = help: the following other types implement trait `Publications`:
+            [PublicationName; 1]
+            [PublicationName; 2]
+            [PublicationName; 3]
+            [PublicationName; 4]
+            [PublicationName; 5]
+            [PublicationName; 6]
+            [PublicationName; 7]
+            [PublicationName; 8]
+note: required by a bound in `StartOptions::new`
+ --> src/connection.rs
+  |
+  |     pub fn new(slot: name::SlotName, publications: impl Publications) -> Self {
+  |                                                         ^^^^^^^^^^^^ required by this bound in `StartOptions::new`

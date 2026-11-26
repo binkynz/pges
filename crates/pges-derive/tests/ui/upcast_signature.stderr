@@ -1,0 +1,8 @@
+error[E0308]: mismatched types
+ --> tests/ui/upcast_signature.rs:6:60
+  |
+6 |     #[event(name = "job.created", version = 2, upcast(1 => up))]
+  |                                                            ^^ expected fn pointer, found fn item
+  |
+  = note: expected fn pointer `fn(serde_json::value::Value) -> Result<serde_json::value::Value, Box<(dyn std::error::Error + Send + Sync + 'static)>>`
+                found fn item `fn(String) -> String {up}`

@@ -1,0 +1,72 @@
+error[E0277]: the trait bound `DeleteExpected: From<ExpectedVersion>` is not satisfied
+ --> tests/ui/delete_expects_no_no_stream.rs:8:33
+  |
+8 |         .delete_stream::<E>(id, version::ExpectedVersion::NoStream)
+  |          -------------          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `From<ExpectedVersion>` is not implemented for `DeleteExpected`
+  |          |
+  |          required by a bound introduced by this call
+  |
+help: the trait `From<ExpectedVersion>` is not implemented for `DeleteExpected`
+      but trait `From<Version>` is implemented for it
+ --> src/delete.rs
+  |
+  | impl From<version::Version> for DeleteExpected {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = help: for that trait implementation, expected `Version`, found `ExpectedVersion`
+  = note: required for `ExpectedVersion` to implement `Into<DeleteExpected>`
+note: required by a bound in `delete::<impl Store>::delete_stream`
+ --> src/delete.rs
+  |
+  |     pub async fn delete_stream<E: event::Event>(
+  |                  ------------- required by a bound in this associated function
+...
+  |         expected: impl Into<DeleteExpected>,
+  |                        ^^^^^^^^^^^^^^^^^^^^ required by this bound in `delete::<impl Store>::delete_stream`
+
+error[E0277]: the trait bound `DeleteExpected: From<ExpectedVersion>` is not satisfied
+ --> tests/ui/delete_expects_no_no_stream.rs:7:13
+  |
+7 |       let _ = store
+  |  _____________^
+8 | |         .delete_stream::<E>(id, version::ExpectedVersion::NoStream)
+  | |___________________________________________________________________^ the trait `From<ExpectedVersion>` is not implemented for `DeleteExpected`
+  |
+help: the trait `From<ExpectedVersion>` is not implemented for `DeleteExpected`
+      but trait `From<Version>` is implemented for it
+ --> src/delete.rs
+  |
+  | impl From<version::Version> for DeleteExpected {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = help: for that trait implementation, expected `Version`, found `ExpectedVersion`
+  = note: required for `ExpectedVersion` to implement `Into<DeleteExpected>`
+note: required by a bound in `delete::<impl Store>::delete_stream`
+ --> src/delete.rs
+  |
+  |     pub async fn delete_stream<E: event::Event>(
+  |                  ------------- required by a bound in this associated function
+...
+  |         expected: impl Into<DeleteExpected>,
+  |                        ^^^^^^^^^^^^^^^^^^^^ required by this bound in `delete::<impl Store>::delete_stream`
+
+error[E0277]: the trait bound `DeleteExpected: From<ExpectedVersion>` is not satisfied
+ --> tests/ui/delete_expects_no_no_stream.rs:9:10
+  |
+9 |         .await;
+  |          ^^^^^ the trait `From<ExpectedVersion>` is not implemented for `DeleteExpected`
+  |
+help: the trait `From<ExpectedVersion>` is not implemented for `DeleteExpected`
+      but trait `From<Version>` is implemented for it
+ --> src/delete.rs
+  |
+  | impl From<version::Version> for DeleteExpected {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = help: for that trait implementation, expected `Version`, found `ExpectedVersion`
+  = note: required for `ExpectedVersion` to implement `Into<DeleteExpected>`
+note: required by a bound in `delete::<impl Store>::delete_stream`
+ --> src/delete.rs
+  |
+  |     pub async fn delete_stream<E: event::Event>(
+  |                  ------------- required by a bound in this associated function
+...
+  |         expected: impl Into<DeleteExpected>,
+  |                        ^^^^^^^^^^^^^^^^^^^^ required by this bound in `delete::<impl Store>::delete_stream`

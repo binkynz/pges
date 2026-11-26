@@ -1,0 +1,32 @@
+error[E0599]: no method named `categories` found for struct `pges_subscribe::subscription::Builder<AllCategories>` in the current scope
+ --> tests/ui/all_categories_and_listed.rs:9:10
+  |
+6 |       let _ = store
+  |  _____________-
+7 | |         .subscription(pges_subscribe::subscription_name!("both"))
+8 | |         .all_categories()
+9 | |         .categories(non_empty![category!("jobs")]);
+  | |         -^^^^^^^^^^ method not found in `pges_subscribe::subscription::Builder<AllCategories>`
+  | |_________|
+  |
+  |
+  = note: the method was found for
+          - `pges_subscribe::subscription::Builder`
+          - `pges_subscribe::subscription::Builder<pges_subscribe::subscription::Listed>`
+
+error[E0599]: no method named `all_categories` found for struct `pges_subscribe::subscription::Builder<pges_subscribe::subscription::Listed>` in the current scope
+  --> tests/ui/all_categories_and_listed.rs:16:10
+   |
+13 |       let _ = store
+   |  _____________-
+14 | |         .subscription(pges_subscribe::subscription_name!("both"))
+   | |          -------------------------------------------------------- method `all_categories` is available on `pges_subscribe::subscription::Builder`
+15 | |         .categories(non_empty![category!("jobs")])
+16 | |         .all_categories();
+   | |_________-^^^^^^^^^^^^^^
+   |
+help: there is a method `categories` with a similar name, but with different arguments
+  --> src/subscription.rs
+   |
+   |     pub fn categories(mut self, names: impl IntoIterator<Item = category::CategoryName>) -> Self {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

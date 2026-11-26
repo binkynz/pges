@@ -1,0 +1,29 @@
+error: invalid category name "Jobs": it must start with a lowercase ASCII letter
+ --> tests/ui/invalid_category.rs:4:20
+  |
+4 | #[event(category = "Jobs")]
+  |                    ^^^^^^
+
+error: invalid category name "jobs-board": it may only contain a-z, 0-9 and _
+  --> tests/ui/invalid_category.rs:11:20
+   |
+11 | #[event(category = "jobs-board")]
+   |                    ^^^^^^^^^^^^
+
+error: invalid category name "": it is empty
+  --> tests/ui/invalid_category.rs:18:20
+   |
+18 | #[event(category = "")]
+   |                    ^^
+
+error: invalid category name "a_category_name_that_is_longer_than_forty_bytes": it is longer than 40 bytes
+  --> tests/ui/invalid_category.rs:25:20
+   |
+25 | #[event(category = "a_category_name_that_is_longer_than_forty_bytes")]
+   |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: missing category: add #[event(category = "...")] to the enum
+  --> tests/ui/invalid_category.rs:32:6
+   |
+32 | enum Missing {
+   |      ^^^^^^^

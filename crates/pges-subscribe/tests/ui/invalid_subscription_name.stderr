@@ -1,0 +1,7 @@
+error[E0080]: evaluation panicked: invalid subscription name: it must match ^[a-z][a-z0-9_.-]{0,99}$
+ --> tests/ui/invalid_subscription_name.rs:2:16
+  |
+2 |     let name = pges_subscribe::subscription_name!("Jobs Board");
+  |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `main::NAME` failed here
+  |
+  = note: this error originates in the macro `$crate::panic::panic_2021` which comes from the expansion of the macro `pges_subscribe::subscription_name` (in Nightly builds, run with -Z macro-backtrace for more info)

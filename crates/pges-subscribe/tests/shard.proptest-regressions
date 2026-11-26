@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 67b2404602a5cc0e06159f4717be7b4d071b1488a3b29fe199a2969b29d45e3d # shrinks to ops = [Append { cat: 2, stream: 5, events: 3 }, Append { cat: 1, stream: 4, events: 1 }, Append { cat: 2, stream: 0, events: 3 }, Append { cat: 2, stream: 3, events: 3 }, Restart(1), Sequence(4), Append { cat: 2, stream: 2, events: 2 }, Pause(16), Append { cat: 0, stream: 3, events: 3 }, Sequence(5), Sequence(5), Sequence(1), Restart(1), Pause(11), Append { cat: 0, stream: 5, events: 3 }, Append { cat: 1, stream: 2, events: 1 }, Sequence(4), Crash(1), Sequence(1), Append { cat: 2, stream: 1, events: 2 }, Append { cat: 1, stream: 3, events: 3 }, Append { cat: 0, stream: 5, events: 2 }, Append { cat: 0, stream: 0, events: 3 }, Crash(1), Sequence(4), Sequence(1), Crash(0), Pause(4), Restart(1), Restart(1), Append { cat: 2, stream: 2, events: 3 }, Sequence(2), Pause(6)], batch_size = 2
+cc a5f0d92a09ac2b37134eb90175d925b57743ff9fba3233b05d54c7365fda4661

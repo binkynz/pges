@@ -1,0 +1,15 @@
+error[E0080]: evaluation panicked: invalid number of lanes: it must be between 1 and 32767
+ --> tests/ui/lanes_out_of_range.rs:2:16
+  |
+2 |     let none = pges_subscribe::lanes!(0);
+  |                ^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `main::LANES` failed here
+  |
+  = note: this error originates in the macro `$crate::panic::panic_2021` which comes from the expansion of the macro `pges_subscribe::lanes` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0080]: evaluation panicked: invalid number of lanes: it must be between 1 and 32767
+ --> tests/ui/lanes_out_of_range.rs:3:20
+  |
+3 |     let too_many = pges_subscribe::lanes!(32768);
+  |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `main::LANES` failed here
+  |
+  = note: this error originates in the macro `$crate::panic::panic_2021` which comes from the expansion of the macro `pges_subscribe::lanes` (in Nightly builds, run with -Z macro-backtrace for more info)

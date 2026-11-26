@@ -1,0 +1,17 @@
+error: upcast entry 2 is out of range: version 2 needs upcast(1 => ...)
+ --> tests/ui/upcast_out_of_range.rs:6:64
+  |
+6 |     #[event(name = "job.created", version = 2, upcast(1 => up, 2 => up))]
+  |                                                                ^
+
+error: upcast entry 0 is out of range: version 1 has no older versions to upcast
+ --> tests/ui/upcast_out_of_range.rs:8:43
+  |
+8 |     #[event(name = "job.assigned", upcast(0 => up))]
+  |                                           ^
+
+error: duplicate upcast entry for version 1
+  --> tests/ui/upcast_out_of_range.rs:10:63
+   |
+10 |     #[event(name = "job.closed", version = 3, upcast(1 => up, 1 => up, 2 => up))]
+   |                                                               ^

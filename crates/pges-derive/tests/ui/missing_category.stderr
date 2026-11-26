@@ -1,0 +1,11 @@
+error: missing category: add #[event(category = "...")] to the enum
+ --> tests/ui/missing_category.rs:4:6
+  |
+4 | enum NoEventAttribute {
+  |      ^^^^^^^^^^^^^^^^
+
+error: missing category: add #[event(category = "...")] to the enum
+  --> tests/ui/missing_category.rs:11:6
+   |
+11 | enum NoCategory {
+   |      ^^^^^^^^^^

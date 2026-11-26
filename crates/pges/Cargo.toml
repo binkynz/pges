@@ -1,0 +1,65 @@
+[package]
+name = "pges"
+description = "An event store on PostgreSQL 18+: streams, a gap-free log per store, and exactly-once subscriptions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+keywords = ["event-sourcing", "event-store", "postgres", "cqrs", "database"]
+categories = ["database", "asynchronous"]
+include = ["src/**/*", "Cargo.toml", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["derive", "subscribe", "wake-grpc"]
+# #[derive(pges::Event)], also as pges::derive::Event.
+derive = ["dep:pges-derive"]
+# pges::subscribe, without wakers; add wake-grpc, wake-poll, wake-inproc or wake-notify.
+subscribe = ["dep:pges-subscribe"]
+wake-grpc = ["subscribe", "pges-subscribe/wake-grpc"]
+wake-grpc-tls = ["wake-grpc", "pges-subscribe/wake-grpc-tls"]
+wake-poll = ["subscribe", "pges-subscribe/wake-poll"]
+wake-inproc = ["subscribe", "pges-subscribe/wake-inproc"]
+wake-notify = ["subscribe", "pges-subscribe/wake-notify"]
+# pges::sequencer with the outbox and logical sources, as pges-sequencer's defaults.
+sequencer = ["sequencer-outbox", "source-logical"]
+# pges::sequencer with the outbox source only, without pges-replication.
+sequencer-outbox = ["dep:pges-sequencer"]
+# The logical source; it also turns on pges::replication, whose Config it takes.
+source-logical = ["sequencer-outbox", "pges-sequencer/source-logical", "replication"]
+watch-notify = ["sequencer-outbox", "pges-sequencer/watch-notify"]
+watch-grpc = ["sequencer-outbox", "pges-sequencer/watch-grpc"]
+watch-grpc-tls = ["watch-grpc", "pges-sequencer/watch-grpc-tls"]
+# pges::replication, the logical replication client; tls adds TLS.
+replication = ["dep:pges-replication"]
+tls = ["replication", "pges-replication/tls"]
+# W3C trace context: appends without a trace record the current tracing span's (tracing-opentelemetry);
+# delivered events give their trace as an OpenTelemetry parent context.
+otel = ["pges-core-dep/otel", "pges-postgres/otel", "pges-subscribe?/otel"]
+
+[dependencies]
+# Renamed so that `::pges_core` does not resolve in this crate's tests and doc examples: they then prove
+# that `#[derive(pges::Event)]` finds pges-core through the facade alone.
+pges-core-dep = { package = "pges-core", path = "../pges-core", version = "0.1.0" }
+pges-derive = { path = "../pges-derive", version = "0.1.0", optional = true }
+pges-postgres = { path = "../pges-postgres", version = "0.1.0" }
+pges-replication = { path = "../pges-replication", version = "0.1.0", default-features = false, optional = true }
+pges-sequencer = { path = "../pges-sequencer", version = "0.1.0", default-features = false, optional = true }
+pges-subscribe = { path = "../pges-subscribe", version = "0.1.0", default-features = false, optional = true }
+
+[dev-dependencies]
+anyhow = "1.0.105"
+futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
+pges-testing = { path = "../pges-testing" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.154"
+sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "postgres", "uuid"] }
+tokio = { version = "1.44", features = ["macros", "rt-multi-thread", "time"] }
+trybuild = "1.0.105"

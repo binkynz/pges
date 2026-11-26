@@ -1,0 +1,15 @@
+error[E0599]: no method named `run_pg` found for struct `pges_subscribe::backfill::Builder` in the current scope
+  --> tests/ui/backfill_without_categories.rs:25:10
+   |
+20 |       let _ = store
+   |  _____________-
+21 | |         .backfill(
+22 | |             pges_subscribe::subscription_name!("nothing"),
+23 | |             backfill::Until::Head,
+24 | |         )
+25 | |         .run_pg(Ignore)
+   | |         -^^^^^^ method not found in `pges_subscribe::backfill::Builder`
+   | |_________|
+   |
+   |
+   = note: the method was found for `pges_subscribe::backfill::Builder<Listed>`

@@ -1,0 +1,15 @@
+error[E0080]: evaluation panicked: invalid slot name: it must be 1 to 63 characters from a-z, 0-9 and _
+ --> tests/ui/invalid_names.rs:2:16
+  |
+2 |     let slot = pges_replication::slot_name!("Not-A-Slot");
+  |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `main::NAME` failed here
+  |
+  = note: this error originates in the macro `pges_replication::slot_name` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0080]: evaluation panicked: invalid publication name: it must match ^[a-z_][a-z0-9_]{0,62}$
+ --> tests/ui/invalid_names.rs:3:23
+  |
+3 |     let publication = pges_replication::publication_name!("1pges");
+  |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `main::NAME` failed here
+  |
+  = note: this error originates in the macro `pges_replication::publication_name` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -1,0 +1,17 @@
+error: #[serde] on an event enum does not change the stored data; for container attributes such as `rename_all`, use a newtype variant around a struct that derives serde
+ --> tests/ui/serde_container.rs:5:1
+  |
+5 | #[serde(rename_all = "camelCase")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: #[serde] on a variant does not change the stored data; for container attributes such as `rename_all`, use a newtype variant around a struct that derives serde
+  --> tests/ui/serde_container.rs:15:5
+   |
+15 |     #[serde(rename_all = "camelCase")]
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: #[serde] on a newtype variant's field does not change the stored data; put serde attributes on the inner type
+  --> tests/ui/serde_container.rs:23:13
+   |
+23 |     Created(#[serde(default)] u64),
+   |             ^^^^^^^^^^^^^^^^^

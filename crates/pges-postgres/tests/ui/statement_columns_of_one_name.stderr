@@ -1,0 +1,25 @@
+error[E0080]: evaluation panicked: another column is named `count`: read each with `at`
+  --> tests/ui/statement_columns_of_one_name.rs:11:1
+   |
+11 | / pges_postgres::typed_query! {
+12 | |     /// Read by name.
+13 | |     pub BY_NAME, mod by_name {
+14 | |         name: "counts/by_name",
+...  |
+19 | | }
+   | |_^ evaluation of `by_name::_` failed here
+   |
+   = note: this error originates in the macro `$crate::panic::panic_2021` which comes from the expansion of the macro `pges_postgres::typed_query` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0080]: evaluation panicked: the field `all` is read `at 1`, but is not at position 1 of the row
+  --> tests/ui/statement_columns_of_one_name.rs:21:1
+   |
+21 | / pges_postgres::typed_query! {
+22 | |     /// Read swapped.
+23 | |     pub SWAPPED, mod swapped {
+24 | |         name: "counts/swapped",
+...  |
+29 | | }
+   | |_^ evaluation of `swapped::_` failed here
+   |
+   = note: this error originates in the macro `$crate::panic::panic_2021` which comes from the expansion of the macro `pges_postgres::typed_query` (in Nightly builds, run with -Z macro-backtrace for more info)

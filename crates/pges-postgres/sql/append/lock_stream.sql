@@ -1,0 +1,11 @@
+-- Locks a stream's row until the transaction ends, and returns its last commit id. No row: the stream does
+-- not exist.
+--
+-- $1 stream id.
+--
+-- Taken before an append is run again with a new crate-generated commit id, which is then chosen above
+-- last_commit_id under the lock, so it cannot fall behind again. Without the lock, an UPDATE that arrives
+-- after the row's holder commits can take the newest row version before one already waiting, and appends
+-- that got their ids later keep overtaking the waiter. delete_stream takes it first too, so an `any`
+-- expectation cannot create the stream it deletes.
+SELECT last_commit_id FROM {store}.streams WHERE stream_id = $1 FOR UPDATE

@@ -1,0 +1,17 @@
+error: invalid crate path "not a path": expected a path such as "pges::core"
+ --> tests/ui/invalid_crate.rs:4:36
+  |
+4 | #[event(category = "jobs", crate = "not a path")]
+  |                                    ^^^^^^^^^^^^
+
+error: the crate path must not have generic arguments
+  --> tests/ui/invalid_crate.rs:11:36
+   |
+11 | #[event(category = "jobs", crate = "pges_core::<u8>")]
+   |                                    ^^^^^^^^^^^^^^^^^
+
+error: duplicate `crate`
+  --> tests/ui/invalid_crate.rs:18:51
+   |
+18 | #[event(category = "jobs", crate = "::pges_core", crate = "::pges_core")]
+   |                                                   ^^^^^^^^^^^^^^^^^^^^^

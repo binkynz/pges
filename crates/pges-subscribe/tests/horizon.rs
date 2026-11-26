@@ -1,0 +1,203 @@
+//! The retention horizon guard: a cursor behind a category's horizon stops the subscription with
+//! `CursorBeforeHorizon`, checked inside the read statement.
+
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+mod common;
+
+use anyhow::Result;
+
+use pges_core::{category, interval, non_empty, position, stream};
+use pges_subscribe::{
+    subscription::{self, StoreExt},
+    subscription_name,
+    waker::recheck,
+};
+
+use common::{Cat, Fixture, Recorder};
+
+async fn set_horizon(f: &Fixture, cat: Cat, horizon: i64) -> Result<()> {
+    sqlx::query("UPDATE es.categories SET horizon_position = $2 WHERE category_id = $1")
+        .bind(f.id(cat).get())
+        .bind(horizon)
+        .execute(&f.pool)
+        .await?;
+    Ok(())
+}
+
+async fn stopped_with(
+    subscription: subscription::Subscription,
+) -> Result<subscription::SubscribeError> {
+    common::Running::spawn(subscription).stopped().await
+}
+
+#[tokio::test]
+async fn a_cursor_behind_the_horizon_stops_the_subscription() -> Result<()> {
+    let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    let (job, order) = (stream::StreamId::new_v7(), stream::StreamId::new_v7());
+    for _ in 0..3 {
+        f.append(Cat::Jobs, job, 1).await?;
+        f.append(Cat::Orders, order, 1).await?;
+    }
+    f.sequence_all().await?;
+    // Retention removed jobs up to position 3.
+    set_horizon(&f, Cat::Jobs, 3).await?;
+
+    let error = stopped_with(
+        f.store
+            .subscription(subscription_name!("behind"))
+            .categories(non_empty![category!("jobs")])
+            .run_pg(Recorder::new("behind")),
+    )
+    .await?;
+    match error {
+        subscription::SubscribeError::CursorBeforeHorizon {
+            category,
+            cursor,
+            horizon,
+        } => {
+            assert_eq!(category, f.id(Cat::Jobs));
+            assert_eq!(cursor, position::Position::BEGINNING);
+            assert_eq!(horizon, pges_testing::position(3));
+        }
+        other => panic!("unexpected error {other:?}"),
+    }
+
+    // Over several categories the orders rows are not delivered either: the batch fails as a whole.
+    let error = stopped_with(
+        f.store
+            .subscription(subscription_name!("behind-both"))
+            .categories(non_empty![category!("orders"), category!("jobs")])
+            .run_pg(Recorder::new("behind-both")),
+    )
+    .await?;
+    assert!(
+        matches!(error, subscription::SubscribeError::CursorBeforeHorizon { category, .. }
+            if category == f.id(Cat::Jobs)),
+        "{error:?}"
+    );
+    assert!(f.delivered("behind-both").await?.is_empty());
+
+    // A subscription starting at the horizon reads what is left.
+    let running = common::Running::spawn(
+        f.store
+            .subscription(subscription_name!("at-horizon"))
+            .categories(non_empty![category!("jobs")])
+            .start(subscription::Start::Position(pges_testing::position(3)))
+            .run_pg(Recorder::new("at-horizon")),
+    );
+    running.wait_position(6).await?;
+    running.stop().await?;
+    assert_eq!(
+        f.delivered("at-horizon")
+            .await?
+            .iter()
+            .map(|d| d.0)
+            .collect::<Vec<_>>(),
+        [5]
+    );
+
+    f.finish().await
+}
+
+#[tokio::test]
+async fn a_horizon_that_passes_a_running_subscription_stops_it() -> Result<()> {
+    let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    let job = stream::StreamId::new_v7();
+    f.append(Cat::Jobs, job, 1).await?;
+    f.sequence_all().await?;
+
+    let running = common::Running::spawn(
+        f.store
+            .subscription(subscription_name!("overtaken"))
+            .categories(non_empty![category!("jobs")])
+            .waker(recheck::Recheck::every(interval!(5 ms)))
+            .run_pg(Recorder::new("overtaken")),
+    );
+    running.wait_position(1).await?;
+
+    // New events, then retention passes the cursor before the subscription reads them.
+    for _ in 0..3 {
+        f.append(Cat::Jobs, job, 1).await?;
+    }
+    set_horizon(&f, Cat::Jobs, 3).await?;
+    f.sequence_all().await?;
+
+    let error = running.stopped().await?;
+    assert!(
+        matches!(error, subscription::SubscribeError::CursorBeforeHorizon { cursor, .. }
+            if cursor == pges_testing::position(1)),
+        "{error:?}"
+    );
+    assert_eq!(f.cursor("overtaken").await?, Some(1));
+
+    f.finish().await
+}
+
+/// A category read takes two statements: the log page, with the horizon check, then the page's commits.
+/// Retention that raises the horizon and removes the commits in between stops the subscription; it does not
+/// skip the missing commits as deleted. A lock on the category's commits holds the subscription between the
+/// two statements.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_between_the_log_page_and_its_commits_stops_the_subscription() -> Result<()> {
+    let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    let job = stream::StreamId::new_v7();
+    for _ in 0..3 {
+        f.append(Cat::Jobs, job, 1).await?;
+    }
+    f.sequence_all().await?;
+
+    let mut retention = f.pool.begin().await?;
+    sqlx::query("LOCK TABLE es.commits_jobs IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *retention)
+        .await?;
+    let running = common::Running::spawn(
+        f.store
+            .subscription(subscription_name!("raced"))
+            .categories(non_empty![category!("jobs")])
+            .run_pg(Recorder::new("raced")),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'
+                   AND query LIKE '%commits_jobs%'",
+            )
+            .fetch_one(&f.pool)
+            .await?;
+            if waiting > 0 {
+                return anyhow::Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+
+    // As apply_retention does: the horizon first, then the commits go.
+    sqlx::query("UPDATE es.categories SET horizon_position = 3 WHERE category_id = $1")
+        .bind(f.id(Cat::Jobs).get())
+        .execute(&mut *retention)
+        .await?;
+    sqlx::query("DELETE FROM es.commits_jobs")
+        .execute(&mut *retention)
+        .await?;
+    retention.commit().await?;
+
+    let error = running.stopped().await?;
+    match error {
+        subscription::SubscribeError::CursorBeforeHorizon {
+            category,
+            cursor,
+            horizon,
+        } => {
+            assert_eq!(category, f.id(Cat::Jobs));
+            assert_eq!(cursor, position::Position::BEGINNING);
+            assert_eq!(horizon, pges_testing::position(3));
+        }
+        other => panic!("unexpected error {other:?}"),
+    }
+    assert!(f.delivered("raced").await?.is_empty());
+
+    f.finish().await
+}

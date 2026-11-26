@@ -1,0 +1,11 @@
+error: missing event name: add #[event(name = "...")] to variant `Created`
+ --> tests/ui/missing_name.rs:7:5
+  |
+7 |     Created { title: String },
+  |     ^^^^^^^
+
+error: missing event name: add #[event(name = "...")] to variant `Assigned`
+ --> tests/ui/missing_name.rs:8:5
+  |
+8 |     Assigned { assignee: String },
+  |     ^^^^^^^^

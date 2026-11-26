@@ -1,0 +1,103 @@
+-- pges/0001_init.sql
+-- Shared objects, once per database. Applied by the crate's migration runner inside one transaction,
+-- holding pg_advisory_xact_lock(hashtext('pges.migrate')).
+
+CREATE SCHEMA IF NOT EXISTS pges;
+
+-- Applied migrations for every scope: 'pges' itself and each store schema.
+CREATE TABLE pges.migrations (
+  applied_at timestamptz NOT NULL DEFAULT now(),
+  version    int4        NOT NULL,
+  scope      text        NOT NULL,
+  name       text        NOT NULL,
+  checksum   bytea       NOT NULL,              -- sha256 of the migration text
+  PRIMARY KEY (scope, version)
+);
+
+-- Compatibility window per scope. A crate whose schema version for the scope is below min_compatible
+-- must refuse to start.
+CREATE TABLE pges.scopes (
+  schema_version int4 NOT NULL,
+  min_compatible int4 NOT NULL,
+  scope          text PRIMARY KEY,
+  CHECK (min_compatible <= schema_version)
+);
+INSERT INTO pges.scopes (schema_version, min_compatible, scope) VALUES (1, 1, 'pges');
+
+CREATE TABLE pges.stores (
+  max_clock_skew interval NOT NULL DEFAULT '5 seconds' -- furthest a commit id may be from the clock;
+                 CHECK (max_clock_skew >= '0'),        -- writers' StoreConfig::max_clock_skew must not
+                                                       -- exceed it; retention and resequence use it
+  max_txn_age   interval NOT NULL DEFAULT '1 hour'  -- longest writer transaction (the writer roles'
+                CHECK (max_txn_age > '0'),          -- transaction_timeout); retention and resequence use it
+  last_position int8 NOT NULL DEFAULT 0,        -- store high-water mark, written by the sequencer at most
+                                                -- once a second; the exact value is max(log.last_position)
+  store_id      int4 GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  retention     int2 NOT NULL DEFAULT 0         -- default retention of new categories; codes as
+                CHECK (retention BETWEEN 0 AND 3), -- <store>.categories.retention
+  outbox        bool NOT NULL DEFAULT false,    -- appends also enqueue into <store>.pending (opt_outbox.sql)
+  dcb           bool NOT NULL DEFAULT false,    -- appends maintain tag_heads/commit_tags (opt_dcb.sql)
+  retain_for    interval,                       -- with retention, as <store>.categories.retain_for
+  schema_name   text NOT NULL UNIQUE,
+  CHECK ((retention = 0) = (retain_for IS NULL))
+);
+
+-- One kind of sequencer source per database: either every store has the outbox or none has. A store row is
+-- inserted with its final outbox flag. The check first takes the migration runner's lock (which the runner
+-- already holds), so of two READ COMMITTED transactions adding stores of different kinds, the second sees the
+-- first's row once it commits. SQLSTATE PGE02 maps to MigrateError::OutboxMismatch.
+CREATE FUNCTION pges.check_one_source_kind() RETURNS trigger
+  LANGUAGE plpgsql
+AS $$
+BEGIN
+  PERFORM pg_advisory_xact_lock(hashtext('pges.migrate'));
+  IF EXISTS (SELECT 1 FROM pges.stores WHERE outbox <> NEW.outbox) THEN
+    RAISE EXCEPTION 'store % has outbox = %, unlike the other stores of this database', NEW.schema_name,
+      NEW.outbox USING ERRCODE = 'PGE02';
+  END IF;
+  RETURN NULL;
+END $$;
+
+CREATE TRIGGER one_source_kind AFTER INSERT OR UPDATE OF outbox ON pges.stores
+  FOR EACH ROW EXECUTE FUNCTION pges.check_one_source_kind();
+
+-- Single row: sequencer leadership and progress. Updated on leadership change, lease renewal and token
+-- persistence only, not on every batch: a batch checks the fence with a row lock.
+CREATE TABLE pges.sequencer (
+  fence        int8 NOT NULL DEFAULT 0,         -- bumped on every leadership change
+  singleton    bool NOT NULL DEFAULT true PRIMARY KEY CHECK (singleton),
+  lease_until  timestamptz,                     -- NULL until the first leader; acquire with
+                                                -- WHERE lease_until IS NULL OR lease_until < now()
+  source       text,                            -- source kind that wrote source_token, e.g. 'logical'
+  source_token bytea,                           -- opaque resume point (LSN, Kafka offset, ...); everything
+                                                -- before it is in log
+  halted       text,                            -- set when sequencing stopped for a reason that needs an
+                                                -- operator (e.g. 'slot invalidated'); cleared by resequence
+  leader       text                             -- watch endpoint address of the current leader
+);
+INSERT INTO pges.sequencer DEFAULT VALUES;
+
+-- Lowest uuidv7 for a timestamp (millisecond floor). Used for commit partition bounds. Pass timestamptz
+-- values with an explicit offset ('2026-12-01 00:00:00+00'); a bare literal is read in the session TimeZone.
+CREATE FUNCTION pges.uuidv7_floor(ts timestamptz) RETURNS uuid
+  LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+  RETURN (lpad(to_hex(floor(extract(epoch FROM ts) * 1000)::int8), 12, '0')
+          || '70008000000000000000')::uuid;
+
+-- Rejects a client commit id whose timestamp is more than `tol` from the statement's start. Called from the
+-- append statement; SQLSTATE PGE01 maps to AppendError::CommitIdSkew. statement_timestamp(), not now(),
+-- so a long UnitOfWork does not drift.
+CREATE FUNCTION pges.check_commit_id(id uuid, tol interval) RETURNS uuid
+  LANGUAGE plpgsql STABLE PARALLEL SAFE
+AS $$
+BEGIN
+  IF uuid_extract_timestamp(id) NOT BETWEEN statement_timestamp() - tol AND statement_timestamp() + tol THEN
+    RAISE EXCEPTION 'commit id % is outside the clock skew tolerance %', id, tol USING ERRCODE = 'PGE01';
+  END IF;
+  RETURN id;
+END $$;
+
+-- Stores add their commits table to this publication. Only inserts are published, and the column list
+-- (set per table) leaves out the payload from the output. Decoding still reads every WAL record of the
+-- database, payload included.
+CREATE PUBLICATION pges WITH (publish = 'insert', publish_via_partition_root = true);

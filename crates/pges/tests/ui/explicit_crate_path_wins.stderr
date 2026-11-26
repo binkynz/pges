@@ -1,0 +1,5 @@
+error[E0433]: cannot find `pges_core` in the crate root
+ --> tests/ui/explicit_crate_path_wins.rs:5:36
+  |
+5 | #[event(category = "jobs", crate = "::pges_core")]
+  |                                    ^^^^^^^^^^^^^ could not find `pges_core` in the list of imported crates

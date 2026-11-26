@@ -1,0 +1,5 @@
+error: unsupported codec "msgpack"; supported codecs: "json"
+ --> tests/ui/unsupported_codec.rs:4:36
+  |
+4 | #[event(category = "jobs", codec = "msgpack")]
+  |                                    ^^^^^^^^^

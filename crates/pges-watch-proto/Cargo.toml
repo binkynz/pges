@@ -1,0 +1,34 @@
+[package]
+name = "pges-watch-proto"
+description = "The pges sequencer's gRPC watch service (pges.watch.v1): protobuf messages, tonic client and server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+keywords = ["grpc", "protobuf", "tonic", "event-sourcing"]
+categories = ["network-programming", "encoding"]
+include = ["src/**/*", "proto/**/*", "tests/**/*", "Cargo.toml", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true
+
+[features]
+# The generated tonic client, watch_client::WatchClient.
+client = ["dep:tonic", "dep:tonic-prost"]
+# The generated tonic server, watch_server::{Watch, WatchServer}.
+server = ["dep:tonic", "dep:tonic-prost"]
+
+[dependencies]
+pges-core = { path = "../pges-core", version = "0.1.0", default-features = false }
+prost = "0.14"
+tonic = { version = "0.14.2", default-features = false, features = ["codegen"], optional = true }
+tonic-prost = { version = "0.14.2", optional = true }
+
+[dev-dependencies]
+protox = "0.10"
+tonic-prost-build = { version = "0.14.2", default-features = false }

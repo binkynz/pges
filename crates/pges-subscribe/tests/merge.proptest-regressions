@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 559b29492e5ca3c40a4a4e1107e5276ce9ff6f1b8edb7334f5679c655d5b2c85 # shrinks to ops = [Append { cat: 0, stream: 0, events: 1 }, Append { cat: 0, stream: 0, events: 1 }, Append { cat: 0, stream: 0, events: 1 }, Append { cat: 0, stream: 0, events: 1 }, Append { cat: 0, stream: 0, events: 1 }], batch_size = 1
+cc 5fac8766d91e931618f5c2d462af234085d13a496327d6bfbd6cbc31b727337e # shrinks to ops = [Append { cat: 2, stream: 0, events: 2 }, Append { cat: 1, stream: 3, events: 1 }, Sequence(1), Sequence(5), Sequence(1), Sequence(1), Append { cat: 2, stream: 2, events: 3 }, Append { cat: 0, stream: 3, events: 1 }, Append { cat: 0, stream: 3, events: 1 }, Append { cat: 1, stream: 1, events: 3 }, Sequence(4), Sequence(5), Sequence(4), Append { cat: 1, stream: 3, events: 1 }, Sequence(1), Sequence(1), Append { cat: 2, stream: 1, events: 1 }, Sequence(1), Sequence(3), Restart, Append { cat: 1, stream: 2, events: 1 }, Append { cat: 1, stream: 0, events: 3 }, Crash, Append { cat: 2, stream: 2, events: 1 }, Append { cat: 0, stream: 1, events: 2 }, Append { cat: 1, stream: 3, events: 1 }, Pause(17), Crash, Sequence(5), Append { cat: 0, stream: 1, events: 2 }], batch_size = 2
+cc d5067bea0ff9115031443245f0f0eb30b3fbc797be17fa9bdf87c6eafcd0140c # shrinks to ops = [Crash], batch_size = 1

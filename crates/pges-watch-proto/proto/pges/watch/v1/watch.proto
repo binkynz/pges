@@ -1,0 +1,85 @@
+// The pges sequencer's watch service, version 1.
+//
+// A shape change is a new package (pges.watch.v2), never an edit of this one. Fields and enum values may be
+// added under new numbers; a number is never reused.
+
+syntax = "proto3";
+
+package pges.watch.v1;
+
+// How far each store's log has been sequenced, for subscribers that wait for new positions. Every value is a
+// hint: the log table is the truth, and a subscriber reads the log after a value has woken it.
+//
+// Only the leading sequencer serves Watch. A sequencer that stands by answers UNAVAILABLE, so a client with
+// several sequencer endpoints tries the next one.
+service Watch {
+  // Streams the store's high-water mark: the current value at once, then each new value. A reader may skip
+  // values, never the newest one. Within one leadership term (one fence) positions never go down.
+  //
+  // Fails with UNAVAILABLE when the server is not leading. Ends with UNAVAILABLE when the server stops
+  // leading, whether it stands by, halts, shuts down or is abandoned. A store the leader has not announced
+  // reads as all zero until it does.
+  rpc Watch(WatchRequest) returns (stream WatchResponse);
+
+  // The server's sequencer state, for health checks and for finding the leader.
+  rpc Status(StatusRequest) returns (StatusResponse);
+}
+
+// Which store to watch.
+message WatchRequest {
+  // The store's id, `pges.stores.store_id`.
+  int32 store_id = 1;
+}
+
+// One store's high-water mark, as announced by the leader of one term.
+message WatchResponse {
+  // The fence of the term that announced the value, `pges.sequencer.fence`. Every new leader has a higher
+  // fence.
+  uint64 fence = 1;
+  // The store's newest position.
+  uint64 store = 2;
+  // The newest position of each category that has events, sorted by category id.
+  repeated CategoryPosition categories = 3;
+  // The WAL position the sequencer read after the log rows committed, as a byte offset: the LSN `X/Y` is
+  // `(X << 32) | Y`. A reader on a replica waits until `pg_last_wal_replay_lsn()` reaches it. Absent when the
+  // sequencer has not read one yet.
+  optional uint64 lsn = 4;
+}
+
+// A category's newest position.
+message CategoryPosition {
+  // The category's id, `categories.category_id` in the store's schema.
+  int32 category_id = 1;
+  // The category's newest position in the store's log.
+  uint64 position = 2;
+}
+
+// Asks for the server's sequencer state.
+message StatusRequest {}
+
+// The server's sequencer state.
+message StatusResponse {
+  // What the sequencer is doing.
+  SequencerState state = 1;
+  // The fence of the term while leading; absent otherwise.
+  optional uint64 fence = 2;
+}
+
+// What a sequencer is doing.
+enum SequencerState {
+  // Not set; a newer server's state this client does not know.
+  SEQUENCER_STATE_UNSPECIFIED = 0;
+  // Waiting for the lease; another sequencer may lead.
+  SEQUENCER_STATE_STANDBY = 1;
+  // Holding the lease and sequencing. Watch is served.
+  SEQUENCER_STATE_LEADING = 2;
+  // Retrying after an error; it keeps leading if it can renew its lease in time.
+  SEQUENCER_STATE_RECOVERING = 3;
+  // Stopped on an error that needs an operator.
+  SEQUENCER_STATE_HALTED = 4;
+  // Stopped after a shutdown; a leader released its lease.
+  SEQUENCER_STATE_STOPPED = 5;
+  // The run ended without returning (a panic, an aborted task): the lease is not released, and a standby
+  // takes over once it expires. Alert on it.
+  SEQUENCER_STATE_ABANDONED = 6;
+}

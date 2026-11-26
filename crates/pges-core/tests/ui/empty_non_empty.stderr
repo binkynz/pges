@@ -1,0 +1,11 @@
+error: unexpected end of macro invocation
+ --> tests/ui/empty_non_empty.rs:4:44
+  |
+4 |     let roles: non_empty::NonEmpty<&str> = non_empty![];
+  |                                            ^^^^^^^^^^^^ missing tokens in macro arguments
+  |
+note: while trying to match meta-variable `$first:expr`
+ --> src/non_empty.rs
+  |
+  |     ($first:expr $(, $rest:expr)* $(,)?) => {
+  |      ^^^^^^^^^^^

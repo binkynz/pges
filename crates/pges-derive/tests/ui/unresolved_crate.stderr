@@ -1,0 +1,5 @@
+error[E0433]: cannot find `no_such_crate` in the crate root
+ --> tests/ui/unresolved_crate.rs:4:36
+  |
+4 | #[event(category = "jobs", crate = "::no_such_crate")]
+  |                                    ^^^^^^^^^^^^^^^^^ could not find `no_such_crate` in the list of imported crates

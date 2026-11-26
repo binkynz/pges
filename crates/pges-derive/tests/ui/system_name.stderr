@@ -1,0 +1,11 @@
+error: invalid event name "$stream-deleted": names starting with `$` are reserved for system events
+ --> tests/ui/system_name.rs:6:20
+  |
+6 |     #[event(name = "$stream-deleted")]
+  |                    ^^^^^^^^^^^^^^^^^
+
+error: event names must not be empty
+ --> tests/ui/system_name.rs:8:20
+  |
+8 |     #[event(name = "")]
+  |                    ^^

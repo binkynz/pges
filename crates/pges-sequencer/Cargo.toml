@@ -1,0 +1,67 @@
+[package]
+name = "pges-sequencer"
+description = "The pges sequencer: orders committed appends into each store's gap-free log"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+keywords = ["event-sourcing", "event-store", "postgres", "logical-replication"]
+categories = ["database", "asynchronous", "command-line-utilities"]
+include = ["src/**/*", "sql/**/*", "Cargo.toml", "README.md", "LICENSE-MIT", "LICENSE-APACHE"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["source-logical"]
+# The logical replication source (pges-replication), with TLS.
+source-logical = ["dep:pges-replication", "pges-replication/tls"]
+# NOTIFY pges_<store> after each batch.
+watch-notify = []
+# The gRPC watch server, pges.watch.v1.Watch (tonic).
+watch-grpc = ["dep:pges-watch-proto", "dep:tonic", "tokio/net"]
+# TLS, and optionally client certificates, for the gRPC watch server (rustls with ring, through tonic).
+watch-grpc-tls = ["watch-grpc", "dep:rustls", "dep:rustls-pki-types", "tonic/tls-ring"]
+# The pges-sequencer binary.
+bin = ["dep:clap", "dep:tracing-subscriber", "tokio/rt-multi-thread", "tokio/signal"]
+
+[[bin]]
+name = "pges-sequencer"
+path = "src/bin/pges-sequencer.rs"
+required-features = ["bin"]
+
+[dependencies]
+clap = { version = "4.5", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"], optional = true }
+futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
+pges-core = { path = "../pges-core", version = "0.1.0" }
+pges-postgres = { path = "../pges-postgres", version = "0.1.0" }
+pges-replication = { path = "../pges-replication", version = "0.1.0", optional = true }
+pges-watch-proto = { path = "../pges-watch-proto", version = "0.1.0", features = ["server"], optional = true }
+rustls = { version = "0.23.46", default-features = false, features = ["std"], optional = true }
+rustls-pki-types = { version = "1.16", features = ["std"], optional = true }
+sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "postgres", "uuid"] }
+thiserror = "2"
+tokio = { version = "1.44", features = ["macros", "sync", "time"] }
+tonic = { version = "0.14.2", default-features = false, features = ["codegen", "server"], optional = true }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", default-features = false, features = ["fmt", "env-filter", "ansi", "std"], optional = true }
+uuid = "1.26.1"
+
+[dev-dependencies]
+anyhow = "1.0.105"
+pges-watch-proto = { path = "../pges-watch-proto", features = ["client", "server"] }
+tonic = { version = "0.14.2", default-features = false, features = ["channel"] }
+trybuild = "1.0.105"
+pges-derive = { path = "../pges-derive" }
+pges-testing = { path = "../pges-testing", features = ["tls"] }
+proptest = "1.11"
+serde = { version = "1", features = ["derive"] }
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
+tokio = { version = "1.44", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+uuid = { version = "1.26.1", features = ["serde", "v7"] }

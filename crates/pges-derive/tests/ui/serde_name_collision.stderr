@@ -1,0 +1,17 @@
+error: field `name` is stored or read as "title", which field `title` already uses
+ --> tests/ui/serde_name_collision.rs:9:26
+  |
+9 |         #[serde(rename = "title")]
+  |                          ^^^^^^^
+
+error: field `owner` is stored or read as "assignee", which field `assignee` already uses
+  --> tests/ui/serde_name_collision.rs:15:25
+   |
+15 |         #[serde(alias = "assignee")]
+   |                         ^^^^^^^^^^
+
+error: field `kind` is stored or read as "type", which field `r#type` already uses
+  --> tests/ui/serde_name_collision.rs:18:26
+   |
+18 |         #[serde(rename = "type")]
+   |                          ^^^^^^

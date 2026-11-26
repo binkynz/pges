@@ -1,0 +1,7 @@
+error[E0277]: the `?` operator can only be applied to values that implement `Try`
+ --> tests/ui/admin_with_a_store_name_cannot_fail.rs:6:17
+  |
+6 |     let admin = admin::Admin::new(pool, pges_core::store_name!("ops_es"))?;
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the `?` operator cannot be applied to type `Admin`
+  |
+  = help: the nightly-only, unstable trait `Try` is not implemented for `Admin`

@@ -1,0 +1,11 @@
+error[E0616]: field `state` of struct `Loaded` is private
+ --> tests/ui/loaded_is_read_only.rs:6:12
+  |
+6 |     loaded.state = A::default();
+  |            ^^^^^ private field
+
+error[E0616]: field `version` of struct `Loaded` is private
+ --> tests/ui/loaded_is_read_only.rs:7:12
+  |
+7 |     loaded.version = None;
+  |            ^^^^^^^ private field

@@ -1,0 +1,41 @@
+error: #[derive(Event)] only supports enums, with one variant per event type
+ --> tests/ui/unsupported_shapes.rs:5:8
+  |
+5 | struct NotAnEnum {
+  |        ^^^^^^^^^
+
+error: #[derive(Event)] does not support generic enums
+  --> tests/ui/unsupported_shapes.rs:11:13
+   |
+11 | enum Generic<T> {
+   |             ^
+
+error: tuple variants must have exactly one field; use a struct variant or a newtype variant
+  --> tests/ui/unsupported_shapes.rs:20:12
+   |
+20 |     Created(String, u8),
+   |            ^^^^^^^^^^^^
+
+error: #[derive(Event)] needs at least one variant
+  --> tests/ui/unsupported_shapes.rs:25:6
+   |
+25 | enum NoVariants {}
+   |      ^^^^^^^^^^
+
+error: unknown enum attribute; expected `category`, `codec` or `crate`
+  --> tests/ui/unsupported_shapes.rs:28:28
+   |
+28 | #[event(category = "jobs", owner = "me")]
+   |                            ^^^^^
+
+error: unknown variant attribute; expected `name`, `version` or `upcast`
+  --> tests/ui/unsupported_shapes.rs:37:35
+   |
+37 |     #[event(name = "job.created", since = 2)]
+   |                                   ^^^^^
+
+error: schema versions start at 1
+  --> tests/ui/unsupported_shapes.rs:44:45
+   |
+44 |     #[event(name = "job.created", version = 0)]
+   |                                             ^

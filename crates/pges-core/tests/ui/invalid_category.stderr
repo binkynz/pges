@@ -1,0 +1,15 @@
+error[E0080]: evaluation panicked: invalid category name: it must match ^[a-z][a-z0-9_]{0,39}$
+ --> tests/ui/invalid_category.rs:3:44
+  |
+3 | const UPPER_CASE: category::CategoryName = category!("Jobs");
+  |                                            ^^^^^^^^^^^^^^^^^ evaluation of `UPPER_CASE::NAME` failed here
+  |
+  = note: this error originates in the macro `$crate::panic::panic_2021` which comes from the expansion of the macro `category` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+note: erroneous constant encountered
+ --> tests/ui/invalid_category.rs:3:44
+  |
+3 | const UPPER_CASE: category::CategoryName = category!("Jobs");
+  |                                            ^^^^^^^^^^^^^^^^^
+  |
+  = note: this note originates in the macro `category` (in Nightly builds, run with -Z macro-backtrace for more info)

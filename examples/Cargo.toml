@@ -1,0 +1,26 @@
+[package]
+name = "pges-examples"
+description = "Runnable examples for pges"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1.0.105"
+futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
+opentelemetry = { version = "0.33.1", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace"] }
+pges = { path = "../crates/pges", features = ["derive", "subscribe", "wake-inproc", "wake-grpc", "sequencer", "watch-grpc", "otel"] }
+pges-testing = { path = "../crates/pges-testing" }
+sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "postgres", "uuid"] }
+tokio = { version = "1.44", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1.41"
+tracing-opentelemetry = { version = "0.34.0", default-features = false }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "env-filter", "ansi", "registry", "std"] }
+url = "2.5"
+uuid = { version = "1.26.1", features = ["serde", "v7"] }

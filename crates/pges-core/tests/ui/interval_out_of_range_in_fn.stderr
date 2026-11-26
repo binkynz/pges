@@ -1,0 +1,7 @@
+error[E0080]: evaluation panicked: invalid interval: it must be between 1 ms and 30 days
+ --> tests/ui/interval_out_of_range_in_fn.rs:4:20
+  |
+4 |     let too_long = interval!(31 d);
+  |                    ^^^^^^^^^^^^^^^ evaluation of `main::INTERVAL` failed here
+  |
+  = note: this error originates in the macro `$crate::panic::panic_2021` which comes from the expansion of the macro `interval` (in Nightly builds, run with -Z macro-backtrace for more info)

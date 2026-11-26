@@ -1,0 +1,15 @@
+error[E0080]: evaluation panicked: invalid interval: it must be between 1 ms and 30 days
+ --> tests/ui/interval_out_of_range.rs:3:34
+  |
+3 | const ZERO: interval::Interval = interval!(0 ms);
+  |                                  ^^^^^^^^^^^^^^^ evaluation of `ZERO::INTERVAL` failed here
+  |
+  = note: this error originates in the macro `$crate::panic::panic_2021` which comes from the expansion of the macro `interval` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+note: erroneous constant encountered
+ --> tests/ui/interval_out_of_range.rs:3:34
+  |
+3 | const ZERO: interval::Interval = interval!(0 ms);
+  |                                  ^^^^^^^^^^^^^^^
+  |
+  = note: this note originates in the macro `$crate::interval` which comes from the expansion of the macro `interval` (in Nightly builds, run with -Z macro-backtrace for more info)

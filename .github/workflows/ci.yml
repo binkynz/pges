@@ -1,0 +1,71 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned: the trybuild `.stderr` files hold this compiler's wording, and the compile-fail tests run only
+      # on it (`TOOLCHAIN` in each crate's tests/compile_fail.rs). Bump both together.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo doc --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+      # Intra-doc links and doc examples behind features break only when the feature is off: build each
+      # workspace crate's docs and run its doctests with no features, then with each feature alone. The
+      # crates and features come from `cargo metadata`, so a new crate or feature is covered without an edit.
+      - name: cargo doc and doctests per feature
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          set -euo pipefail
+          cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | [.name] + (.features | keys - ["default"]) | join(" ")' \
+            | while read -r crate features; do
+                for feature in "" $features; do
+                  echo "::group::$crate ${feature:-(no features)}"
+                  cargo doc -p "$crate" --no-deps --no-default-features ${feature:+--features "$feature"} </dev/null
+                  cargo test -p "$crate" --doc --no-default-features ${feature:+--features "$feature"} </dev/null
+                  echo "::endgroup::"
+                done
+              done
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+      # Tests start postgres:18 with wal_level=logical themselves (testcontainers on the runner's Docker).
+      - run: cargo test --workspace --all-features
+      # The examples crate enables optional features (otel among them), and feature unification would
+      # turn them on for every crate in a workspace run. Test the library crates on their own defaults too.
+      - run: cargo test -p pges-core -p pges-postgres -p pges-subscribe -p pges-sequencer
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94
+      - run: cargo check --workspace --all-targets --all-features
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2

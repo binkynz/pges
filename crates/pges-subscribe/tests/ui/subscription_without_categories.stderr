@@ -1,0 +1,18 @@
+error[E0599]: the method `run` exists for struct `pges_subscribe::subscription::Builder`, but its trait bounds were not satisfied
+  --> tests/ui/subscription_without_categories.rs:15:10
+   |
+13 |       let _ = store
+   |  _____________-
+14 | |         .subscription(pges_subscribe::subscription_name!("nothing"))
+15 | |         .run(Ignore);
+   | |         -^^^ method cannot be called on `pges_subscribe::subscription::Builder` due to unsatisfied trait bounds
+   | |_________|
+   |
+   |
+  ::: src/subscription.rs
+   |
+   |   pub enum NoScope {}
+   |   ---------------- doesn't satisfy `NoScope: pges_subscribe::subscription::Scope`
+   |
+   = note: the following trait bounds were not satisfied:
+           `NoScope: pges_subscribe::subscription::Scope`

@@ -1,0 +1,63 @@
+error[E0308]: mismatched types
+ --> tests/ui/zero_settings.rs:9:21
+  |
+9 |         .batch_size(0)
+  |          ---------- ^ expected `NonZero<u32>`, found integer
+  |          |
+  |          arguments to this method are incorrect
+  |
+  = note: expected struct `NonZero<u32>`
+               found type `{integer}`
+note: method defined here
+ --> src/subscription.rs
+  |
+  |     pub fn batch_size(mut self, batch_size: NonZeroU32) -> Self {
+  |            ^^^^^^^^^^
+help: consider calling `NonZero::new`
+  |
+9 |         .batch_size(NonZero::new(0).unwrap())
+  |                     +++++++++++++ ++++++++++
+
+error[E0308]: mismatched types
+  --> tests/ui/zero_settings.rs:10:18
+   |
+10 |         .sharded(0)
+   |          ------- ^ expected `Shards`, found integer
+   |          |
+   |          arguments to this method are incorrect
+   |
+note: method defined here
+  --> src/subscription.rs
+   |
+   |     pub fn sharded(mut self, shards: Shards) -> Self {
+   |            ^^^^^^^
+
+error[E0308]: mismatched types
+  --> tests/ui/zero_settings.rs:11:16
+   |
+11 |         .lease(Duration::ZERO);
+   |          ----- ^^^^^^^^^^^^^^ expected `Interval`, found `Duration`
+   |          |
+   |          arguments to this method are incorrect
+   |
+note: method defined here
+  --> src/subscription.rs
+   |
+   |     pub fn lease(mut self, lease: interval::Interval) -> Self {
+   |            ^^^^^
+
+error[E0308]: mismatched types
+  --> tests/ui/zero_settings.rs:12:32
+   |
+12 |     let _ = waker::Wakers::any(Vec::new());
+   |             ------------------ ^^^^^^^^^^ expected `NonEmpty<Box<dyn DynWaker>>`, found `Vec<_>`
+   |             |
+   |             arguments to this function are incorrect
+   |
+   = note: expected struct `pges_core::non_empty::NonEmpty<Box<(dyn DynWaker + 'static)>>`
+              found struct `Vec<_>`
+note: associated function defined here
+  --> src/waker.rs
+   |
+   |     pub fn any(wakers: non_empty::NonEmpty<Box<dyn DynWaker>>) -> Self {
+   |            ^^^

@@ -1,0 +1,26 @@
+error[E0308]: mismatched types
+ --> tests/ui/limits_and_roles_are_checked_types.rs:8:26
+  |
+8 |     limits.max_txn_age = Duration::ZERO;
+  |     ------------------   ^^^^^^^^^^^^^^ expected `Interval`, found `Duration`
+  |     |
+  |     expected due to the type of this binding
+
+error[E0308]: mismatched types
+ --> tests/ui/limits_and_roles_are_checked_types.rs:9:30
+  |
+9 |     definition.max_txn_age = Duration::ZERO;
+  |     ----------------------   ^^^^^^^^^^^^^^ expected `Interval`, found `Duration`
+  |     |
+  |     expected due to the type of this binding
+
+error[E0308]: mismatched types
+  --> tests/ui/limits_and_roles_are_checked_types.rs:13:27
+   |
+13 |     config.writer_roles = Vec::new();
+   |     -------------------   ^^^^^^^^^^ expected `WriterRoles`, found `Vec<_>`
+   |     |
+   |     expected due to the type of this binding
+   |
+   = note: expected struct `WriterRoles`
+              found struct `Vec<_>`

@@ -1,0 +1,11 @@
+error[E0599]: no method named `commit` found for struct `WrappedUnitOfWork<'a>` in the current scope
+ --> tests/ui/wrapped_unit_of_work_cannot_commit.rs:6:18
+  |
+6 |     let _ = work.commit().await;
+  |                  ^^^^^^ method not found in `WrappedUnitOfWork<'_>`
+
+error[E0599]: no method named `rollback` found for struct `WrappedUnitOfWork<'a>` in the current scope
+  --> tests/ui/wrapped_unit_of_work_cannot_commit.rs:10:18
+   |
+10 |     let _ = work.rollback().await;
+   |                  ^^^^^^^^ method not found in `WrappedUnitOfWork<'_>`

@@ -1,0 +1,18 @@
+error[E0308]: mismatched types
+  --> tests/ui/statement_binds_and_reads_are_typed.rs:11:16
+   |
+11 |         shard: 0_i64,
+   |                ^^^^^ expected `i16`, found `i64`
+
+error[E0308]: mismatched types
+  --> tests/ui/statement_binds_and_reads_are_typed.rs:23:28
+   |
+23 |     let _wrong_read: u64 = row.position;
+   |                      ---   ^^^^^^^^^^^^ expected `u64`, found `i64`
+   |                      |
+   |                      expected due to this
+   |
+help: you can convert an `i64` to a `u64` and panic if the converted value doesn't fit
+   |
+23 |     let _wrong_read: u64 = row.position.try_into().unwrap();
+   |                                        ++++++++++++++++++++

@@ -1,0 +1,15 @@
+error[E0080]: evaluation panicked: a version is between 1 and i64::MAX
+ --> tests/ui/version_out_of_range.rs:4:17
+  |
+4 |     let _zero = pges_core::version!(0);
+  |                 ^^^^^^^^^^^^^^^^^^^^^^ evaluation of `main::VERSION` failed here
+  |
+  = note: this error originates in the macro `$crate::panic::panic_2021` which comes from the expansion of the macro `pges_core::version` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0080]: evaluation panicked: a version is between 1 and i64::MAX
+ --> tests/ui/version_out_of_range.rs:5:16
+  |
+5 |     let _far = pges_core::version!(i64::MAX.unsigned_abs() + 1);
+  |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `main::VERSION` failed here
+  |
+  = note: this error originates in the macro `$crate::panic::panic_2021` which comes from the expansion of the macro `pges_core::version` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -1,0 +1,20 @@
+error[E0599]: no method named `all_categories` found for struct `pges_subscribe::backfill::Builder<S>` in the current scope
+  --> tests/ui/backfill_all_categories.rs:10:10
+   |
+ 5 |       let _ = store
+   |  _____________-
+ 6 | |         .backfill(
+ 7 | |             pges_subscribe::subscription_name!("everything"),
+ 8 | |             backfill::Until::Head,
+ 9 | |         )
+10 | |         .all_categories();
+   | |_________-^^^^^^^^^^^^^^
+   |
+help: there is a method `categories` with a similar name, but with different arguments
+  --> src/backfill.rs
+   |
+   | /     pub fn categories(
+   | |         self,
+   | |         names: non_empty::NonEmpty<category::CategoryName>,
+   | |     ) -> Builder<subscription::Listed> {
+   | |______________________________________^

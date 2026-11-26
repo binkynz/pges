@@ -1,0 +1,15 @@
+error[E0061]: this method takes 2 arguments but 1 argument was supplied
+ --> tests/ui/backfill_without_until.rs:5:19
+  |
+5 |     let _ = store.backfill(pges_subscribe::subscription_name!("no-end"));
+  |                   ^^^^^^^^---------------------------------------------- argument #2 is missing
+  |
+note: method defined here
+ --> src/subscription.rs
+  |
+  |     fn backfill(
+  |        ^^^^^^^^
+help: provide the argument
+  |
+5 |     let _ = store.backfill(pges_subscribe::subscription_name!("no-end"), /* until */);
+  |                                                                        +++++++++++++
