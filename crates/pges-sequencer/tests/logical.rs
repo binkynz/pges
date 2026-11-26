@@ -623,6 +623,10 @@ async fn a_store_created_while_streaming_is_sequenced() -> Result<()> {
 /// A batch that waits longer than `wal_sender_timeout` (here on a lock of the log) does not lose the
 /// replication connection: the source sends status updates while the batch runs. Without them the server
 /// ends the connection, which the first run shows.
+///
+/// Each step waits for the state it needs, not for a fixed time: the batch waiting on the lock, the
+/// walsender gone, the sequencer's error recorded. The sequencer notices the lost connection only when it
+/// next uses it, after its batch commits, so its log rows can be visible before the error is.
 #[tokio::test]
 async fn a_slow_batch_keeps_the_replication_connection() -> Result<()> {
     let f = Fixture::logical().await?;
@@ -632,29 +636,42 @@ async fn a_slow_batch_keeps_the_replication_connection() -> Result<()> {
     )))
     .execute(&f.pool)
     .await?;
+    let slot = f.slot().await?;
     let mut count = 0;
 
-    let errors = slow_batch(&f, interval!(30 s), &mut count)
-        .await?
-        .stop_after_errors()
-        .await?;
+    let silent = start_with_status_interval(&f, interval!(30 s)).await?;
+    let walsender = active_pid(&f.pool, &slot).await?;
+    let locker = block_a_batch(&f, &mut count).await?;
+    wait_walsender_ended(&f.pool, &slot, walsender).await?;
+    unblock(&f, locker, count).await?;
+    wait_recovered(&silent).await?;
+    let errors = silent.stop_after_errors().await?;
     assert!(
-        !errors.is_empty(),
-        "the server kept a silent connection open; wal_sender_timeout did not apply"
+        errors.iter().all(|e| e.starts_with("source failed")),
+        "the sequencer recovered from {errors:?}, not only from the lost replication connection"
     );
 
-    let running = slow_batch(&f, interval!(200 ms), &mut count).await?;
+    let running = start_with_status_interval(&f, interval!(200 ms)).await?;
+    let walsender = active_pid(&f.pool, &slot).await?;
+    let locker = block_a_batch(&f, &mut count).await?;
+    // Three times `wal_sender_timeout`, counted from when the batch is known to wait.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        active_pid(&f.pool, &slot).await?,
+        walsender,
+        "the walsender changed while the batch waited"
+    );
+    unblock(&f, locker, count).await?;
     running.stop().await?;
+
     assert_eq!(common::check_log(&f.pool).await?.len(), count);
     f.finish().await
 }
 
-/// Starts a sequencer whose source sends status updates every `status_interval`, and makes one of its
-/// batches wait 3 s for a lock on the log.
-async fn slow_batch(
+/// Starts a sequencer whose source sends status updates every `status_interval`, and waits until it leads.
+async fn start_with_status_interval(
     f: &Fixture,
     status_interval: interval::Interval,
-    count: &mut usize,
 ) -> Result<common::Running> {
     let mut config = common::logical_config();
     config.status_interval = status_interval;
@@ -669,17 +686,70 @@ async fn slow_batch(
     let running = common::Running::start(pool, source, sequencer)?;
     running.wait_leading().await?;
 
+    Ok(running)
+}
+
+/// Locks the log, appends one commit, and waits until the sequencer's batch for it waits on the lock. The
+/// returned connection holds the lock until [`unblock`].
+async fn block_a_batch(f: &Fixture, count: &mut usize) -> Result<sqlx::PgConnection> {
     let mut locker = f.db.connect().await?;
     locker
         .execute("BEGIN; LOCK TABLE es.log IN EXCLUSIVE MODE")
         .await?;
     f.append(Target::Job(stream::StreamId::new_v7()), 1).await?;
     *count += 1;
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    locker.execute("COMMIT").await?;
-    common::wait_sequenced(&f.pool, *count).await?;
 
-    Ok(running)
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_locks WHERE relation = 'es.log'::regclass AND NOT granted",
+        )
+        .fetch_one(&f.pool)
+        .await?;
+        if waiting > 0 {
+            return Ok(locker);
+        }
+        if tokio::time::Instant::now() > deadline {
+            bail!("no batch waits on the lock of the log");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn unblock(f: &Fixture, mut locker: sqlx::PgConnection, count: usize) -> Result<()> {
+    locker.execute("COMMIT").await?;
+    common::wait_sequenced(&f.pool, count).await
+}
+
+/// Waits until `walsender` no longer streams from the slot: the server ended its connection.
+async fn wait_walsender_ended(pool: &PgPool, slot: &str, walsender: Option<i32>) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let pid: Option<i32> =
+            sqlx::query_scalar("SELECT active_pid FROM pg_replication_slots WHERE slot_name = $1")
+                .bind(slot)
+                .fetch_one(pool)
+                .await?;
+        if pid != walsender {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() > deadline {
+            bail!("the server kept a silent connection open; wal_sender_timeout did not apply");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Waits until the sequencer reports an error it recovers from.
+async fn wait_recovered(running: &common::Running) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while running.errors().is_empty() {
+        if tokio::time::Instant::now() > deadline {
+            bail!("the sequencer did not notice that it lost the replication connection");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(())
 }
 
 async fn stored_token(pool: &PgPool) -> Result<Option<Vec<u8>>> {
