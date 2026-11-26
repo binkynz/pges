@@ -15,6 +15,7 @@ use sqlx::{Executor, PgPool};
 use pges_core::{interval, stream, version};
 use pges_postgres::{admin, store};
 use pges_sequencer::{logical, sequencer, source};
+use pges_testing::proxy;
 
 use common::{Fixture, JobEvent, OrderEvent, Target};
 
@@ -482,37 +483,34 @@ async fn bootstrap_refuses_an_outbox_database() -> Result<()> {
 
 /// The slot is dropped while the sequencer streams: it recovers from the lost connection (expected), then
 /// finds the slot missing with a token stored, records the halt and stops. Nothing restarts it.
+///
+/// The replication connection goes through a proxy that refuses new connections while the slot is dropped:
+/// otherwise the sequencer could take the slot again between its walsender ending and the drop.
 #[tokio::test]
 async fn a_dropped_slot_halts_sequencing() -> Result<()> {
     let f = Fixture::logical().await?;
     let slot = f.slot().await?;
-    let running = f.start(common::fast()).await?;
+    let proxy = proxy::Proxy::start(pges_testing::server().await?).await?;
+    let pool = f.db.pool().await?;
+    let source = logical::LogicalSource::new(
+        pool.clone(),
+        pges_replication::config::Config::from_url(&proxy.url(&f.db)?)?,
+        common::logical_config(),
+    );
+    let running = common::Running::start(pool, source, common::fast())?;
     running.wait_leading().await?;
     f.append(Target::Job(stream::StreamId::new_v7()), 1).await?;
     common::wait_sequenced(&f.pool, 1).await?;
     wait_for_token(&f.pool, |stored| !stored.is_empty()).await?;
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    loop {
-        sqlx::query(
-            "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots
-             WHERE slot_name = $1 AND active_pid IS NOT NULL",
-        )
+    proxy.refuse();
+    proxy.drop_connections();
+    wait_inactive(&f.pool, &slot).await?;
+    sqlx::query("SELECT pg_drop_replication_slot($1)")
         .bind(&slot)
         .execute(&f.pool)
         .await?;
-        let dropped = sqlx::query("SELECT pg_drop_replication_slot($1)")
-            .bind(&slot)
-            .execute(&f.pool)
-            .await;
-        if dropped.is_ok() {
-            break;
-        }
-        if tokio::time::Instant::now() > deadline {
-            bail!("could not drop the slot: {dropped:?}");
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    proxy.admit();
 
     let result = running.result().await;
     let Err(sequencer::RunError::Source(source::SourceError::Halt(error))) = &result else {
