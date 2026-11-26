@@ -160,6 +160,10 @@ pub struct AppendArgs {
     /// Bytes of payload per event.
     #[arg(long, default_value_t = 100)]
     pub payload: usize,
+    /// Streams per call: above 1, each call is one `append_many` of that many distinct streams, one event
+    /// each.
+    #[arg(long, default_value_t = 1)]
+    pub batch: usize,
 }
 
 /// Which streams `append` writes to.
@@ -1024,6 +1028,7 @@ async fn append(server_url: &str, args: &AppendArgs) -> Result<report::Report> {
                 "category": generation.category,
                 "category_streams": generation.streams,
                 "concurrency": concurrency,
+                "batch": args.batch.max(1),
                 "seconds": load.elapsed.as_secs_f64(),
                 "calls": load.calls,
                 "calls_per_s": load.calls_per_second(),
@@ -1048,16 +1053,22 @@ async fn append(server_url: &str, args: &AppendArgs) -> Result<report::Report> {
     Ok(report)
 }
 
-/// A single-event append to a random existing stream, or to a new stream.
+/// A single-event append to a random existing stream, or to a new stream; or, with a batch above 1, an
+/// `append_many` of single-event appends to that many.
 #[derive(Clone)]
 struct AppendOperation<E> {
     store: store::Store,
     streams: Option<Arc<[stream::StreamId]>>,
     events: Arc<[E]>,
+    batch: usize,
 }
 
 impl<E: Generated> measure::Operation for AppendOperation<E> {
     async fn call(&self, rng: &mut event::Rng) -> Result<u64> {
+        if self.batch > 1 {
+            return self.call_many(rng).await;
+        }
+
         let event = &self.events[rng.below(self.events.len())..][..1];
         match &self.streams {
             Some(streams) => {
@@ -1081,6 +1092,35 @@ impl<E: Generated> measure::Operation for AppendOperation<E> {
     }
 }
 
+impl<E: Generated> AppendOperation<E> {
+    async fn call_many(&self, rng: &mut event::Rng) -> Result<u64> {
+        let mut ids: Vec<stream::StreamId> = Vec::with_capacity(self.batch);
+        while ids.len() < self.batch {
+            let id = match &self.streams {
+                Some(streams) => streams[rng.below(streams.len())],
+                None => stream::StreamId::new_v7(),
+            };
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        let expected = match self.streams {
+            Some(_) => version::ExpectedVersion::Any,
+            None => version::ExpectedVersion::NoStream,
+        };
+        let entries: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                let event = &self.events[rng.below(self.events.len())..][..1];
+                pges::postgres::append::AppendEntry::new(*id, expected, event)
+            })
+            .collect();
+        self.store.append_many(entries).await?;
+
+        Ok(self.batch as u64)
+    }
+}
+
 async fn append_load<E: Generated>(
     store: &store::Store,
     streams: Option<Arc<[stream::StreamId]>>,
@@ -1095,6 +1135,7 @@ async fn append_load<E: Generated>(
             .map(|_| E::sized(args.payload, &mut rng))
             .collect::<Vec<E>>()
             .into(),
+        batch: args.batch.max(1),
     };
     measure::warm_up(operation.clone(), concurrency, args.warmup).await?;
     measure::drive(
