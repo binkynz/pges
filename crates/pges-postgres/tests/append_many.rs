@@ -461,16 +461,17 @@ async fn a_batch_locks_the_streams_partitions_it_touches() -> Result<()> {
 /// A batch in its own transaction runs with custom plans whatever the statistics and the role's or
 /// session's `plan_cache_mode`, so the batch statement prunes `streams` to the batch's partitions, and the
 /// setting ends with the transaction. On a one-connection pool whose sessions force generic plans, and on a
-/// store analyzed nearly empty, ten batches plan the batch statement ten times as custom plans and never
-/// as a generic one (`pg_prepared_statements`); the session keeps its own mode.
+/// store analyzed with 3 streams in all, ten batches plan the batch statement ten times as custom plans and
+/// never as a generic one (`pg_prepared_statements`); the session keeps its own mode. With the plan cache's
+/// own choice the nearly empty store switched to a generic plan after five custom ones.
 #[tokio::test]
 async fn a_batch_in_its_own_transaction_plans_for_its_streams() -> Result<()> {
-    for regime in [Regime::NearlyEmpty, Regime::ForcedGeneric] {
+    for (regime, streams, batch) in [(Regime::NearlyEmpty, 3, 2), (Regime::ForcedGeneric, 64, 4)] {
         let (f, _, ids) = regime_store(
             regime,
             store::Outbox::Disabled,
             store::AppendRouting::Auto,
-            64,
+            streams,
         )
         .await?;
         let forced = regime == Regime::ForcedGeneric;
@@ -493,9 +494,9 @@ async fn a_batch_in_its_own_transaction_plans_for_its_streams() -> Result<()> {
 
         for round in 0..10 {
             store
-                .append_many((0..4).map(|i| {
+                .append_many((0..batch).map(|i| {
                     append::AppendEntry::new(
-                        ids[(round * 4 + i) % ids.len()],
+                        ids[(round * batch + i) % ids.len()],
                         version::ExpectedVersion::Any,
                         &events,
                     )
