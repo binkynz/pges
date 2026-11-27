@@ -107,9 +107,9 @@ pub const STORE: &[Migration] = &[Migration {
     min_compatible: SchemaVersion(1),
 }];
 
-/// Migrations of the outbox of a store created with [`store::Outbox::Enabled`], scope `<store>.outbox`
-/// ([`outbox_scope`]), in order. The first is applied with the store, in the transaction that creates it; a
-/// store created without the outbox never gets them.
+/// Migrations of the outbox of a store created with [`store::Outbox::Enabled`], scope `<store>.outbox`,
+/// in order. The first is applied with the store, in the transaction that creates it; a store created without
+/// the outbox never gets them.
 pub const OUTBOX: &[Migration] = &[Migration {
     version: SchemaVersion(1),
     name: "opt_outbox",
@@ -119,7 +119,7 @@ pub const OUTBOX: &[Migration] = &[Migration {
 
 /// The scope of a store's outbox migrations: `<store>.outbox`. Store names cannot contain a `.`, so it is
 /// never a store's own scope.
-pub fn outbox_scope(store: &core_store::StoreName) -> String {
+pub(crate) fn outbox_scope(store: &core_store::StoreName) -> String {
     format!("{store}.{OUTBOX_SCOPE_SUFFIX}")
 }
 

@@ -681,7 +681,7 @@ pub async fn check_writer_roles(conn: &mut PgConnection, writer_roles: &WriterRo
 a `u64`.
 
 `migrate::SHARED`, `migrate::STORE` and `migrate::OUTBOX` (the outbox of a store created with it, scope
-`migrate::outbox_scope(&name)`, `<store>.outbox`) list the embedded `Migration`s (version, name, SQL,
+`<store>.outbox`) list the embedded `Migration`s (version, name, SQL,
 `min_compatible`, SHA-256 checksum); versions and `min_compatible` are `migrate::SchemaVersion`. `migrate::latest_version(migrations)`
 is the newest version a list knows, and `migrate::crate_too_old(conn, Scopes::OneStore(&name) | Scopes::AllStores)`
 returns the first scope whose `min_compatible` is above it (`migrate::CrateTooOld { scope, min_compatible,

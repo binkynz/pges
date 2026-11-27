@@ -141,7 +141,7 @@ own statements in `crates/pges-postgres/sql/migrate/`.
   `StoreDefinition::max_clock_skew` and `max_txn_age`), store migration 0001, and `opt_outbox.sql` when
   requested.
 - `opt_outbox.sql` is version 1 (`opt_outbox`) of the store's outbox scope `<store>.outbox`
-  (`migrate::outbox_scope`; store names contain no `.`): it inserts its `pges.scopes` row, as 0001 does for
+  (store names contain no `.`): it inserts its `pges.scopes` row, as 0001 does for
   the store, and the runner records it in `pges.migrations` with its checksum. `migrate::run_store` checks
   and completes the outbox scope of a store that has one, as it does the store's own; a store created
   without the outbox has none and never gets one. A later outbox migration is `migrate::OUTBOX`'s next entry.
