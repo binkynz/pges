@@ -449,6 +449,9 @@ async fn a_listening_connection_that_stops_answering_is_replaced() -> Result<()>
     let mut config = common::outbox_config();
     config.recheck_interval = interval!(200 ms);
     config.store_refresh = interval!(1 h);
+    // Committed before the source listens, so the first drain takes it and no notification of it wakes a
+    // batch later, one that could sequence the commit below while the connection is held.
+    f.append(Target::Job(stream::StreamId::new_v7()), 1).await?;
     let pool = f.db.pool().await?;
     let running = common::Running::start(
         pool,
@@ -456,14 +459,27 @@ async fn a_listening_connection_that_stops_answering_is_replaced() -> Result<()>
         common::fast(),
     )?;
     running.wait_leading().await?;
-    f.append(Target::Job(stream::StreamId::new_v7()), 1).await?;
     common::wait_sequenced(&f.pool, 1).await?;
     let first = wait_listener(&f, None).await?;
 
-    // Past the recheck and the second the connection gets to answer it.
+    // Held until the source gives up on the connection and opens a new one, which the proxy holds too.
+    // Releasing after a fixed time instead races the recheck's deadline: a connection that answers before
+    // the deadline, however late, is rightly kept.
+    let accepted = proxy.accepted();
     proxy.hold(proxy::Direction::Both);
     f.append(Target::Job(stream::StreamId::new_v7()), 1).await?;
-    tokio::time::sleep(Duration::from_millis(2000)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while proxy.accepted() == accepted {
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the source kept a listening connection that does not answer"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let logged: i64 = sqlx::query_scalar("SELECT count(*) FROM es.log")
+        .fetch_one(&f.pool)
+        .await?;
+    assert_eq!(logged, 1, "sequenced before the source listened again");
     proxy.release();
 
     common::wait_sequenced(&f.pool, 2).await?;
