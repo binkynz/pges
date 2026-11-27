@@ -1914,10 +1914,11 @@ it raises `min_compatible`, and the releases below it no longer work. (2026-11-2
   checks the shared scope and its own store, the sequencer every store, since it writes to all of them.
   After a refused renewal the process reads `pges.scopes`, releases its lease and stops with
   `SubscribeError::CrateTooOld` or `RunError::CrateTooOld`, instead of standing by. A `run_pg` batch whose
-  checkpoint carried the refused renewal is rolled back. A standby of the newer release takes over at
-  once.
-- Between the migration and that renewal, an old process keeps working for up to half a lease. Appends,
-  reads and backfills run no lease and are not checked after `Store::open`.
+  checkpoint carried the refused renewal is rolled back. A standby takes over at once.
+- Between the migration and that renewal, an old process keeps working for up to half a lease. Taking a
+  lease is not checked, so a standby of the old release may take the released lease and work until its
+  own first renewal, then stop the same way. Appends, reads and backfills run no lease and are not checked
+  after `Store::open`.
 - The check costs nothing extra while the crate is supported: it is a subquery on `pges.scopes` in the
   renewal statement. Roles that renew need `SELECT` on `pges.scopes` (schema.md, Roles).
 
