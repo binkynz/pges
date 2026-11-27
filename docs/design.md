@@ -1848,6 +1848,30 @@ the halt, 43 recovered, 335 after.
     streams at 64 partitions). The batch unprepared: 20–25% slower at concurrency 1 (earlier).
   - The single append keeps the plan cache's choice: a routed append names its partition, and the fallback
     through `streams` runs in autocommit, with no `BEGIN` to carry the setting.
+- Partition names and headroom (2026-11-27):
+  - Category names may not contain `__`, and every name built from a category other than its partition
+    puts `__` right after the category: leaves `commits_<cat>__<suffix>`, their indexes
+    `commits_<cat>__<suffix>_s`, the category partition's key `commits_<cat>__pkey` (named at creation, so
+    PostgreSQL does not derive `commits_<cat>_pkey`), and the key of `commits` is `commits__pkey`. Before,
+    category `a_202611`'s partition was category `a`'s November leaf: registered first, it left `a` without
+    that leaf, and every append to `a` that month failed; registered second, it failed. Leaf, index and key
+    names of one category now never equal another category's partition or each other (schema.md, Naming).
+    Migration 0001 was edited in place for the CHECK on `categories.name` and the `commits` key name:
+    nothing is published yet.
+  - Rejected: naming partitions by category id (`commits_<id>`). It is unambiguous without a validation
+    rule, but `commits_<cat>` is the name operators, read statements and tests use, and the other generated
+    names only need a separator. Rejected: refusing category names that end like a leaf suffix
+    (`_\d{6}(\d{2})?$`, `_s`, `_pkey`): it patches the cases known today and leaves the scheme ambiguous.
+  - Maintenance checks a partition's parent, not only its name: a name that is a partition of another
+    parent, or a relation that is not a table, fails with `NameTaken` instead of being skipped, dropped or
+    attached under.
+  - A commit id no leaf takes fails with `AppendError::NoPartition { category, commit_id }`, recognized from
+    PostgreSQL's routing error (23514 with no constraint, naming `commits` or the category's partition), not
+    a database error. No default partition and no leaf created on demand: an append must not run DDL, and a
+    default partition would take rows that later block attaching the leaf for their range.
+    `Admin::partition_headroom` reports each category's newest leaf bound and how far ahead it is, and the
+    positions left in the newest log partition; that is what to alert on. `Store::open` does not warn about
+    low headroom: the crate has no logging dependency.
 
 - Slot ahead of the token (2026-11-27; schema.md, Logical source):
   - The logical source confirms the slot only through `Source::ack`, so the slot is never confirmed past a

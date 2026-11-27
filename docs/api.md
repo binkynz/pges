@@ -149,8 +149,10 @@ pub struct CategoryId(i32);             // pges_core::category; categories.categ
 pub struct SchemaVersion(i32);          // pges_postgres::migrate; pges.scopes.schema_version,
                                         // pges.migrations.version; NONE = 0. Not the event's
                                         // pges_core::event::SchemaVersion (Events and aggregates)
-pub struct CategoryName(&'static str);  // validated against ^[a-z][a-z0-9_]{0,39}$; names read from the
-                                        // database are interned (leaked once per category) at Store::open
+pub struct CategoryName(&'static str);  // validated against ^[a-z][a-z0-9_]{0,39}$ and no __ (it
+                                        // separates the category in partition names); names read from
+                                        // the database are interned (leaked once per category) at
+                                        // Store::open
 
 pub enum ExpectedVersion { Any, NoStream, Exact(Version) }
 
@@ -333,7 +335,7 @@ pub enum JobEvent {
 }
 ```
 
-- `category` is required and must match `^[a-z][a-z0-9_]{0,39}$`.
+- `category` is required, must match `^[a-z][a-z0-9_]{0,39}$` and may not contain `__`.
 - `name` is the stored type name and never changes; the Rust variant can be renamed freely. Names must be
   unique within the enum. Names starting with `$` are reserved for system events.
 - `version` (default 1) is the event's schema version. Old versions are never rewritten; upcasters chain
@@ -618,6 +620,11 @@ let report = admin.apply_retention(&retention::RetentionConfig::new(roles)).awai
 let pruned = admin.prune_log(JobEvent::CATEGORY).await?;   // PrunedLog
 let frozen = admin.freeze_closed_partitions().await?;      // freeze::FreezeReport { frozen, busy }
 let ages = admin.partition_ages().await?;                  // Vec<freeze::PartitionAge>
+let headroom = admin.partition_headroom().await?;
+                                                  // PartitionHeadroom { categories: Vec<CategoryHeadroom
+                                                  //   { category, bucket, leaves_until: Option<SystemTime>,
+                                                  //   ahead: Duration }>, log: LogHeadroom { end:
+                                                  //   Option<Position>, remaining: u64 } }
 ```
 
 The migration functions begin transactions on the caller's connection. Run them on a connection outside a
@@ -668,7 +675,8 @@ pub async fn check_writer_roles(conn: &mut PgConnection, writer_roles: &WriterRo
     -> Result<(), WriterRoleError>;               // max_txn_age is the store's, read from the database
 ```
 
-`admin::LEAVES_AHEAD` and `retention::REPORTED_STREAMS` are `u16`.
+`admin::LEAVES_AHEAD` and `retention::REPORTED_STREAMS` are `u16`; `admin::LOG_PARTITION_POSITIONS` (10^8) is
+a `u64`.
 
 `migrate::SHARED` and `migrate::STORE` list the embedded `Migration`s (version, name, SQL, `min_compatible`,
 SHA-256 checksum); versions and `min_compatible` are `migrate::SchemaVersion`. `register_category` is idempotent, creates the category and its partitions in one
@@ -697,6 +705,14 @@ log partitions the sequencer writes to.
   It can read whole partitions, so run it off-peak. It fails with `StoreNotFound`. `partition_ages` lists
   every partition's pages, all-frozen pages, dead rows, xid and multixact age; it takes no lock (schema.md,
   Closed partitions).
+- `partition_headroom` is what to alert on for a stopped `maintain`. Per category it gives the upper bound of
+  the newest time leaf (`leaves_until`) and how far ahead of the database's clock it is (`ahead`, zero once
+  passed); `CategoryHeadroom::below_one_bucket` holds when that is under one bucket (a day, or 28 days for
+  `Month`), which with `maintain` running happens only after it has stopped for about `LEAVES_AHEAD` buckets.
+  Appends past `leaves_until` fail with `AppendError::NoPartition`. For the log it gives the end of the
+  newest log partition and the positions left in it; `maintain` adds a partition once half is used, so alert
+  when `remaining` falls below `LOG_PARTITION_POSITIONS / 2`. It reads only the catalog and takes no lock.
+  The crate has no logging dependency, so `Store::open` does not warn about low headroom itself.
 - `set_writer_limits` raises the store's `max_clock_skew` and `max_txn_age` under the maintenance lock, so a
   retention run in progress finishes with the old values; retention and `resequence` use the new ones from
   their next run. It never lowers them: a lower value fails with `Lowering { max_clock_skew, max_txn_age }`
@@ -759,6 +775,10 @@ pub enum AppendError {
     NoEvents,
     DuplicateStream(StreamId),                                         // append_many names a stream twice
     UnknownCategory(CategoryName),
+    NoPartition { category: CategoryName, commit_id: CommitId },       // no leaf of the category takes the
+                                                                       // commit id: maintain has stopped;
+                                                                       // in append_many, the first commit
+                                                                       // of that category
     NoSpareConnection(CategoryName),                                   // registering needs a second pooled
                                                                        // connection; the unit of work holds
                                                                        // the pool's only one
@@ -787,8 +807,9 @@ outcomes are classified after the statement wrote no row.
 | `load::SnapshotError` | `Encode`, `UnknownCategory`, `Database` |
 | `unit_of_work::TransactionError` | `Aborted`, `Database` |
 | `migrate::MigrateError` | `SharedSchemaMissing`, `ChecksumMismatch`, `CrateTooOld`, `OutboxMismatch { store, outbox }`, `Failed`, `Database` |
-| `admin::RegisterCategoryError`, `admin::MaintainError` | `UnsupportedBucket`, `Database` |
-| `admin::ChangeBucketError` | `UnknownCategory`, `Database` |
+| `admin::RegisterCategoryError`, `admin::MaintainError` | `UnsupportedBucket`, `NameTaken { name }`, `Database` |
+| `admin::ChangeBucketError` | `UnknownCategory`, `NameTaken { name }`, `Database` |
+| `admin::PartitionHeadroomError` | `UnsupportedBucket`, `Database` |
 | `retention::SetRetentionError` | `UnknownCategory`, `Database` |
 | `retention::SetDefaultRetentionError` | `StoreNotFound`, `Database` |
 | `retention::RetentionError` | `SequencerHalted`, `StoreNotFound`, `WriterRole(WriterRoleError)`, `Database` |

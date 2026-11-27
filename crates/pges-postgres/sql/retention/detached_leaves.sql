@@ -1,7 +1,7 @@
 -- Finds the leaves of a category that an interrupted retention run left detached: tables named like the
 -- category's leaves that are no partition any more and are older than its oldest attached leaf.
 --
--- $1 store name, $2 the leaf name pattern (^commits_<category>_[0-9]{6}([0-9]{2})?$ with the category's name
+-- $1 store name, $2 the leaf name pattern (^commits_<category>__[0-9]{6}([0-9]{2})?$ with the category's name
 -- in it), $3 the qualified category partition (<store>.commits_<category>).
 --
 -- Leaves an interrupted creation left detached are newer than every attached leaf, so they are not found;

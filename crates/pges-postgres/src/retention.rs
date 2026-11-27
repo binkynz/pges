@@ -249,8 +249,8 @@ pub enum RefusalReason {
 /// The most streams a [`RefusalReason`] lists.
 pub const REPORTED_STREAMS: u16 = 100;
 
-/// The table name of a partition in a store's schema: a category's time leaf, or a log partition. Its
-/// `Debug` is the quoted name, as for a string.
+/// The table name of a partition in a store's schema: a category's partition or time leaf, or a log
+/// partition. Its `Debug` is the quoted name, as for a string.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PartitionName(String);
 
@@ -950,9 +950,7 @@ async fn detach_and_drop(
         }
     }
 
-    if admin::partition_state(conn, store.as_str(), table.as_str()).await?
-        != admin::PartitionState::Missing
-    {
+    if admin::relation_exists(conn, store.as_str(), table.as_str()).await? {
         admin::ddl(
             conn,
             statement::DROP_PARTITION.render_text(&values),
@@ -971,10 +969,7 @@ async fn drop_detached_leaves(
     category: category::CategoryName,
     parent: &template::Ident,
 ) -> Result<(), sqlx::Error> {
-    let pattern = format!(
-        "^{}_[0-9]{{6}}([0-9]{{2}})?$",
-        ident::category_partition(category.as_str())
-    );
+    let pattern = ident::leaf_pattern(category.as_str());
     let leaves = statement::detached_leaves::Query::fixed()
         .bind(statement::detached_leaves::Params {
             store: store.as_str(),
@@ -1191,14 +1186,14 @@ mod tests {
 
     #[test]
     fn partition_names_print_as_their_text() {
-        let leaf = PartitionName("commits_jobs_2026_11".to_owned());
+        let leaf = PartitionName("commits_jobs__202611".to_owned());
 
-        assert_eq!(format!("{leaf:?}"), "\"commits_jobs_2026_11\"");
+        assert_eq!(format!("{leaf:?}"), "\"commits_jobs__202611\"");
         assert_eq!(
             format!("{:?}", Some(&leaf)),
-            "Some(\"commits_jobs_2026_11\")"
+            "Some(\"commits_jobs__202611\")"
         );
-        assert_eq!(leaf.to_string(), "commits_jobs_2026_11");
+        assert_eq!(leaf.to_string(), "commits_jobs__202611");
     }
 
     #[test]

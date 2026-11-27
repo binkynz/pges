@@ -8,14 +8,17 @@
 //! A category's time leaves never overlap: new leaves start at the upper bound of the newest existing one, so
 //! a bucket change applies from there.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use sqlx::{
     Connection, Executor, PgConnection, PgPool, SqlStr, pool::PoolConnection,
     postgres::types::PgInterval,
 };
 
-use pges_core::{category, store};
+use pges_core::{category, position, store};
 
 use crate::{
     catalog, error, ident, retention,
@@ -93,6 +96,24 @@ impl Admin {
         result
     }
 
+    /// Reports how far ahead of now each category's time leaves reach, and how many positions the store's
+    /// newest log partition has left. This is what to alert on to catch a stopped [`Admin::maintain`].
+    ///
+    /// An append whose commit id is past the newest leaf of its category fails with
+    /// [`AppendError::NoPartition`](crate::append::AppendError::NoPartition); alert when
+    /// [`CategoryHeadroom::below_one_bucket`] holds for a category. When the log fills its newest partition,
+    /// the sequencer stops assigning positions (it retries until a partition is added); alert when
+    /// [`LogHeadroom::remaining`] falls below half of a partition, [`LOG_PARTITION_POSITIONS`] / 2, which
+    /// `maintain` keeps it above.
+    ///
+    /// It reads the catalog only and does not take the maintenance lock, so it answers while maintenance,
+    /// retention or a freeze runs.
+    pub async fn partition_headroom(&self) -> Result<PartitionHeadroom, PartitionHeadroomError> {
+        let mut conn = self.pool.acquire().await?;
+
+        partition_headroom(&mut conn, self).await
+    }
+
     pub(crate) fn for_store(
         pool: PgPool,
         store: store::StoreName,
@@ -150,6 +171,57 @@ impl Admin {
 /// How many buckets ahead of the current one time leaves are kept, so maintenance has slack to retry.
 pub const LEAVES_AHEAD: u16 = 3;
 
+/// How many positions one log partition holds.
+pub const LOG_PARTITION_POSITIONS: u64 = LOG_PARTITION_SPAN.unsigned_abs();
+
+/// How far ahead of now a store's partitions reach ([`Admin::partition_headroom`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PartitionHeadroom {
+    /// One entry per registered category, in id order.
+    pub categories: Vec<CategoryHeadroom>,
+    /// The log's partitions.
+    pub log: LogHeadroom,
+}
+
+/// How far ahead of now a category's time leaves reach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CategoryHeadroom {
+    /// The category.
+    pub category: category::CategoryName,
+    /// The category's bucket.
+    pub bucket: Bucket,
+    /// The upper bound of the category's newest time leaf: appends to the category with a later commit id
+    /// fail with [`AppendError::NoPartition`](crate::append::AppendError::NoPartition). `None`: the category
+    /// has no leaf.
+    pub leaves_until: Option<SystemTime>,
+    /// How long from now, by the database's clock, until [`CategoryHeadroom::leaves_until`]. Zero once it has
+    /// passed, or when the category has no leaf.
+    pub ahead: Duration,
+}
+
+/// How many positions the store's newest log partition has left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LogHeadroom {
+    /// The first position the newest log partition does not hold. `None`: the store has no log partition,
+    /// so the sequencer cannot write until [`Admin::maintain`] creates one.
+    pub end: Option<position::Position>,
+    /// How many more positions the sequencer can give before it needs another partition. Zero when the store
+    /// has no log partition.
+    pub remaining: u64,
+}
+
+impl CategoryHeadroom {
+    /// Whether the category's leaves reach less than one bucket ahead of now: a day for [`Bucket::Day`], 28
+    /// days for [`Bucket::Month`]. With [`Admin::maintain`] running they reach [`LEAVES_AHEAD`] buckets past
+    /// the current one, so this holds only when it has not run for about that long.
+    pub fn below_one_bucket(&self) -> bool {
+        self.ahead < self.bucket.shortest()
+    }
+}
+
 /// How a category is set up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
@@ -183,6 +255,13 @@ pub enum RegisterCategoryError {
         /// The category.
         category: category::CategoryName,
     },
+    /// The name of one of the category's partitions is taken by a relation of the store's schema that is not
+    /// that partition.
+    #[error("{name} is taken by a relation that is not the partition of that name")]
+    NameTaken {
+        /// The partition's name.
+        name: retention::PartitionName,
+    },
     /// A database error, including DDL that kept timing out waiting for a lock.
     #[error(transparent)]
     Database(#[from] error::DbError),
@@ -195,6 +274,13 @@ pub enum ChangeBucketError {
     /// The category is not registered in the store.
     #[error("category {0} is not registered in the store")]
     UnknownCategory(category::CategoryName),
+    /// The name of one of the category's leaves is taken by a relation of the store's schema that is not
+    /// that leaf. The new bucket is recorded; [`Admin::maintain`] creates the leaves once the name is free.
+    #[error("{name} is taken by a relation that is not the partition of that name")]
+    NameTaken {
+        /// The leaf's name.
+        name: retention::PartitionName,
+    },
     /// A database error, including DDL that kept timing out waiting for a lock. The new bucket may already
     /// be recorded; [`Admin::maintain`] creates the leaves it needs.
     #[error(transparent)]
@@ -211,9 +297,63 @@ pub enum MaintainError {
         /// The category.
         category: category::CategoryName,
     },
+    /// The name of a partition is taken by a relation of the store's schema that is not that partition.
+    #[error("{name} is taken by a relation that is not the partition of that name")]
+    NameTaken {
+        /// The partition's name.
+        name: retention::PartitionName,
+    },
     /// A database error, including DDL that kept timing out waiting for a lock.
     #[error(transparent)]
     Database(#[from] error::DbError),
+}
+
+/// The partitions' headroom could not be read.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum PartitionHeadroomError {
+    /// A category has a bucket this crate does not support.
+    #[error("category {category} has an unsupported bucket")]
+    UnsupportedBucket {
+        /// The category.
+        category: category::CategoryName,
+    },
+    /// A database error.
+    #[error(transparent)]
+    Database(#[from] error::DbError),
+}
+
+impl From<sqlx::Error> for PartitionHeadroomError {
+    fn from(source: sqlx::Error) -> Self {
+        Self::Database(source.into())
+    }
+}
+
+impl From<EnsureError> for RegisterCategoryError {
+    fn from(error: EnsureError) -> Self {
+        match error {
+            EnsureError::NameTaken(name) => Self::NameTaken { name },
+            EnsureError::Database(source) => source.into(),
+        }
+    }
+}
+
+impl From<EnsureError> for ChangeBucketError {
+    fn from(error: EnsureError) -> Self {
+        match error {
+            EnsureError::NameTaken(name) => Self::NameTaken { name },
+            EnsureError::Database(source) => source.into(),
+        }
+    }
+}
+
+impl From<EnsureError> for MaintainError {
+    fn from(error: EnsureError) -> Self {
+        match error {
+            EnsureError::NameTaken(name) => Self::NameTaken { name },
+            EnsureError::Database(source) => source.into(),
+        }
+    }
 }
 
 impl From<sqlx::Error> for RegisterCategoryError {
@@ -234,7 +374,7 @@ impl From<sqlx::Error> for MaintainError {
     }
 }
 
-/// Log partitions hold this many positions each.
+/// [`LOG_PARTITION_POSITIONS`], for arithmetic on positions read from the database.
 pub(crate) const LOG_PARTITION_SPAN: i64 = 100_000_000;
 
 /// Attempts for DDL, or a registration transaction, that times out waiting for a lock.
@@ -278,6 +418,16 @@ impl Bucket {
             Self::Day => "YYYYMMDD",
             Self::Month => "YYYYMM",
         }
+    }
+
+    /// The bucket's shortest span: a month is at least 28 days.
+    fn shortest(self) -> Duration {
+        let days = match self {
+            Self::Day => 1,
+            Self::Month => 28,
+        };
+
+        Duration::from_secs(days * 24 * 60 * 60)
     }
 
     fn from_interval(interval: &PgInterval) -> Option<Self> {
@@ -461,24 +611,27 @@ async fn ensure_category_partition(
     category: category::CategoryName,
     category_id: category::CategoryId,
     on_timeout: OnLockTimeout,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), EnsureError> {
     let name = ident::category_partition(category.as_str());
+    let key = plain(&ident::category_partition_key(category.as_str()))?;
     let values = template::Values::new()
         .store(store)
         .category(category)
-        .category_id(category_id);
+        .category_id(category_id)
+        .ident(template::IdentPlaceholder::Index, &key);
 
-    match partition_state(conn, store.as_str(), &name).await? {
+    match partition_state(conn, store.as_str(), &name, "commits").await? {
         PartitionState::Attached => return Ok(()),
         PartitionState::Detached => {}
         PartitionState::Missing => {
             let create = statement::CREATE_CATEGORY_PARTITION.render_text(&values);
             ddl(conn, create, on_timeout).await?;
         }
+        PartitionState::Taken => return Err(EnsureError::name_taken(name)),
     }
 
     let attach = statement::ATTACH_CATEGORY_PARTITION.render_text(&values);
-    ddl(conn, attach, on_timeout).await
+    Ok(ddl(conn, attach, on_timeout).await?)
 }
 
 /// Creates the category's missing time leaves (`leaf/to_create.sql`), after finishing attaches that were
@@ -490,8 +643,9 @@ async fn ensure_leaves(
     category_id: category::CategoryId,
     bucket: Bucket,
     on_timeout: OnLockTimeout,
-) -> Result<(), sqlx::Error> {
-    let parent = format!("{store}.{}", ident::category_partition(category.as_str()));
+) -> Result<(), EnsureError> {
+    let partition = ident::category_partition(category.as_str());
+    let parent = format!("{store}.{partition}");
     let bound = plain(ident::BOUND)?;
 
     let unfinished = statement::unfinished_leaves::Query::fixed()
@@ -538,7 +692,7 @@ async fn ensure_leaves(
             .ident(template::IdentPlaceholder::Bound, &bound)
             .range(&timestamptz(&from)?, &timestamptz(&to)?);
 
-        match partition_state(conn, store.as_str(), &name).await? {
+        match partition_state(conn, store.as_str(), &name, &partition).await? {
             PartitionState::Attached => continue,
             // Never attached, so no row was ever routed into it.
             PartitionState::Detached => {
@@ -550,6 +704,7 @@ async fn ensure_leaves(
                 .await?;
             }
             PartitionState::Missing => {}
+            PartitionState::Taken => return Err(EnsureError::name_taken(name)),
         }
 
         for statement in [
@@ -568,7 +723,7 @@ async fn ensure_leaves(
 }
 
 /// Creates log partition 0, and the next one once the store has passed half of the newest.
-async fn ensure_log_partitions(conn: &mut PgConnection, admin: &Admin) -> Result<(), sqlx::Error> {
+async fn ensure_log_partitions(conn: &mut PgConnection, admin: &Admin) -> Result<(), EnsureError> {
     let store = admin.store_name();
     let newest = statement::newest_log_partition::Query::fixed()
         .bind(statement::newest_log_partition::Params {
@@ -601,8 +756,12 @@ async fn ensure_log_partitions(conn: &mut PgConnection, admin: &Admin) -> Result
         .range(&template::Literal::int(from), &template::Literal::int(to));
     let retry = OnLockTimeout::RetryStatement;
 
-    if partition_state(conn, store.as_str(), &name).await? == PartitionState::Detached {
-        ddl(conn, statement::DROP_PARTITION.render_text(&values), retry).await?;
+    match partition_state(conn, store.as_str(), &name, "log").await? {
+        PartitionState::Detached => {
+            ddl(conn, statement::DROP_PARTITION.render_text(&values), retry).await?;
+        }
+        PartitionState::Taken => return Err(EnsureError::name_taken(name)),
+        PartitionState::Missing | PartitionState::Attached => {}
     }
     for statement in [
         &statement::CREATE_LOG_PARTITION,
@@ -628,29 +787,138 @@ fn timestamptz(text: &str) -> Result<template::Literal, sqlx::Error> {
         .ok_or_else(|| sqlx::Error::Protocol(format!("{text:?} is not a timestamptz bound")))
 }
 
+/// What a partition's name refers to in the store's schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PartitionState {
     Missing,
+    /// A table that is no partition.
     Detached,
+    /// A partition of the expected parent.
     Attached,
+    /// Something else: a partition of another parent, or a relation that is not a table.
+    Taken,
 }
 
+/// What `table` is, for a partition of `parent`; both are names in the store's schema.
 pub(crate) async fn partition_state(
     conn: &mut PgConnection,
     store: &str,
     table: &str,
+    parent: &str,
 ) -> Result<PartitionState, sqlx::Error> {
-    let attached = statement::partition_state::Query::fixed()
+    let row = statement::partition_state::Query::fixed()
         .bind(statement::partition_state::Params { store, table })
         .fetch_optional(&mut *conn)
-        .await?
-        .map(|row| row.relispartition);
+        .await?;
 
-    Ok(match attached {
+    Ok(match row {
         None => PartitionState::Missing,
-        Some(false) => PartitionState::Detached,
-        Some(true) => PartitionState::Attached,
+        Some(row) if row.is_table != Some(true) => PartitionState::Taken,
+        Some(row) if !row.relispartition => PartitionState::Detached,
+        Some(row) if row.parent.as_deref() == Some(parent) => PartitionState::Attached,
+        Some(_) => PartitionState::Taken,
     })
+}
+
+/// Whether the store's schema has a relation named `table`.
+pub(crate) async fn relation_exists(
+    conn: &mut PgConnection,
+    store: &str,
+    table: &str,
+) -> Result<bool, sqlx::Error> {
+    let row = statement::partition_state::Query::fixed()
+        .bind(statement::partition_state::Params { store, table })
+        .fetch_optional(&mut *conn)
+        .await?;
+
+    Ok(row.is_some())
+}
+
+/// Why a partition could not be created.
+pub(crate) enum EnsureError {
+    NameTaken(retention::PartitionName),
+    Database(sqlx::Error),
+}
+
+impl EnsureError {
+    fn name_taken(name: String) -> Self {
+        Self::NameTaken(retention::PartitionName::new(name))
+    }
+}
+
+impl From<sqlx::Error> for EnsureError {
+    fn from(source: sqlx::Error) -> Self {
+        Self::Database(source)
+    }
+}
+
+async fn partition_headroom(
+    conn: &mut PgConnection,
+    admin: &Admin,
+) -> Result<PartitionHeadroom, PartitionHeadroomError> {
+    let rows = admin
+        .sql()
+        .leaf_headroom
+        .bind(statement::leaf_headroom::Params {})
+        .fetch_all(&mut *conn)
+        .await?;
+    let mut categories = Vec::with_capacity(rows.len());
+    for row in rows {
+        // Names become part of DDL; the categories table's CHECK already enforces this.
+        let Some(category) = catalog::intern(&row.name) else {
+            continue;
+        };
+        let Some(bucket) = Bucket::from_interval(&row.bucket) else {
+            return Err(PartitionHeadroomError::UnsupportedBucket { category });
+        };
+
+        categories.push(CategoryHeadroom {
+            category,
+            bucket,
+            leaves_until: row.upper.and_then(system_time),
+            ahead: row.ahead.map_or(Duration::ZERO, micros_ahead),
+        });
+    }
+
+    let newest = statement::newest_log_partition::Query::fixed()
+        .bind(statement::newest_log_partition::Params {
+            log: &format!("{}.log", admin.store()),
+        })
+        .fetch_one(&mut *conn)
+        .await?
+        .max;
+    let last_position = admin
+        .sql()
+        .last_position
+        .bind(statement::last_position::Params {})
+        .fetch_one(&mut *conn)
+        .await?
+        .coalesce;
+    let end = newest.map(|n| n.saturating_add(1).saturating_mul(LOG_PARTITION_SPAN));
+    let log = LogHeadroom {
+        end: end.and_then(position::Position::from_i64),
+        remaining: end.map_or(0, |end| {
+            u64::try_from(end.saturating_sub(last_position).saturating_sub(1)).unwrap_or(0)
+        }),
+    };
+
+    Ok(PartitionHeadroom { categories, log })
+}
+
+/// A time in microseconds since the Unix epoch; `None` if the platform cannot represent it.
+fn system_time(micros: i64) -> Option<SystemTime> {
+    let offset = Duration::from_micros(micros.unsigned_abs());
+
+    if micros >= 0 {
+        SystemTime::UNIX_EPOCH.checked_add(offset)
+    } else {
+        SystemTime::UNIX_EPOCH.checked_sub(offset)
+    }
+}
+
+/// A distance ahead of now in microseconds; zero when it is behind.
+fn micros_ahead(micros: i64) -> Duration {
+    Duration::from_micros(u64::try_from(micros).unwrap_or(0))
 }
 
 /// Runs DDL. In autocommit it retries with backoff while the statement times out waiting for a lock.

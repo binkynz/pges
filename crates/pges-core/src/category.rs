@@ -4,7 +4,8 @@ use std::fmt;
 
 /// The name of a category: a group of streams of one aggregate type inside a store, such as `jobs`.
 ///
-/// Names match `^[a-z][a-z0-9_]{0,39}$`, because they become part of partition names. Write a literal name
+/// Names match `^[a-z][a-z0-9_]{0,39}$` and do not contain `__`, because they become part of partition names,
+/// where `__` separates the category from the rest of the name. Write a literal name
 /// with [`category!`](crate::category!), which checks it at compile time. Names read at run time go through
 /// [`CategoryName::leak`].
 ///
@@ -92,6 +93,9 @@ pub enum CategoryError {
     /// The name contains a byte other than `a`–`z`, `0`–`9` or `_`.
     #[error("category name may only contain a-z, 0-9 and _")]
     InvalidCharacter,
+    /// The name contains `__`, which separates a category's name from the rest of its partitions' names.
+    #[error("category name may not contain __")]
+    DoubleUnderscore,
 }
 
 /// A [`CategoryName`](crate::category::CategoryName) from a literal, checked at compile time.
@@ -121,7 +125,9 @@ macro_rules! category {
                 ::core::result::Result::Ok(name) => name,
                 #[allow(clippy::panic)]
                 ::core::result::Result::Err(_) => {
-                    ::core::panic!("invalid category name: it must match ^[a-z][a-z0-9_]{{0,39}}$")
+                    ::core::panic!(
+                        "invalid category name: it must match ^[a-z][a-z0-9_]{{0,39}}$ and not contain __"
+                    )
                 }
             };
 
@@ -129,7 +135,8 @@ macro_rules! category {
     }};
 }
 
-pub(crate) const fn validate(name: &str) -> Result<(), CategoryError> {
+/// `^[a-z][a-z0-9_]{0,39}$`: the rule category and store names share.
+pub(crate) const fn validate_identifier(name: &str) -> Result<(), CategoryError> {
     let bytes = name.as_bytes();
     if bytes.is_empty() {
         return Err(CategoryError::Empty);
@@ -146,6 +153,23 @@ pub(crate) const fn validate(name: &str) -> Result<(), CategoryError> {
         let byte = bytes[i];
         if !(byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_') {
             return Err(CategoryError::InvalidCharacter);
+        }
+        i += 1;
+    }
+
+    Ok(())
+}
+
+pub(crate) const fn validate(name: &str) -> Result<(), CategoryError> {
+    if let Err(error) = validate_identifier(name) {
+        return Err(error);
+    }
+
+    let bytes = name.as_bytes();
+    let mut i = 1;
+    while i < bytes.len() {
+        if bytes[i] == b'_' && bytes[i - 1] == b'_' {
+            return Err(CategoryError::DoubleUnderscore);
         }
         i += 1;
     }
@@ -173,6 +197,16 @@ mod tests {
             Err(CategoryError::TooLong)
         );
         assert!(CategoryName::new("a".repeat(40).leak()).is_ok());
+        assert!(CategoryName::new("a_202611").is_ok());
+        assert!(CategoryName::new("jobs_").is_ok());
+        assert_eq!(
+            CategoryName::new("jobs__202611"),
+            Err(CategoryError::DoubleUnderscore)
+        );
+        assert_eq!(
+            CategoryName::new("jobs__"),
+            Err(CategoryError::DoubleUnderscore)
+        );
     }
 
     #[test]

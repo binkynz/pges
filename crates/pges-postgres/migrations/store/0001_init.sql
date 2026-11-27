@@ -24,7 +24,8 @@ CREATE TABLE categories (
   retention           int2     NOT NULL DEFAULT 0        -- 0 forever, 1 window+drop, 2 window+archive,
                       CHECK (retention BETWEEN 0 AND 3), -- 3 snapshot+truncate
   retain_for          interval,
-  name                text     NOT NULL UNIQUE CHECK (name ~ '^[a-z][a-z0-9_]{0,39}$'),
+  name                text     NOT NULL UNIQUE      -- no __: it separates the category in partition names
+                      CHECK (name ~ '^[a-z][a-z0-9_]{0,39}$' AND name !~ '__'),
   CHECK ((retention = 0) = (retain_for IS NULL))
 ) WITH (fillfactor = 50);                                -- periodic high-water updates; keep HOT
 
@@ -85,7 +86,8 @@ CREATE TABLE commits (
   versions     int8range   GENERATED ALWAYS AS
                (int8range(last_version - event_count + 1, last_version + 1)) VIRTUAL,
   recorded_at  timestamptz GENERATED ALWAYS AS (uuid_extract_timestamp(commit_id)) VIRTUAL,
-  PRIMARY KEY (category_id, commit_id)
+  -- Not commits_pkey: that is the partition name of a category named pkey.
+  CONSTRAINT commits__pkey PRIMARY KEY (category_id, commit_id)
 ) PARTITION BY LIST (category_id);
 
 -- Store log, written only by the sequencer. Positions are per store and gap-free.

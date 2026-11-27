@@ -150,6 +150,7 @@ pub(crate) struct AdminSql {
     pub(crate) horizon: typed::Rendered<statement::horizon::Query>,
     pub(crate) raise_scan_from: typed::Rendered<statement::raise_scan_from::Query>,
     pub(crate) prune_category: typed::Rendered<statement::prune_category::Query>,
+    pub(crate) leaf_headroom: typed::Rendered<statement::leaf_headroom::Query>,
 }
 
 impl AdminSql {
@@ -171,6 +172,7 @@ impl AdminSql {
             horizon: statement::horizon::Query::render(&values),
             raise_scan_from: statement::raise_scan_from::Query::render(&values),
             prune_category: statement::prune_category::Query::render(&values),
+            leaf_headroom: statement::leaf_headroom::Query::render(&values),
         }
     }
 }

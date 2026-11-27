@@ -755,7 +755,7 @@ pub const ATTACH_LEAF: template::Statement = template::Statement {
 };
 
 crate::typed_query! {
-    /// Whether a table of the store is attached as a partition.
+    /// What a name in the store's schema is: a table or not, a partition or not, and its parent.
     pub PARTITION_STATE, mod partition_state {
         name: "partition/state",
         files: [sql_file!("partition/state.sql")],
@@ -764,7 +764,25 @@ crate::typed_query! {
             table: &'q str,
         },
         row {
+            is_table: Option<bool>,
             relispartition: bool,
+            parent: Option<String>,
+        },
+    }
+}
+
+crate::typed_query! {
+    /// Reads, for every category, the upper bound of its newest attached leaf and how far ahead of now it is.
+    pub LEAF_HEADROOM, mod leaf_headroom {
+        name: "partition/headroom",
+        files: [sql_file!("partition/headroom.sql")],
+        params {},
+        row {
+            category_id: i32,
+            name: String,
+            bucket: PgInterval,
+            upper: Option<i64>,
+            ahead: Option<i64>,
         },
     }
 }
@@ -1381,6 +1399,7 @@ pub const ALL: &[&template::Statement] = &[
     &ADD_LEAF_BOUND,
     &ATTACH_LEAF,
     &PARTITION_STATE,
+    &LEAF_HEADROOM,
     &DROP_BOUND,
     &DROP_PARTITION,
     &DETACH_PENDING,
@@ -1470,6 +1489,7 @@ pub const TYPED: &[typed::Shape] = &[
     typed::Shape::of::<unfinished_leaves::Query>(),
     typed::Shape::of::<leaves_to_create::Query>(),
     typed::Shape::of::<partition_state::Query>(),
+    typed::Shape::of::<leaf_headroom::Query>(),
     typed::Shape::of::<detach_pending::Query>(),
     typed::Shape::of::<newest_log_partition::Query>(),
     typed::Shape::of::<last_position::Query>(),

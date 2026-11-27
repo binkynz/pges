@@ -245,6 +245,7 @@ async fn delete_in(
 
     let result = append::append_in_transaction(store, conn, prepared, None)
         .await
+        .map_err(|error| append::no_partition(error, store, std::slice::from_ref(prepared)))
         .map_err(|error| DeleteStreamError::from_append(error, expected))?;
     let first_commit_id = store
         .inner

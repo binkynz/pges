@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use pges_core::{aggregate, category, commit, event, frame, metadata, stream, version};
 
-use crate::{ambient, catalog, error, load, sql::statement, store, unit_of_work};
+use crate::{ambient, catalog, error, ident, load, sql::statement, store, unit_of_work};
 
 impl store::Store {
     /// Appends `events` to one stream, checking `expected` first.
@@ -289,6 +289,19 @@ pub enum AppendError {
     /// The events' category is not registered in the store.
     #[error("category {0} is not registered in the store")]
     UnknownCategory(category::CategoryName),
+    /// No partition of the category takes the commit: its newest time leaf ends before the commit id's time,
+    /// because [`Admin::maintain`](crate::admin::Admin::maintain) has not run for about
+    /// [`LEAVES_AHEAD`](crate::admin::LEAVES_AHEAD) buckets. Nothing was written; inside a transaction the
+    /// transaction is aborted. Run `maintain`, then retry. [`Admin::partition_headroom`](crate::admin::Admin::partition_headroom)
+    /// tells how far ahead the leaves reach, so this can be alerted on before it happens. In an
+    /// [`store::Store::append_many`], `commit_id` is that of the batch's first commit in the category.
+    #[error("no partition of category {category} takes commit id {commit_id}: run Admin::maintain")]
+    NoPartition {
+        /// The category.
+        category: category::CategoryName,
+        /// The commit id no partition takes.
+        commit_id: commit::CommitId,
+    },
     /// An event could not be encoded.
     #[error(transparent)]
     Encode(event::CodecError),
@@ -418,7 +431,7 @@ impl<'a, E: event::Event> Append<'a, E> {
         )
         .await?;
 
-        match target {
+        let result = match target {
             Target::Pool(store) => append_pooled(store, &mut prepared, snapshot.as_ref()).await,
             Target::Connection {
                 store, conn, state, ..
@@ -433,7 +446,9 @@ impl<'a, E: event::Event> Append<'a, E> {
 
                 result
             }
-        }
+        };
+
+        result.map_err(|error| no_partition(error, &store, std::slice::from_ref(&prepared)))
     }
 }
 
@@ -483,7 +498,7 @@ impl<'a> AppendMany<'a> {
             );
         }
 
-        match target {
+        let result = match target {
             Target::Pool(store) => append_many_pooled(store, &mut prepared).await,
             Target::Connection {
                 store, conn, state, ..
@@ -496,7 +511,9 @@ impl<'a> AppendMany<'a> {
 
                 result
             }
-        }
+        };
+
+        result.map_err(|error| no_partition(error, &store, &prepared))
     }
 }
 
@@ -505,8 +522,45 @@ impl AppendError {
     fn aborts_transaction(&self) -> bool {
         matches!(
             self,
-            Self::CommitIdSkew(_) | Self::DuplicateCommit(_) | Self::Database(_)
+            Self::CommitIdSkew(_)
+                | Self::DuplicateCommit(_)
+                | Self::NoPartition { .. }
+                | Self::Database(_)
         )
+    }
+}
+
+/// Turns a database error from routing a commit to its partition into [`AppendError::NoPartition`].
+///
+/// Only an error that names `commits` or the category partition of one of the commits counts. `commits`
+/// itself finds no partition only when a category's partition is missing; it then names the category when
+/// the commits are all in one.
+pub(crate) fn no_partition(
+    error: AppendError,
+    store: &store::Store,
+    prepared: &[Prepared],
+) -> AppendError {
+    let AppendError::Database(database) = &error else {
+        return error;
+    };
+    let Some(table) = database.unrouted_table(store.name().as_str()) else {
+        return error;
+    };
+
+    let in_partition = prepared
+        .iter()
+        .find(|p| table == ident::category_partition(p.category.name.as_str()));
+    let in_commits = || {
+        let first = prepared.first()?;
+        (table == "commits" && prepared.iter().all(|p| p.category.id == first.category.id))
+            .then_some(first)
+    };
+    match in_partition.or_else(in_commits) {
+        Some(unrouted) => AppendError::NoPartition {
+            category: unrouted.category.name,
+            commit_id: unrouted.commit_id,
+        },
+        None => error,
     }
 }
 

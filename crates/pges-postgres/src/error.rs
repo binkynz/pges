@@ -2,6 +2,8 @@
 
 use std::{error, fmt};
 
+use sqlx::postgres::PgDatabaseError;
+
 /// A database or connection error. The driver error is available through [`error::Error::source`], without
 /// naming its type.
 #[derive(Debug)]
@@ -34,7 +36,25 @@ impl DbError {
     pub(crate) fn is_connection_loss(&self) -> bool {
         is_connection_loss(&self.source)
     }
+
+    /// The partitioned table of `schema` that found no partition for a row, if that is the error: PostgreSQL
+    /// reports it as a check violation (23514) that names the table and no constraint.
+    pub(crate) fn unrouted_table(&self, schema: &str) -> Option<&str> {
+        let error = self
+            .source
+            .as_database_error()?
+            .try_downcast_ref::<PgDatabaseError>()?;
+
+        (error.code() == CHECK_VIOLATION
+            && error.constraint().is_none()
+            && error.schema() == Some(schema))
+        .then(|| error.table())
+        .flatten()
+    }
 }
+
+/// SQLSTATE 23514: a row fails a CHECK constraint, or no partition takes it.
+const CHECK_VIOLATION: &str = "23514";
 
 impl fmt::Display for DbError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

@@ -549,9 +549,16 @@ pub async fn register_category(
         .store(store)
         .category(category)
         .category_id(id);
-    conn.execute(postgres_sql::statement::CREATE_CATEGORY_PARTITION.render_text(&values))
-        .await
-        .context("creating the category partition")?;
+    let key = ident(&format!("commits_{category}__pkey"))?;
+    conn.execute(
+        postgres_sql::statement::CREATE_CATEGORY_PARTITION.render_text(
+            &values
+                .clone()
+                .ident(template::IdentPlaceholder::Index, &key),
+        ),
+    )
+    .await
+    .context("creating the category partition")?;
     conn.execute(postgres_sql::statement::ATTACH_CATEGORY_PARTITION.render_text(&values))
         .await
         .context("attaching the category partition")?;
@@ -561,7 +568,7 @@ pub async fn register_category(
             .bind(sql::statement::month::Params { offset })
             .fetch_one(&mut *conn)
             .await?;
-        let leaf = ident(&format!("commits_{category}_{suffix}"))?;
+        let leaf = ident(&format!("commits_{category}__{suffix}"))?;
         let leaf_values = values
             .clone()
             .ident(template::IdentPlaceholder::Leaf, &leaf)

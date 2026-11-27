@@ -219,7 +219,7 @@ async fn categories_get_partitions_ahead_and_maintenance_is_idempotent() -> Resu
     assert!(
         daily_leaves
             .iter()
-            .all(|l| l.len() == "commits_parts_yyyymmdd".len())
+            .all(|l| l.len() == "commits_parts__yyyymmdd".len())
     );
     assert!(
         (4..=5).contains(&monthly_leaves.len()),
@@ -269,7 +269,7 @@ async fn maintenance_leaves_existing_leaves_alone() -> Result<()> {
     admin.maintain().await?;
 
     let current: String = sqlx::query_scalar(
-        "SELECT 'es.commits_jobs_' || to_char(now() AT TIME ZONE 'UTC', 'YYYYMM')",
+        "SELECT 'es.commits_jobs__' || to_char(now() AT TIME ZONE 'UTC', 'YYYYMM')",
     )
     .fetch_one(&f.pool)
     .await?;
@@ -464,7 +464,7 @@ async fn leaf_names_fit_for_the_longest_category() -> Result<()> {
     let leaves = leaves_of(&f.pool, &format!("es.commits_{longest}")).await?;
     assert!(!leaves.is_empty());
     for leaf in &leaves {
-        assert_eq!(leaf.name.len(), "commits_".len() + 40 + "_yyyymmdd".len());
+        assert_eq!(leaf.name.len(), "commits_".len() + 40 + "__yyyymmdd".len());
         let mut indexes: Vec<String> = sqlx::query_scalar(
             "SELECT c.relname::text FROM pg_index x JOIN pg_class c ON c.oid = x.indexrelid
              WHERE x.indrelid = $1::regclass ORDER BY 1",
@@ -528,7 +528,7 @@ async fn bucket_changes_apply_after_the_newest_leaf() -> Result<()> {
         added
             .iter()
             .skip(1)
-            .all(|l| l.name.len() == "commits_parts_yyyymm".len()),
+            .all(|l| l.name.len() == "commits_parts__yyyymm".len()),
         "after the bridge, one leaf per month: {added:?}"
     );
 

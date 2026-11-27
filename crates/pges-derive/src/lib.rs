@@ -56,7 +56,7 @@ use proc_macro::TokenStream;
 /// `#[event(category = "...", codec = "...", crate = "...")]`
 ///
 /// - `category` (required) is the category the events belong to, becoming `Event::CATEGORY`. It must match
-///   `^[a-z][a-z0-9_]{0,39}$`, the rule of `CategoryName`.
+///   `^[a-z][a-z0-9_]{0,39}$` and not contain `__`, the rule of `CategoryName`.
 /// - `codec` (default `"json"`) is how event data is written. `"json"` is the only codec so far; it uses
 ///   `serde_json` through `pges_core::codec::json`. Any other value is a compile error.
 /// - `crate` is the path the generated code names `pges-core` by, as serde's `#[serde(crate = "...")]`.

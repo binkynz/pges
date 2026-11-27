@@ -16,19 +16,32 @@ order, the queries the crate runs and how partitions are maintained.
 | Store positions | `position`, `last_position`, `horizon_position` | |
 | Ranges | plural of the thing, always virtual | `versions`, `positions` |
 | Small enums | `int2` with a CHECK and a comment, not Postgres enums (enums need DDL to extend) | `state`, `retention` |
-| Partitions | `<table>_<category>` for LIST, `<table>_<category>_<yyyymm[dd]>` for RANGE leaves | `commits_jobs_202611` |
+| Partitions | `<table>_<category>` for LIST, `<table>_<category>__<yyyymm[dd]>` for RANGE leaves | `commits_jobs__202611` |
 | Log partitions | `log_<first position / 10^8>` | `log_0042` |
 | Hash partitions | `<table>_p<remainder, 3 digits>` | `streams_p007` |
 | Indexes | `<table>_<purpose>` | `log_by_category` |
-| Leaf indexes | `<leaf>_s` for the unique `(stream_id, last_version)` index | `commits_jobs_202611_s` |
+| Leaf indexes | `<leaf>_s` for the unique `(stream_id, last_version)` index | `commits_jobs__202611_s` |
+| Category partition keys | `commits_<category>__pkey`, named when the partition is created | `commits_jobs__pkey` |
 
 Category names are limited to `^[a-z][a-z0-9_]{0,39}$` so every generated name stays within PostgreSQL's
 63-byte limit, which it would otherwise silently truncate. For a 40-character category: `commits_<cat>` is 48
-bytes, a leaf `commits_<cat>_<YYYYMMDD>` 57, its index `<leaf>_s` 59, and the `<leaf>_pkey` PostgreSQL derives
-when the leaf is attached 62. The attach constraint is `bound` (constraint names are per table); log
-partitions are `log_<n, at least 4 digits>`. Store names only qualify these names. They follow the same rule
-and also exclude `pges`, `public`, `information_schema` and `pg_*`. `crates/pges-postgres/src/ident.rs` builds
-every name and tests the longest case.
+bytes, its key `commits_<cat>__pkey` 54, a leaf `commits_<cat>__<YYYYMMDD>` 58, its index `<leaf>_s` 60, and
+the `<leaf>_pkey` PostgreSQL derives when the leaf is attached 63. The attach constraint is `bound`
+(constraint names are per table); log partitions are `log_<n, at least 4 digits>`. Store names only qualify
+these names. They follow the same rule and also exclude `pges`, `public`, `information_schema` and `pg_*`.
+`crates/pges-postgres/src/ident.rs` builds every name and tests the longest case.
+
+Category names also exclude `__`, which separates the category from the rest of every name built from it. All
+these names share one namespace (tables and indexes are both in `pg_class`), so without it a category named
+like another's leaf would take that leaf's name: `a_202611`'s partition would be `a`'s November leaf
+`commits_a_202611`. With the separator, every name built from a category other than its partition contains
+`__` right after the category and continues with something that does not start with `_`, so it is never
+another category's partition `commits_<cat>`, and it names its category unambiguously. The category
+partition's primary key is named `commits_<cat>__pkey` when the partition is created
+(`crates/pges-postgres/sql/category/create_partition.sql`), because the name PostgreSQL would derive,
+`commits_<cat>_pkey`, is category `<cat>_pkey`'s partition; for the same reason the primary key of `commits`
+is `commits__pkey`, not `commits_pkey` (category `pkey`). `ident::tests` checks that the names of categories
+named like each other's leaves, indexes and keys never collide.
 
 Leaves created before the `_s` suffix keep their old `_stream` index name: maintenance runs no DDL on existing
 leaves.
@@ -310,6 +323,15 @@ id. Only a 23505 on a constraint named `*_pkey` (the leaf's commits key) counts;
 result as deduplicated (this covers a caller-supplied id retried after the skew window), otherwise
 `CommitIdSkew` or `DuplicateCommit`. Inside a transaction it returns the error directly, and the
 transaction is aborted. Appends do not run under a savepoint, which would cost a round trip each.
+
+A commit id that no leaf of its category takes (maintenance stopped for about `LEAVES_AHEAD` buckets, or a
+leaf dropped by hand) fails the insert into `commits` with PostgreSQL's routing error: SQLSTATE 23514, no
+constraint, and the table where routing stopped, `commits_<cat>` (or `commits` when the category partition
+itself is missing). Only that shape, in the store's schema, naming `commits` or the category partition of one
+of the append's commits, becomes `AppendError::NoPartition { category, commit_id }`; a CHECK violation names
+its constraint and stays a database error. `Admin::partition_headroom` reports how far each category's
+leaves reach (`crates/pges-postgres/sql/partition/headroom.sql`) and how many positions the newest log
+partition has left, so the condition can be alerted on before appends fail.
 
 - Outbox stores (`pges.stores.outbox`, read at `Store::open`) add one more CTE step, the `pending` insert
   from the commits insert's `RETURNING` (`crates/pges-postgres/sql/append/commit_outbox.sql`).
@@ -1086,7 +1108,11 @@ Leaves that already exist get no DDL. The `bound` constraint is dropped only fro
 have it (an interrupted creation), found with one catalog query over the category's leaves
 (`crates/pges-postgres/sql/leaf/unfinished.sql`), because `ALTER TABLE` takes ACCESS EXCLUSIVE on the leaf
 even when there is nothing to drop. A leaf left detached by an interrupted creation
-(`crates/pges-postgres/sql/partition/state.sql`) is dropped and created again.
+(`crates/pges-postgres/sql/partition/state.sql`) is dropped and created again. The same statement reads the
+parent of a name that is a partition: a partition counts as present only under the parent maintenance means
+(`commits` for a category partition, `commits_<cat>` for a leaf, `log` for a log partition). A name taken by
+anything else (a partition of another parent, an index, a sequence) fails registration, `change_bucket` and
+`maintain` with `NameTaken`, and nothing is dropped, skipped or attached under it.
 
 `Admin::register_category` runs in one transaction: the `categories` row, then the category partition and its
 leaves. No store sees the category before its partitions exist; an append in between fails with
@@ -1111,12 +1137,13 @@ on the parent, and a request queued behind a long catch-up read would block ever
 matching CHECK constraint lets it skip the validation scan. Each attach still invalidates cached plans.
 
 - **Category registration** attaches an empty partitioned `commits_<cat>`: created detached and partitioned by
-  commit id (`crates/pges-postgres/sql/category/create_partition.sql`), then attached under the category's id
+  commit id, with its primary key named `commits_<cat>__pkey`
+  (`crates/pges-postgres/sql/category/create_partition.sql`), then attached under the category's id
   (`crates/pges-postgres/sql/category/attach_partition.sql`).
 - **Time leaves**, from the later of the newest leaf's upper bound and the bucket holding `now() - 1 hour`, up
   to three buckets after the current one (`admin::LEAVES_AHEAD`), so retries have slack
   (`crates/pges-postgres/sql/leaf/to_create.sql`). The newest upper bound is read from the catalog. Leaves are
-  named `commits_<cat>_<suffix>` with the bucket's suffix format (`YYYYMMDD`, `YYYYMM`). A first leaf whose
+  named `commits_<cat>__<suffix>` with the bucket's suffix format (`YYYYMMDD`, `YYYYMM`). A first leaf whose
   lower bound is not a bound of the bucket (after a bucket change) ends at the next bound and is named by its
   lower bound as `YYYYMMDD`. Each returned leaf that is not attached yet is created detached
   (`crates/pges-postgres/sql/leaf/create.sql`, with `autovacuum_freeze_min_age = 0` and
@@ -1181,7 +1208,7 @@ matching CHECK constraint lets it skip the validation scan. Each attach still in
   `RetentionError::WriterRole`.
 
   Then, per policy category (`crates/pges-postgres/sql/retention/categories.sql`), it drops the leaves left by
-  an interrupted run: detached tables named like the category's leaves (`^commits_<cat>_[0-9]{6}([0-9]{2})?$`)
+  an interrupted run: detached tables named like the category's leaves (`^commits_<cat>__[0-9]{6}([0-9]{2})?$`)
   and older than its oldest attached leaf (`crates/pges-postgres/sql/retention/detached_leaves.sql`), each
   with `crates/pges-postgres/sql/partition/drop.sql`.
 

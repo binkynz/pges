@@ -187,7 +187,7 @@ impl Fixture {
 
     async fn leaf(&self, months_back: i32) -> Result<String> {
         Ok(sqlx::query_scalar(
-            "SELECT 'commits_jobs_' || to_char(now() AT TIME ZONE 'UTC' - make_interval(months => $1), 'YYYYMM')",
+            "SELECT 'commits_jobs__' || to_char(now() AT TIME ZONE 'UTC' - make_interval(months => $1), 'YYYYMM')",
         )
         .bind(months_back)
         .fetch_one(&self.pool)
