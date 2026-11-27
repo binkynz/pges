@@ -58,6 +58,10 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crates
   also checks a partition's parent: a name taken by another relation fails with `NameTaken` (on
   `RegisterCategoryError`, `ChangeBucketError` and `MaintainError`) instead of being skipped or dropped.
   Store migration 0001 changed in place (nothing is published yet).
+- **Subscriptions read the log at least every `max_idle`** (`pges-subscribe`). A caught-up subscription
+  whose waker stayed quiet without failing, such as a `NotifyWaker` on a half-open connection, kept renewing
+  its lease and delivered nothing, so no standby took over. Every subscription, and each shard, now reads the
+  log after `Builder::max_idle` (default 30 s) without a wake-up, whatever the waker.
 - **Late retries in a transaction are deduplicated** (`pges-postgres`). A caller-supplied commit id that
   already committed on the stream returns `Outcome::Deduplicated` in a unit of work and in `append_in`
   inside a transaction too, even when the retry comes later than `max_clock_skew`. Before, the skew check

@@ -39,9 +39,10 @@ use crate::waker;
 /// call waits only for what is left of it.
 ///
 /// The listening connection only reads, so one that dies silently (dropped by a firewall or a NAT without a
-/// reset) may never be noticed, and the waker then stays quiet. Where that can happen, combine it with a
-/// `PollWaker` (`wake-poll`) with a long `max_interval` through [`Wakers`](waker::Wakers), so a
-/// missed notice delays the subscriber by at most that long.
+/// reset) may never be noticed, and the waker then stays quiet. A subscription still reads the log every
+/// [`max_idle`](crate::subscription::Builder::max_idle) (30 s by default). For a shorter bound, lower it, or
+/// combine this waker with a `PollWaker` (`wake-poll`) with a long `max_interval` through
+/// [`Wakers`](waker::Wakers), so a missed notice delays the subscriber by at most that long.
 pub struct NotifyWaker {
     pool: PgPool,
     pool_kind: PoolKind,

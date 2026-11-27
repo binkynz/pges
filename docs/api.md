@@ -873,6 +873,8 @@ let handle = store.subscription(subscription_name!("jobs-board.v3"))
                                                     // every 500 ms
     .acquire_interval(interval!(1 s))               // a standby's attempts; default 1 s
     .retry_interval(interval!(1 s))                 // pause after a database or waker error; default 1 s
+    .max_idle(interval!(30 s))                      // read the log at least this often while caught up,
+                                                    // whatever the waker; default 30 s
     .replica(replica::Replica::new(replica_pool).fallback(interval!(5 s), limit.clone()))
                                                     // optional: read pages from a streaming replica;
                                                     // or .replica(pool): no fallback
@@ -978,7 +980,8 @@ pub enum SystemEvent {                     // type names starting with $; pges_c
 `Builder<S>` tracks the scope (`NoScope`, `Listed`, `AllCategories`): `run` and `run_pg` exist only once
 categories are chosen, and listed categories and `all_categories()` cannot be combined; neither compiles.
 The first `.categories(..)` takes a `NonEmpty<CategoryName>`, later ones any iterator. `sharded` takes
-`Shards`, `batch_size` a `NonZeroU32`, and `lease`, `acquire_interval` and `retry_interval` an `Interval`.
+`Shards`, `batch_size` a `NonZeroU32`, and `lease`, `acquire_interval`, `retry_interval` and `max_idle` an
+`Interval`.
 
 - Reads follow schema.md (Read a category from a cursor): `H` first, then each category up to `H`, merged
   at the cut. Batches are in position order, and no event of the subscribed categories is skipped or
@@ -1049,6 +1052,11 @@ The first `.categories(..)` takes a `NonEmpty<CategoryName>`, later ones any ite
 - Without a waker, a caught-up subscription uses `waker::recheck::Recheck::default()`: it reads the log again
   every 500 ms. A plain timer, which works with no features; a custom interval is
   `.waker(waker::recheck::Recheck::every(interval!(..)))`.
+- Whatever the waker, a caught-up subscription reads the log again after `max_idle` (default 30 s) without
+  a wake-up, and each shard of a sharded one does on its own. A waker can stay quiet without failing (a
+  `NotifyWaker` on a half-open connection), while its holder keeps renewing the lease, so no standby would
+  take over. The backstop bounds the delay to `max_idle`, at one log read per `max_idle` while nothing is
+  appended. (2026-11-27)
 
 | Error | Variants |
 |---|---|
@@ -1727,8 +1735,9 @@ and a level-triggered waker given `H` would fire again at once.
 - `store_connections()` is 1 for `new`, 0 for `with_separate_pool`: a separate pool's listening connection
   does not count against the store's pool.
 - The listening connection only reads, so one that dies silently (dropped by a firewall or a NAT without a
-  reset) may never be noticed, and the waker then stays quiet. Where that can happen, combine it with a
-  `PollWaker` with a long `max_interval` through `Wakers::any`.
+  reset) may never be noticed, and the waker then stays quiet. The subscription still reads the log every
+  `max_idle` (30 s by default). For a shorter bound, lower `max_idle`, or combine it with a `PollWaker`
+  with a long `max_interval` through `Wakers::any`.
 - Dropping a `NotifyWaker` needs a tokio runtime: sqlx runs `UNLISTEN *` on a spawned task before the
   connection goes back to the pool. A subscription drops its waker inside its own task.
 - `GrpcWaker` (`wake-grpc`, the default) streams one store's values from the sequencers' gRPC watch. Give it

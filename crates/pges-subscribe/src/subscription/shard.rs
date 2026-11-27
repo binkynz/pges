@@ -209,6 +209,7 @@ impl Coordinator {
             status,
             retry: self.setup.retry,
             retry_interval: self.setup.retry_interval,
+            max_idle: self.setup.max_idle,
             replica: self.setup.replica(),
         };
         let shutdown: subscription::Shutdown = Box::pin(

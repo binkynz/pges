@@ -1121,8 +1121,15 @@ the halt, 43 recovered, 335 after.
     kept state, so it wakes only a `known` below that position.
   - `NotifyWaker::with_separate_pool` exists so LISTEN can use a pool that bypasses a transaction-mode
     pooler; its connection does not count against the store's pool. `new` counts it.
-  - `NotifyWaker` does not detect a half-open connection by itself. The remedy is documentation pointing to
-    `Wakers::any` with a poll waker, not keepalives: sqlx's `PgListener` (0.8 and 0.9.1) has no keepalive option.
+  - `NotifyWaker` does not detect a half-open connection by itself, and sqlx's `PgListener` (0.8 and
+    0.9.1) has no keepalive option.
+  - Idle backstop (2026-11-27): every subscription reads the log after `max_idle` (default 30 s) without a
+    wake-up, whatever its waker; each shard on its own. A waker that stays quiet without failing (a
+    `NotifyWaker` on a half-open connection, or a custom one) otherwise stalled the subscription forever
+    while it kept renewing the lease, so no standby took over. Before, only documentation pointed to
+    `Wakers::any` with a poll waker. A read per 30 s is negligible beside the lease renewal every 7.5 s.
+    Treating each lease renewal as a wake-up was the alternative; it ties the delivery bound to the lease
+    and could not be tuned on its own.
 - `pges` facade (2026-11-25):
   - Re-exports only, each crate as an inlined module (`pges::core`, `pges::derive`, `pges::postgres`,
     `pges::subscribe`, `pges::sequencer`, `pges::replication`), plus the derive at the root; the facade is the only crate that
