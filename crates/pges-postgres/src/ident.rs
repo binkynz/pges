@@ -52,6 +52,15 @@ pub(crate) fn leaf_stream_index(leaf: &str) -> String {
     format!("{leaf}_s")
 }
 
+/// Hash partition `remainder` of `table` (`streams` or `snapshots`) in a store with `partitions` of them, as
+/// store migration 0001 names it: `<table>_p<remainder>`, padded with zeros to 3 digits, or to as many as
+/// the highest remainder has.
+#[cfg(test)]
+pub(crate) fn hash_partition(table: &str, remainder: u16, partitions: u16) -> String {
+    let digits = partitions.saturating_sub(1).to_string().len().max(3);
+    format!("{table}_p{remainder:0digits$}")
+}
+
 /// Log partition `n`, holding positions `[n * 10^8, (n + 1) * 10^8)`: `log_<n, at least 4 digits>`.
 pub(crate) fn log_partition(n: i64) -> String {
     format!("log_{n:04}")
@@ -110,8 +119,30 @@ mod tests {
         assert_eq!(names[3].len(), 63, "the longest name PostgreSQL derives");
     }
 
-    /// No name built for one category equals one built for another, or the primary key of `commits`, for
-    /// categories named like each other's leaves, leaf indexes and keys.
+    /// Hash partitions keep the 3-digit names up to 1000 partitions, widen above, never collide, and fit.
+    #[test]
+    fn hash_partition_names_widen_with_the_partitions() {
+        assert_eq!(hash_partition("streams", 7, 64), "streams_p007");
+        assert_eq!(hash_partition("streams", 999, 1000), "streams_p999");
+        assert_eq!(hash_partition("streams", 7, 1001), "streams_p0007");
+        assert_eq!(hash_partition("streams", 1000, 1001), "streams_p1000");
+        assert_eq!(
+            hash_partition("snapshots", 65534, u16::MAX),
+            "snapshots_p65534"
+        );
+
+        for partitions in [1, 999, 1000, 1001, 10_000, 10_001, u16::MAX] {
+            let names: std::collections::HashSet<String> = (0..partitions)
+                .map(|remainder| hash_partition("snapshots", remainder, partitions))
+                .collect();
+            assert_eq!(names.len(), usize::from(partitions));
+            assert!(names.iter().all(|name| is_plain_identifier(name)));
+        }
+    }
+
+    /// No name built for one category equals one built for another, for categories named like each other's
+    /// leaves, leaf indexes and keys, and none takes a name reserved for objects on `commits` itself
+    /// (`commits__*`).
     #[test]
     fn names_of_different_categories_never_collide() {
         let categories = [
@@ -126,7 +157,6 @@ mod tests {
             "pkey",
         ];
         let mut seen = std::collections::HashMap::new();
-        seen.insert("commits__pkey".to_owned(), "commits");
 
         for category in categories {
             assert!(
@@ -144,6 +174,7 @@ mod tests {
                 names.push(leaf);
             }
             for name in names {
+                assert!(!name.starts_with("commits__"), "{name}");
                 if let Some(other) = seen.insert(name.clone(), category) {
                     panic!("{name} is built for {other} and {category}");
                 }

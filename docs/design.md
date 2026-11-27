@@ -122,7 +122,8 @@ database's WAL MB/s, not commits/s.
   retention defaults and position numbering, typically one per bounded context.
 - A **category** (`parts`, `orders`, `jobs`) groups streams of one aggregate type inside a store.
 - `commits` is LIST-partitioned by category, then RANGE by time, so a category gets its own indexes, vacuum
-  and retention. Its primary key is `(category_id, commit_id)`.
+  and retention. `commits` has no key of its own: each category partition's primary key is `(commit_id)`, so
+  a commit id is unique within a category.
 - One sequencer per database: one source, one publication (each store's `commits` with a column list), one
   position counter per store. No ordering across stores.
 - No table per aggregate type and no typed payload columns; typed tables are read models.
@@ -947,8 +948,10 @@ the halt, 43 recovered, 335 after.
   (2026-11-24)
 - `SnapshotPolicy::Manual`: `snapshot_after` writes a snapshot on every call, because the caller asked for it.
 - No `dcb` cargo feature until DCB appends exist; `Store::open` refuses DCB stores.
-- The option scripts (outbox, dcb) get their own versioned scopes (`<store>.outbox`, `<store>.dcb`) when they
-  first need a migration. Until then the `pges.stores` flags record them.
+- The outbox script is version 1 of its own versioned scope, `<store>.outbox` (migrate::OUTBOX), recorded and
+  checksummed from 0.1.0 on, so it is frozen like 0001 and a later outbox migration has a version to follow.
+  DCB gets `<store>.dcb` when it ships; until then `opt_dcb.sql` is unrecorded and not frozen
+  (2026-11-27).
 - `append_many` locks streams in a deterministic order without relying on the planner: a locking step
   `SELECT … FROM streams WHERE stream_id = ANY(…) ORDER BY stream_id FOR UPDATE` inside the statement
   (LockRows above Sort locks in sorted order) (schema.md, Append).
@@ -1898,7 +1901,8 @@ the halt, 43 recovered, 335 after.
   - Category names may not contain `__`, and every name built from a category other than its partition
     puts `__` right after the category: leaves `commits_<cat>__<suffix>`, their indexes
     `commits_<cat>__<suffix>_s`, the category partition's key `commits_<cat>__pkey` (named at creation, so
-    PostgreSQL does not derive `commits_<cat>_pkey`), and the key of `commits` is `commits__pkey`. Before,
+    PostgreSQL does not derive `commits_<cat>_pkey`), and anything on `commits` itself is `commits__<name>`.
+    Before,
     category `a_202611`'s partition was category `a`'s November leaf: registered first, it left `a` without
     that leaf, and every append to `a` that month failed; registered second, it failed. Leaf, index and key
     names of one category now never equal another category's partition or each other (schema.md, Naming).
@@ -1940,6 +1944,26 @@ the halt, 43 recovered, 335 after.
   - Tested with a real promotion: a replica pair (`replica::Pair::start_failover`) whose replica
     synchronises the failover slot, has its WAL stream cut before the batch that sequences the last commit,
     and is promoted; and with the state built directly by `pg_replication_slot_advance`.
+
+- Migration 0001 review before the 0.1.0 publish (2026-11-27; schema.md, Naming, Migrations, Roles):
+  - `commits` has no primary key. The key was `(category_id, commit_id)` on the root, so every leaf carried a
+    32-byte-key unique index although `category_id` is constant in a category partition. Each category
+    partition now has `PRIMARY KEY (commit_id)`, named `commits_<cat>__pkey`, copied to its leaves as
+    `<leaf>_pkey`: the same per-category uniqueness, with half the key. Nothing used the root key: appends
+    have no `ON CONFLICT` on `commits`, the publication publishes inserts only (no replica identity needed),
+    and every lookup by commit id names its category, so it is pruned to one category's leaves.
+  - Hash partitions widen above 1000: `<table>_p<remainder>` padded to 3 digits or the digits of the highest
+    remainder, so up to 1000 the names are unchanged. No cap below the `u16` of `stream_partitions`: every
+    name fits, and the lock table is the practical limit.
+  - Store creation adds `commits` to the publication only when the creating role has the owner's privileges
+    and the publication exists; otherwise it skips an outbox store, and refuses a logical one (42501).
+    Rejected: skipping the logical store too, leaving it to the logical source's publication repair. That
+    repair runs only when the source opens, and a slot that already exists never delivers commits made
+    before their table joined the publication, with nothing to detect it (the commits check runs only for a
+    new slot). A sound skip would need the source to check, under a lock that holds writers off, that a
+    store it adds to the publication has no commits yet, and halt for `resequence` otherwise.
+  - `pges.check_commit_id` refuses ids that are not UUIDv7 (22023). The CHECK constraints over several
+    columns are named (`<table>_<purpose>`) instead of PostgreSQL's `<table>_check`.
 
 ## Open decisions
 

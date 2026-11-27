@@ -440,6 +440,7 @@ crate::typed_query! {
             shared_version: i32,
             store_version: i32,
             store: Option<&'q str>,
+            outbox_version: i32,
         },
         row {
             scope: String,

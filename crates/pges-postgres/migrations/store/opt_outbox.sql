@@ -1,6 +1,7 @@
 -- store/opt_outbox.sql
--- Optional, applied when a store uses the outbox source (no logical replication). Same search_path rules
--- as 0001. The append statement inserts one row here per commit when pges.stores.outbox is set (read at
+-- Optional, applied when a store uses the outbox source (no logical replication), in the transaction that
+-- creates the store, right after 0001 and with the same search_path. It is version 1 of the store's option
+-- scope `<store>.outbox`, recorded and checksummed like a migration. The append statement inserts one row here per commit when pges.stores.outbox is set (read at
 -- Store::open; there is no cargo feature for it). The sequencer drains it in the same transaction that
 -- writes the log rows, and assigns positions in seq order:
 --
@@ -14,6 +15,9 @@
 -- seq must come from an uncached sequence (CACHE 1, the default). The row is inserted at the end of the
 -- append, after the command's reads, so if one append saw another's commit its seq is higher. A cached
 -- sequence hands out per-backend blocks and breaks that.
+
+INSERT INTO pges.scopes (schema_version, min_compatible, scope)
+VALUES (1, 1, current_schema() || '.outbox');
 
 CREATE TABLE pending (
   seq         int8 GENERATED ALWAYS AS IDENTITY (CACHE 1) PRIMARY KEY,

@@ -10,7 +10,7 @@ mod common;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use sqlx::{Executor, PgPool};
+use sqlx::{Connection, Executor, PgPool};
 
 use pges_core::{interval, stream, version};
 use pges_postgres::{admin, store};
@@ -72,6 +72,39 @@ async fn appends_become_log_rows_in_commit_order() -> Result<()> {
 
     running.stop().await?;
     f.finish().await
+}
+
+/// A store created while the publication is missing (a restore with `--no-publications`) is created all
+/// the same, outside any publication. The source creates the publication and adds the store's `commits`
+/// before it creates its slot, and sequences the store's appends.
+#[tokio::test]
+async fn a_store_created_without_the_publication_is_published_by_the_source() -> Result<()> {
+    let db = pges_testing::TestDb::new().await?;
+    let mut conn = db.connect().await?;
+    conn.execute("DROP PUBLICATION pges").await?;
+    conn.close().await?;
+    let f = Fixture::on(db, common::Kind::Logical).await?;
+    assert!(published(&f.pool).await?.is_empty());
+
+    let running = f.start(common::fast()).await?;
+    running.wait_leading().await?;
+    assert_eq!(published(&f.pool).await?, ["es"]);
+    let committed = f.append(Target::Job(stream::StreamId::new_v7()), 2).await?;
+
+    common::wait_sequenced(&f.pool, 1).await?;
+    let log = common::check_log(&f.pool).await?;
+    assert_eq!(common::commit_order(&log), [committed.commit_id]);
+    running.stop().await?;
+    f.finish().await
+}
+
+/// The stores whose `commits` the publication `pges` holds.
+async fn published(pool: &PgPool) -> Result<Vec<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT schemaname::text FROM pg_publication_tables WHERE pubname = 'pges' ORDER BY 1",
+    )
+    .fetch_all(pool)
+    .await?)
 }
 
 #[tokio::test]

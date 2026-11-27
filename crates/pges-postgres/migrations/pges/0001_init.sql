@@ -4,7 +4,8 @@
 
 CREATE SCHEMA IF NOT EXISTS pges;
 
--- Applied migrations for every scope: 'pges' itself and each store schema.
+-- Applied migrations for every scope: 'pges' itself, each store schema, and a store's option scripts
+-- (`<store>.outbox`).
 CREATE TABLE pges.migrations (
   applied_at timestamptz NOT NULL DEFAULT now(),
   version    int4        NOT NULL,
@@ -20,7 +21,7 @@ CREATE TABLE pges.scopes (
   schema_version int4 NOT NULL,
   min_compatible int4 NOT NULL,
   scope          text PRIMARY KEY,
-  CHECK (min_compatible <= schema_version)
+  CONSTRAINT scopes_window CHECK (min_compatible <= schema_version)
 );
 INSERT INTO pges.scopes (schema_version, min_compatible, scope) VALUES (1, 1, 'pges');
 
@@ -36,10 +37,11 @@ CREATE TABLE pges.stores (
   retention     int2 NOT NULL DEFAULT 0         -- default retention of new categories; codes as
                 CHECK (retention BETWEEN 0 AND 3), -- <store>.categories.retention
   outbox        bool NOT NULL DEFAULT false,    -- appends also enqueue into <store>.pending (opt_outbox.sql)
-  dcb           bool NOT NULL DEFAULT false,    -- appends maintain tag_heads/commit_tags (opt_dcb.sql)
+  dcb           bool NOT NULL DEFAULT false,    -- set by opt_dcb.sql, which no release applies; Store::open
+                                                -- refuses such a store (DCB appends are not implemented)
   retain_for    interval,                       -- with retention, as <store>.categories.retain_for
   schema_name   text NOT NULL UNIQUE,
-  CHECK ((retention = 0) = (retain_for IS NULL))
+  CONSTRAINT stores_retain_for CHECK ((retention = 0) = (retain_for IS NULL))
 );
 
 -- One kind of sequencer source per database: either every store has the outbox or none has. A store row is
@@ -84,20 +86,24 @@ CREATE FUNCTION pges.uuidv7_floor(ts timestamptz) RETURNS uuid
   RETURN (lpad(to_hex(floor(extract(epoch FROM ts) * 1000)::int8), 12, '0')
           || '70008000000000000000')::uuid;
 
--- Rejects a client commit id whose timestamp is more than `tol` from the statement's start. Called from the
--- append statement; SQLSTATE PGE01 maps to AppendError::CommitIdSkew. statement_timestamp(), not now(),
--- so a long UnitOfWork does not drift.
+-- Rejects a client commit id that is not a UUIDv7 (SQLSTATE 22023), or whose timestamp is more than `tol`
+-- from the statement's start (SQLSTATE PGE01, which maps to AppendError::CommitIdSkew). Called from the append
+-- statements. statement_timestamp(), not now(), so a long UnitOfWork does not drift.
 CREATE FUNCTION pges.check_commit_id(id uuid, tol interval) RETURNS uuid
   LANGUAGE plpgsql STABLE PARALLEL SAFE
 AS $$
 BEGIN
+  IF uuid_extract_version(id) IS DISTINCT FROM 7 THEN
+    RAISE EXCEPTION 'commit id % is not a UUIDv7', id USING ERRCODE = '22023';
+  END IF;
   IF uuid_extract_timestamp(id) NOT BETWEEN statement_timestamp() - tol AND statement_timestamp() + tol THEN
     RAISE EXCEPTION 'commit id % is outside the clock skew tolerance %', id, tol USING ERRCODE = 'PGE01';
   END IF;
   RETURN id;
 END $$;
 
--- Stores add their commits table to this publication. Only inserts are published, and the column list
--- (set per table) leaves out the payload from the output. Decoding still reads every WAL record of the
--- database, payload included.
+-- Store creation adds the store's commits table to this publication (store/0001_init.sql says when it does
+-- not), and the logical sequencer source adds any store's that is missing. Only inserts are published, and
+-- the column list (set per table) leaves out the payload from the output. Decoding still reads every WAL
+-- record of the database, payload included.
 CREATE PUBLICATION pges WITH (publish = 'insert', publish_via_partition_root = true);

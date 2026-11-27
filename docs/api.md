@@ -680,8 +680,9 @@ pub async fn check_writer_roles(conn: &mut PgConnection, writer_roles: &WriterRo
 `admin::LEAVES_AHEAD` and `retention::REPORTED_STREAMS` are `u16`; `admin::LOG_PARTITION_POSITIONS` (10^8) is
 a `u64`.
 
-`migrate::SHARED` and `migrate::STORE` list the embedded `Migration`s (version, name, SQL, `min_compatible`,
-SHA-256 checksum); versions and `min_compatible` are `migrate::SchemaVersion`. `migrate::latest_version(migrations)`
+`migrate::SHARED`, `migrate::STORE` and `migrate::OUTBOX` (the outbox of a store created with it, scope
+`migrate::outbox_scope(&name)`, `<store>.outbox`) list the embedded `Migration`s (version, name, SQL,
+`min_compatible`, SHA-256 checksum); versions and `min_compatible` are `migrate::SchemaVersion`. `migrate::latest_version(migrations)`
 is the newest version a list knows, and `migrate::crate_too_old(conn, Scopes::OneStore(&name) | Scopes::AllStores)`
 returns the first scope whose `min_compatible` is above it (`migrate::CrateTooOld { scope, min_compatible,
 crate_version }`), the check `Store::open` makes at start. `register_category` is idempotent, creates the category and its partitions in one
@@ -1911,9 +1912,10 @@ it raises `min_compatible`, and the releases below it no longer work. (2026-11-2
 - A running subscription or sequencer finds out at its next lease renewal (a subscription renews every
   half lease, 7.5 s by default; the sequencer every `Lease::renew`, 5 s) or its next attempt to take a
   lease (a standby tries every `acquire_interval`, 1 s by default). The renewal and acquire statements
-  refuse while the shared scope's or a store's `min_compatible` is above the crate's version: a
-  subscription checks the shared scope and its own store, the sequencer every store, since it writes to all
-  of them. After a refused renewal the process reads `pges.scopes`, releases its lease and stops with
+  refuse while the shared scope's, a store's or a store's outbox scope's `min_compatible` is above the
+  crate's version for it: a subscription checks the shared scope and its own store's scopes, the sequencer
+  every store's, since it writes to all of them. After a refused renewal the process reads `pges.scopes`,
+  releases its lease and stops with
   `SubscribeError::CrateTooOld` or `RunError::CrateTooOld`, instead of standing by. A `run_pg` batch whose
   checkpoint carried the refused renewal is rolled back. A refused acquire takes no lease, changes no fence
   and stops the standby with the same error, whether or not the lease was free; it is not retried. So only

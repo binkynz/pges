@@ -26,10 +26,10 @@ impl Store {
     ///
     /// With [`AutoMigrate::CreateOrMigrate`] it first applies the migrations, creating the store from the
     /// [`StoreDefinition`] if it does not exist. Then it checks that the shared `pges` schema and the store
-    /// schema are at the version this crate needs and that their applied migrations match the embedded ones,
-    /// reads the store's `outbox` and `dcb` flags, lists the partitions of `streams` so each append can name
-    /// its stream's partition (with [`AppendRouting::Auto`], the default), and loads the ids of its
-    /// categories and event types.
+    /// schema (and, for a store with the outbox, its outbox scope `<store>.outbox`) are at the version this
+    /// crate needs and that their applied migrations match the embedded ones, reads the store's `outbox` and
+    /// `dcb` flags, lists the partitions of `streams` so each append can name its stream's partition (with
+    /// [`AppendRouting::Auto`], the default), and loads the ids of its categories and event types.
     ///
     /// Fails with [`OpenError::StoreNotFound`] for a store that does not exist (and is not created), with
     /// [`OpenError::StoreRequiresFeature`] for a store that needs a feature this build lacks, and with
@@ -92,6 +92,15 @@ impl Store {
             // DCB appends (tag_heads, commit_tags) are not implemented; a writer that skipped them would
             // break the store's consistency boundaries.
             return Err(OpenError::StoreRequiresFeature("dcb"));
+        }
+
+        if outbox {
+            check_compatibility(
+                &mut conn,
+                &migrate::outbox_scope(&store_name),
+                migrate::OUTBOX,
+            )
+            .await?;
         }
 
         let outbox = if outbox {
@@ -431,6 +440,11 @@ pub struct StoreDefinition {
     /// `statement_cache_capacity` (default 100) at least `stream_partitions + 36`. The default 64 fit; with
     /// more, appends go through `streams`, whose plans may lock every partition. Each partition statement
     /// holds about 130 KB of plan cache per connection (8.6 MB at 64 partitions).
+    ///
+    /// The partitions are `streams_p<remainder>` and `snapshots_p<remainder>`, the remainder padded with
+    /// zeros to 3 digits, or to as many as the highest remainder has (`streams_p0000` to `streams_p1000` for
+    /// 1001). The store is created in one transaction that locks every partition and its primary key, so
+    /// thousands of partitions need a larger `max_locks_per_transaction`.
     pub stream_partitions: NonZeroU16,
     /// Whether appends also enqueue into `pending`, for the outbox sequencer source. All stores of a database
     /// must agree: creating a store that differs fails with [`migrate::MigrateError::OutboxMismatch`].
@@ -510,7 +524,7 @@ pub enum OpenError {
     /// The database's schema for `scope` is older than this crate needs; run the migrations.
     #[error("scope {scope} is at schema version {database}; this crate needs {required}")]
     SchemaBehind {
-        /// `pges` or the store's name.
+        /// `pges`, the store's name, or its outbox scope (`<store>.outbox`).
         scope: String,
         /// The database's schema version, [`migrate::SchemaVersion::NONE`] if the scope does not exist.
         database: migrate::SchemaVersion,
@@ -522,7 +536,7 @@ pub enum OpenError {
         "scope {scope} requires schema version {min_compatible} or newer; this crate knows {crate_version}"
     )]
     CrateTooOld {
-        /// `pges` or the store's name.
+        /// `pges`, the store's name, or its outbox scope (`<store>.outbox`).
         scope: String,
         /// The oldest schema version the database still supports.
         min_compatible: migrate::SchemaVersion,
@@ -532,7 +546,7 @@ pub enum OpenError {
     /// An applied migration differs from the one embedded in this crate.
     #[error("migration {version} of scope {scope} was applied with a different text")]
     ChecksumMismatch {
-        /// `pges` or the store's name.
+        /// `pges`, the store's name, or its outbox scope (`<store>.outbox`).
         scope: String,
         /// The migration's version.
         version: migrate::SchemaVersion,

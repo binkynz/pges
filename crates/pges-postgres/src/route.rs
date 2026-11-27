@@ -181,6 +181,7 @@ mod tests {
     use sqlx::{Connection, PgConnection};
 
     use super::*;
+    use crate::ident;
 
     /// Remainders PostgreSQL 18 gave for these ids in a 64-partition store (`satisfies_hash_partition`).
     #[test]
@@ -227,7 +228,7 @@ mod tests {
         let probes = probes();
         (0..modulus)
             .map(|remainder| statement::stream_leaves::Row {
-                leaf: format!("streams_p{remainder:03}"),
+                leaf: ident::hash_partition("streams", remainder, modulus),
                 modulus: Some(i32::from(modulus)),
                 remainder: Some(i32::from(remainder)),
                 probes: Some(

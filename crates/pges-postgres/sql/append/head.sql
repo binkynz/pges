@@ -7,7 +7,7 @@
 --
 -- The client always generates the commit id, so an append whose response was lost can be retried.
 -- pges.check_commit_id raises SQLSTATE PGE01 when the id's timestamp is more than $9 from
--- statement_timestamp(); it accepts ids that are not UUIDv7, whose timestamp is NULL. An id at or below the
+-- statement_timestamp(), and 22023 for an id that is not a UUIDv7 (the crate sends none). An id at or below the
 -- stream's last_commit_id is not checked (infinite tolerance): the append cannot apply, so it returns no row
 -- and append/classify.sql reports a retry of a stored commit as deduplicated however late it comes, in a
 -- transaction too, where an error would abort it. last_commit_id only grows, so the statement's snapshot is

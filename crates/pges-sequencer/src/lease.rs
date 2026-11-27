@@ -120,6 +120,7 @@ pub(crate) async fn renew(
             fence: fence.sql(),
             shared_version: migrate::latest_version(migrate::SHARED).get(),
             store_version: migrate::latest_version(migrate::STORE).get(),
+            outbox_version: migrate::latest_version(migrate::OUTBOX).get(),
         })
         .execute(&mut *conn)
         .await?;

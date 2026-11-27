@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::Result;
 use sqlx::Connection;
 
-use pges_core::{category, stream, version};
+use pges_core::{category, commit, stream, version};
 use pges_postgres::{admin, append, store};
 
 use common::{Fixture, JOBS, JobEvent, ORDERS, OrderEvent, Placed, STORE_NAME};
@@ -457,5 +457,105 @@ async fn day_leaves_and_bucket_changes_do_not_collide() -> Result<()> {
             &[JobEvent::created("a")],
         )
         .await?;
+    f.finish().await
+}
+
+/// `commits` has no key of its own: each category partition's primary key, on the commit id, is copied to
+/// its leaves, so a commit id is unique within a category and may repeat in another. A category partition
+/// that maintenance attaches again keeps its key.
+#[tokio::test]
+async fn commit_ids_are_unique_per_category() -> Result<()> {
+    let f = Fixture::new().await?;
+    let root_indexes: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM pg_index WHERE indrelid = 'es.commits'::regclass")
+            .fetch_one(&f.pool)
+            .await?;
+    assert_eq!(root_indexes, 0);
+    for category in [JOBS, ORDERS] {
+        let partition = format!("es.commits_{category}");
+        let key: (String, String) = sqlx::query_as(
+            "SELECT conname::text, pg_get_constraintdef(oid) FROM pg_constraint
+             WHERE conrelid = $1::regclass AND contype = 'p'",
+        )
+        .bind(&partition)
+        .fetch_one(&f.pool)
+        .await?;
+        assert_eq!(
+            key,
+            (
+                format!("commits_{category}__pkey"),
+                "PRIMARY KEY (commit_id)".to_owned()
+            )
+        );
+        let leaf_keys: Vec<String> = sqlx::query_scalar(
+            "SELECT pg_get_constraintdef(k.oid) FROM pg_inherits i
+             JOIN pg_constraint k ON k.conrelid = i.inhrelid AND k.contype = 'p'
+             WHERE i.inhparent = $1::regclass",
+        )
+        .bind(&partition)
+        .fetch_all(&f.pool)
+        .await?;
+        assert!(!leaf_keys.is_empty());
+        assert!(
+            leaf_keys.iter().all(|key| key == "PRIMARY KEY (commit_id)"),
+            "{leaf_keys:?}"
+        );
+    }
+
+    sqlx::query("ALTER TABLE es.commits DETACH PARTITION es.commits_orders")
+        .execute(&f.pool)
+        .await?;
+    f.store.admin().maintain().await?;
+    let commit_id = commit::CommitId::generate();
+    f.store
+        .append(
+            stream::StreamId::new_v7(),
+            version::ExpectedVersion::NoStream,
+            &[JobEvent::created("a")],
+        )
+        .commit_id(commit_id)
+        .await?;
+    f.store
+        .append(
+            stream::StreamId::new_v7(),
+            version::ExpectedVersion::NoStream,
+            &[OrderEvent::Placed(Placed { total: 1 })],
+        )
+        .commit_id(commit_id)
+        .await?;
+    let error = f
+        .store
+        .append(
+            stream::StreamId::new_v7(),
+            version::ExpectedVersion::NoStream,
+            &[OrderEvent::Placed(Placed { total: 2 })],
+        )
+        .commit_id(commit_id)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, append::AppendError::DuplicateCommit(c) if c == commit_id),
+        "{error}"
+    );
+
+    // A lookup by category and commit id, as the append's classification makes, reads one leaf's key.
+    let mut conn = f.db.connect().await?;
+    sqlx::query("SET enable_seqscan = off")
+        .execute(&mut conn)
+        .await?;
+    let orders: i32 =
+        sqlx::query_scalar("SELECT category_id FROM es.categories WHERE name = 'orders'")
+            .fetch_one(&mut conn)
+            .await?;
+    let plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "EXPLAIN (COSTS OFF) SELECT last_version FROM es.commits
+         WHERE category_id = {orders} AND commit_id = '{commit_id}'"
+    )))
+    .fetch_all(&mut conn)
+    .await?;
+    let plan = plan.join("\n");
+    assert!(plan.contains("Index Scan using commits_orders__"), "{plan}");
+    assert!(!plan.contains("commits_jobs"), "{plan}");
+    conn.close().await?;
     f.finish().await
 }
