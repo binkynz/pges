@@ -6,87 +6,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crates
 
 ## [Unreleased]
 
-### Added
-
-- **Append partition routing** (`pges-postgres`). A single append names its stream's hash partition of
-  `streams`, so it locks only that partition whatever the planner's statistics and `plan_cache_mode`, and
-  reuses its plan (about 3x the appends per second at concurrency 1). It needs one prepared statement per
-  partition on each connection, about 130 KB of server plan-cache memory each (8.6 MB at 64 partitions), and
-  runs only while they fit sqlx's statement cache (`statement-cache-capacity >= stream_partitions + 36`; the
-  default 100 holds the default 64 partitions) and the role may write every partition directly. Otherwise
-  appends go through `streams` as before. `StoreConfig::append_routing` (`AppendRouting::Auto`, the default,
-  or `Streams`) turns it off.
-- **Partition headroom** (`pges-postgres`). `Admin::partition_headroom` reports, per category, the upper
-  bound of its newest time leaf and how far ahead of now it is (`CategoryHeadroom::below_one_bucket` flags
-  less than one bucket), and the positions left in the newest log partition. Alert on it to catch a stopped
-  `Admin::maintain` before appends fail.
-- **`AppendError::NoPartition`** (`pges-postgres`). An append whose commit id no leaf of its category takes
-  (maintenance stopped for about `LEAVES_AHEAD` buckets) fails with `NoPartition { category, commit_id }`
-  instead of a raw database error (SQLSTATE 23514). `delete_stream` reports it as `Write(NoPartition)`.
-
-### Changed
-
-- **`append_many` plans for its streams** (`pges-postgres`). The batch statement runs with
-  `plan_cache_mode = force_custom_plan`, so it locks only the partitions of `streams` its streams live in
-  (4 locks each) whatever the planner's statistics and the role's or session's `plan_cache_mode`. Before, a
-  generic plan, which the plan cache kept for a store analyzed nearly empty or under `force_generic_plan`,
-  locked every partition, and at 1M streams ran 1.5x to 6x slower. In its own transaction the setting is
-  part of `BEGIN` (no extra round trip) and ends with the transaction; inside a unit of work it is set
-  before the batch and the transaction's previous value is put back after it (two more round trips, and one
-  more prepared statement on that connection). Stores where the plan cache chose a cheap generic plan now
-  plan every batch: about 1 ms more per batch of 16.
-
-### Fixed
-
-- **`append_many` could deadlock against another batch** (`pges-postgres`). A batch in its own transaction
-  that retried a stream created after its statement started locked it with `SKIP LOCKED`, which still waits
-  when the row's updater commits during the lock: PostgreSQL then locks the newer row version and waits for
-  its holder. Holding its other streams' locks, the batch could wait for a batch that was waiting for it, and
-  one of them failed with a deadlock error. The retry lock now runs with `lock_timeout` at 1 ms and treats a
-  timeout as a busy row, so the batch starts over.
-- **A slot ahead of the token halts sequencing** (`pges-sequencer`). After promoting an asynchronous
-  standby with a synchronised failover slot, the slot could be confirmed past the standby's stored token:
-  the sequencer's batch with the log rows and the token comes later in WAL than the commits it confirms.
-  The server then silently started after those commits, and they were never sequenced. The logical source
-  now reads `confirmed_flush_lsn` whenever it opens and halts with `SlotLost::Ahead` when it is past the
-  token; `pges-sequencer resequence` recovers the commits. The source no longer confirms idle WAL from
-  keepalives directly: it hands the position out as an empty batch's token, which the sequencer stores
-  before it is confirmed, so the slot is never ahead of the token on a healthy server. A slot the source
-  creates has its consistent point stored as the token at once. design.md now recommends a synchronous
-  failover target.
-- **Category names no longer collide with other categories' partitions** (`pges-postgres`, `pges-core`,
-  `pges-derive`). A category named like another's leaf took that leaf's name: `a_202611`'s partition was
-  `a`'s November leaf `commits_a_202611`. Registered first, it left `a` without that leaf, so its appends
-  failed all month while maintenance reported success; registered second, it failed. Names like a leaf's
-  index (`a_202611_s`) or a key (`a_pkey`, `pkey`) failed to register. Leaves are now
-  `commits_<cat>__<suffix>`, the category partition's key `commits_<cat>__pkey` and the key of `commits`
-  `commits__pkey`, and category names may not contain `__` (`CategoryError::DoubleUnderscore`). Maintenance
-  also checks a partition's parent: a name taken by another relation fails with `NameTaken` (on
-  `RegisterCategoryError`, `ChangeBucketError` and `MaintainError`) instead of being skipped or dropped.
-  Store migration 0001 changed in place (nothing is published yet).
-- **Schema compatibility is checked at lease renewal** (`pges-postgres`, `pges-subscribe`, `pges-sequencer`).
-  A subscription or sequencer kept running after a migration raised `min_compatible` above its crate's
-  schema version; only `Store::open` checked it. Lease renewals now fail while the database no longer
-  supports the crate, and the holder stops with the new `SubscribeError::CrateTooOld` or
-  `RunError::CrateTooOld` and releases its lease. Roles that renew leases (reader, sequencer) need `SELECT`
-  on `pges.scopes`. New `migrate::crate_too_old`, `migrate::Scopes` and `migrate::CrateTooOld`;
-  `migrate::latest_version` is public.
-- **Subscriptions read the log at least every `max_idle`** (`pges-subscribe`). A caught-up subscription
-  whose waker stayed quiet without failing, such as a `NotifyWaker` on a half-open connection, kept renewing
-  its lease and delivered nothing, so no standby took over. Every subscription, and each shard, now reads the
-  log after `Builder::max_idle` (default 30 s) without a wake-up, whatever the waker.
-- **Late retries in a transaction are deduplicated** (`pges-postgres`). A caller-supplied commit id that
-  already committed on the stream returns `Outcome::Deduplicated` in a unit of work and in `append_in`
-  inside a transaction too, even when the retry comes later than `max_clock_skew`. Before, the skew check
-  ran first and the retry failed with `CommitIdSkew`, aborting the caller's transaction; only appends
-  outside a transaction looked the id up. Only ids above the stream's last commit id are checked against
-  the skew now, so a late id the stream has not stored is `CommitIdOutOfOrder`.
-- **The logical source ends only walsenders** (`pges-sequencer`). Before `START_REPLICATION` it ended
-  whichever process held the slot, including a session running `pg_drop_replication_slot` or another slot
-  function. A drop ended mid-call could remove the slot while its client saw an error. Now only a walsender
-  holding the slot is ended; another session is waited for, as before, up to `LogicalConfig::start_timeout`.
-
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-11-27
 
 The first release: `pges`, `pges-core`, `pges-derive`, `pges-postgres`, `pges-subscribe`, `pges-sequencer`,
 `pges-replication`, `pges-watch-proto` and `pges-testing`. It needs PostgreSQL 18 and Rust 1.94.
@@ -122,6 +42,21 @@ The first release: `pges`, `pges-core`, `pges-derive`, `pges-postgres`, `pges-su
 - **Test support** (`pges-testing`): PostgreSQL 18 from a local cluster or Docker, a database per test
   cloned from a template, store fixtures, a fault-injection proxy, a primary with a streaming replica, a
   cancellation harness and throwaway TLS certificates.
+- **Append partition routing** (`pges-postgres`). A single append names its stream's hash partition of
+  `streams`, so it locks only that partition whatever the planner's statistics and `plan_cache_mode`, and
+  reuses its plan (about 3x the appends per second at concurrency 1). It needs one prepared statement per
+  partition on each connection, about 130 KB of server plan-cache memory each (8.6 MB at 64 partitions), and
+  runs only while they fit sqlx's statement cache (`statement-cache-capacity >= stream_partitions + 36`; the
+  default 100 holds the default 64 partitions) and the role may write every partition directly. Otherwise
+  appends go through `streams` as before. `StoreConfig::append_routing` (`AppendRouting::Auto`, the default,
+  or `Streams`) turns it off.
+- **Partition headroom** (`pges-postgres`). `Admin::partition_headroom` reports, per category, the upper
+  bound of its newest time leaf and how far ahead of now it is (`CategoryHeadroom::below_one_bucket` flags
+  less than one bucket), and the positions left in the newest log partition. Alert on it to catch a stopped
+  `Admin::maintain` before appends fail.
+- **`AppendError::NoPartition`** (`pges-postgres`). An append whose commit id no leaf of its category takes
+  (maintenance stopped for about `LEAVES_AHEAD` buckets) fails with `NoPartition { category, commit_id }`
+  instead of a raw database error (SQLSTATE 23514). `delete_stream` reports it as `Write(NoPartition)`.
 
 ### Stability
 
