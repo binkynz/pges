@@ -87,8 +87,8 @@ CREATE FUNCTION pges.uuidv7_floor(ts timestamptz) RETURNS uuid
           || '70008000000000000000')::uuid;
 
 -- Rejects a client commit id that is not a UUIDv7 (SQLSTATE 22023), or whose timestamp is more than `tol`
--- from the statement's start (SQLSTATE PGE01, which maps to AppendError::CommitIdSkew). Called from the append
--- statements. statement_timestamp(), not now(), so a long UnitOfWork does not drift.
+-- from the statement's start (SQLSTATE PGE01, which maps to AppendError::CommitIdSkew). Called from the
+-- append statements. statement_timestamp(), not now(), so a long UnitOfWork does not drift.
 CREATE FUNCTION pges.check_commit_id(id uuid, tol interval) RETURNS uuid
   LANGUAGE plpgsql STABLE PARALLEL SAFE
 AS $$
@@ -103,7 +103,7 @@ BEGIN
 END $$;
 
 -- Store creation adds the store's commits table to this publication (store/0001_init.sql says when it does
--- not), and the logical sequencer source adds any store's that is missing. Only inserts are published, and
--- the column list (set per table) leaves out the payload from the output. Decoding still reads every WAL
--- record of the database, payload included.
+-- not), and the logical sequencer source adds the commits table of any store missing from it. Only inserts
+-- are published, and the column list (set per table) leaves out the payload from the output. Decoding still
+-- reads every WAL record of the database, payload included.
 CREATE PUBLICATION pges WITH (publish = 'insert', publish_via_partition_root = true);

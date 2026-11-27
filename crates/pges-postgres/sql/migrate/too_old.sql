@@ -6,12 +6,14 @@
 -- check, or NULL for every store, $4 its newest outbox schema version. Returns the shared scope first, then
 -- stores by name, each store's outbox scope (`<store>.outbox`) right after the store; no row when every
 -- checked scope supports the crate. Store names contain no `.`, so a scope ending in `.outbox` is an outbox
--- scope.
+-- scope. Scopes are ordered byte by byte (COLLATE "C"): `.` sorts below every character of a store name, so
+-- `<store>.outbox` follows `<store>` and comes before any longer store name, which a linguistic collation
+-- does not ensure.
 SELECT scope, min_compatible FROM pges.scopes
 WHERE CASE WHEN scope = 'pges' THEN min_compatible > $1
            WHEN scope LIKE '%.outbox'
              THEN coalesce(scope = $3 || '.outbox', scope IN (SELECT schema_name || '.outbox' FROM pges.stores))
                   AND min_compatible > $4
            ELSE coalesce(scope = $3, scope IN (SELECT schema_name FROM pges.stores)) AND min_compatible > $2 END
-ORDER BY scope <> 'pges', scope
+ORDER BY scope <> 'pges', scope COLLATE "C"
 LIMIT 1

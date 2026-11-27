@@ -1,9 +1,9 @@
 -- store/opt_outbox.sql
 -- Optional, applied when a store uses the outbox source (no logical replication), in the transaction that
 -- creates the store, right after 0001 and with the same search_path. It is version 1 of the store's option
--- scope `<store>.outbox`, recorded and checksummed like a migration. The append statement inserts one row here per commit when pges.stores.outbox is set (read at
--- Store::open; there is no cargo feature for it). The sequencer drains it in the same transaction that
--- writes the log rows, and assigns positions in seq order:
+-- scope `<store>.outbox`, recorded and checksummed like a migration. The append statement inserts one row
+-- here per commit when pges.stores.outbox is set (read at Store::open; there is no cargo feature for it). The
+-- sequencer drains it in the same transaction that writes the log rows, and assigns positions in seq order:
 --
 --   WITH d AS (
 --     DELETE FROM pending WHERE seq IN (SELECT seq FROM pending ORDER BY seq LIMIT $n) RETURNING *

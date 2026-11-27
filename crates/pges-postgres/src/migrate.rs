@@ -171,11 +171,13 @@ async fn run_shared_inner(conn: &mut PgConnection) -> Result<(), MigrateError> {
 /// first.
 ///
 /// Store creation is one transaction: the schema, its `pges.stores` row, the first migration and the
-/// options in `definition` (with the outbox, the first [`OUTBOX`] migration). The definition of an existing store is never changed, and `definition` is then
-/// not read. A database holds stores of one outbox kind; a store whose [`store::StoreDefinition::outbox`]
-/// differs from the existing stores' fails with [`MigrateError::OutboxMismatch`]. Creating a store without the
-/// outbox fails with [`MigrateError::Failed`] (SQLSTATE 42501) when the role lacks the privileges of the
-/// `pges` publication's owner, which adding the store's `commits` to it needs.
+/// options in `definition` (with the outbox, the first [`OUTBOX`] migration). The definition of an existing
+/// store is never changed, and `definition` is then not read. A database holds stores of one outbox kind; a
+/// store whose [`store::StoreDefinition::outbox`] differs from the existing stores' fails with
+/// [`MigrateError::OutboxMismatch`]. Creating a store without the outbox fails with [`MigrateError::Failed`]
+/// (SQLSTATE 42501) when the `pges` publication exists and the role lacks the privileges of its owner, which
+/// adding the store's `commits` to it needs. Without the publication the store is created outside it, and the
+/// logical source adds it.
 ///
 /// Run it on a connection outside a transaction. Each migration then runs in a transaction of its own, which a
 /// dropped future rolls back. On a connection already inside a transaction, each is a savepoint instead, and a
