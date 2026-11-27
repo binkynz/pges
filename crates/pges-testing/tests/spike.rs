@@ -297,19 +297,32 @@ async fn append_expected_versions_and_idempotent_retry() -> Result<()> {
         .get("category_id");
     assert_eq!(cat, f.jobs.get());
 
-    // A commit id outside the skew tolerance raises PGE01.
-    let old = Uuid::new_v7(uuid::Timestamp::from_unix(
+    // A new commit id outside the skew tolerance raises PGE01.
+    let ahead = Uuid::new_v7(uuid::Timestamp::from_unix(
         uuid::NoContext,
-        1_700_000_000,
+        4_000_000_000,
         0,
     ));
-    let err = append(c, store::Outbox::Disabled, s, f.jobs.get(), 4, 1, old)
+    let err = append(c, store::Outbox::Disabled, s, f.jobs.get(), 4, 1, ahead)
         .await
         .unwrap_err();
     assert_eq!(
         err.as_database_error().and_then(|e| e.code()).as_deref(),
         Some("PGE01"),
         "{err}"
+    );
+
+    // One at or below the stream's last_commit_id is not checked: it cannot apply, so it returns no row and
+    // classification reports a stored one as deduplicated, however late.
+    let old = Uuid::new_v7(uuid::Timestamp::from_unix(
+        uuid::NoContext,
+        1_700_000_000,
+        0,
+    ));
+    assert_eq!(
+        append(c, store::Outbox::Disabled, s, f.jobs.get(), 4, 1, old).await?,
+        None,
+        "an old commit id"
     );
 
     // An id at or below last_commit_id is rejected (out of order), not silently accepted.

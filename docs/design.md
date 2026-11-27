@@ -987,6 +987,15 @@ the halt, 43 recovered, 335 after.
     check and on ids increasing per stream, which still hold (schema.md, Append (one stream)). Measured: 16 writers
     133 → 247 appends/s over 10 minutes; at 16 writers about 60–73% of appends still retry, because queued
     ids generated in the last id's millisecond fall below the new one.
+  - Late retries (2026-11-27): the skew check skips an id at or below the stream's `last_commit_id`, so a
+    retry of a stored commit returns no row and is classified `Deduplicated` in every mode. Before, a unit
+    of work retried later than `max_clock_skew` got `CommitIdSkew` and an aborted transaction. A savepoint
+    around each append in a transaction was the alternative; it costs a round trip and sqlx's savepoint
+    handling is unsafe (Decided, sqlx 0.9.1). Nothing at or below `last_commit_id` is ever written, so every
+    stored id still passed the check. Cost: one more probe of the partition's key, already in cache for the
+    update, and two more relation locks (9, 11 with the outbox), the partition and its key in shared mode.
+    Checking only in the rows `created` and `bumped` write would read nothing more, but the function would
+    then run only for appends that apply, and a test counts the statement's runs by its calls.
 - Outbox wake-ups: the outbox source does not poll. Writers NOTIFY `pges__outbox` (payload: the store's
   schema name) from a statement-level trigger on `pending`, only when the statement enqueued rows. The
   source LISTENs on a connection of its own: before its first drain, and again, followed by a drain, after

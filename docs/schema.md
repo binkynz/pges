@@ -200,9 +200,10 @@ returned a row.
 
 - The append names the hash partition of `streams` that holds the stream (`{stream_table}`, such as
   `streams_p017`), so no plan has partitions to prune and the append's locks do not depend on statistics or
-  `plan_cache_mode`: 7 relation locks (9 with the outbox) in every regime measured (`streams` never
-  analyzed, analyzed at 30 streams per partition, analyzed with 3 streams in all, `force_generic_plan`). The insert into a partition also takes a lock on `streams` itself, to check the
-  partition's bound. Through `streams`, a custom plan prunes to the stream's partition (9 locks), but the
+  `plan_cache_mode`: 9 relation locks (11 with the outbox) in every regime measured (`streams` never
+  analyzed, analyzed at 30 streams per partition, analyzed with 3 streams in all, `force_generic_plan`); 7 and 9 before the skew check read
+  `last_commit_id` (2026-11-27), which takes the partition and its key in a second, shared mode. The insert into a partition also takes a lock on `streams` itself, to check the
+  partition's bound. Through `streams`, a custom plan prunes to the stream's partition (9 locks, measured before the skew check's read), but the
   plan cache keeps a generic plan when the partitions were analyzed nearly empty, and PG18 locks every
   partition of a generic plan before run-time pruning: 70 locks at 64 partitions, 71 with
   `force_generic_plan` (135 unprepared), and every sixth execution planned a generic plan once (again after
@@ -251,9 +252,18 @@ returned a row.
   lost response. `pges.check_commit_id` raises SQLSTATE `PGE01` when the id's timestamp is more than the
   writer's skew (`$9`: `StoreConfig::max_clock_skew`, or the store's recorded value when `None`) from
   `statement_timestamp()`; the crate maps it to `AppendError::CommitIdSkew`. `Store::open` refuses a
-  `max_clock_skew` larger than the store's recorded one (Writer limits). Outside a transaction a `PGE01` is
-  followed by the classification query below, so a retry of an old id that already succeeded returns its
-  result instead of failing the skew check.
+  `max_clock_skew` larger than the store's recorded one (Writer limits).
+- An id at or below the stream's `last_commit_id` (one scalar subquery on the row `bumped` updates, in the
+  same partition) is not checked: the function gets an infinite tolerance, so it still runs once per
+  statement. Such an append cannot apply, so it returns no row and the classification query below reports
+  a retry of a stored commit as `Deduplicated`, however late it comes and in every mode. Before
+  (2026-11-27), the skew check ran first, and a unit of work or `append_in` inside a transaction got
+  `CommitIdSkew` and an aborted transaction for a retry more than the skew after the first attempt; only
+  autocommit looked the id up after the error. `last_commit_id` only grows, so reading it in the
+  statement's snapshot is safe: an id the snapshot sees at or below it stays at or below it. A late id the
+  stream has not stored is then `CommitIdOutOfOrder` instead of `CommitIdSkew`; a new id (above
+  `last_commit_id`, or for a new stream) is still checked. `append_many` keeps the plain check: its ids are
+  always crate-generated and fresh.
 - `uuid_extract_timestamp` returns NULL for ids that are not uuidv7, so `pges.check_commit_id` accepts any
   non-v7 id. The client only sends v7 `CommitId`s, but the SQL guard alone is weaker than it looks.
 - `i.commit_id > s.last_commit_id` keeps commit ids increasing within a stream, so `first_commit_id` is a
@@ -320,9 +330,10 @@ A unique violation (23505) on the `commits` primary key means two different appe
 id. Only a 23505 on a constraint named `*_pkey` (the leaf's commits key) counts; one on the per-leaf
 `(stream_id, last_version)` index is returned as a database error. Outside a transaction, after either
 `PGE01` or that 23505, the crate runs the classification query: if `done` is set it returns the original
-result as deduplicated (this covers a caller-supplied id retried after the skew window), otherwise
-`CommitIdSkew` or `DuplicateCommit`. Inside a transaction it returns the error directly, and the
-transaction is aborted. Appends do not run under a savepoint, which would cost a round trip each.
+result as deduplicated, otherwise `CommitIdSkew` or `DuplicateCommit`. Inside a transaction it returns the
+error directly, and the transaction is aborted. Appends do not run under a savepoint, which would cost a
+round trip each. A retry of a stored id never gets here: it is at or below `last_commit_id`, so the
+statement skips its skew check and returns no row.
 
 A commit id that no leaf of its category takes (maintenance stopped for about `LEAVES_AHEAD` buckets, or a
 leaf dropped by hand) fails the insert into `commits` with PostgreSQL's routing error: SQLSTATE 23514, no

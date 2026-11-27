@@ -537,7 +537,9 @@ set `append_routing` to `AppendRouting::Streams`.
 - The commit id is always generated on the client, so the crate can retry by itself. Outside a unit of
   work, an append that loses its connection is retried once on a new one; if the first attempt committed,
   the retry returns the original result with `Outcome::Deduplicated`. A caller-supplied commit id that
-  already committed on this stream also returns `Deduplicated`.
+  already committed on this stream also returns `Deduplicated`, in every mode (autocommit, a unit of work,
+  `append_in` inside a transaction) and however long after `max_clock_skew` the retry comes. Only a new id
+  is checked against the skew; a late id the stream has not stored is `CommitIdOutOfOrder`.
 - `snapshot_after` with `SnapshotPolicy::Manual` writes a snapshot on every call, because the caller asked
   for it. With `EveryN(n)` it writes when the stored snapshot is at least `n` versions behind.
   `load_snapshotted` with `EveryN(n)` saves a new snapshot when it replayed at least `n` events. `load` and
