@@ -432,6 +432,23 @@ crate::typed_query! {
 }
 
 crate::typed_query! {
+    /// Finds a scope whose oldest supported schema version is above this crate's newest one.
+    pub TOO_OLD, mod too_old {
+        name: "migrate/too_old",
+        files: [sql_file!("migrate/too_old.sql")],
+        params<'q> {
+            shared_version: i32,
+            store_version: i32,
+            store: Option<&'q str>,
+        },
+        row {
+            scope: String,
+            min_compatible: i32,
+        },
+    }
+}
+
+crate::typed_query! {
     /// Whether `pges.migrations` exists.
     pub MIGRATIONS_TABLE_EXISTS, mod migrations_table_exists {
         name: "migrate/migrations_table_exists",
@@ -1372,6 +1389,7 @@ pub const ALL: &[&template::Statement] = &[
     &MIGRATE_LOCK,
     &SCOPE,
     &MIN_COMPATIBLE,
+    &TOO_OLD,
     &MIGRATIONS_TABLE_EXISTS,
     &APPLIED_MIGRATIONS,
     &STORES_TABLE_EXISTS,
@@ -1472,6 +1490,7 @@ pub const TYPED: &[typed::Shape] = &[
     typed::Shape::of::<migrate_lock::Query>(),
     typed::Shape::of::<scope::Query>(),
     typed::Shape::of::<min_compatible::Query>(),
+    typed::Shape::of::<too_old::Query>(),
     typed::Shape::of::<migrations_table_exists::Query>(),
     typed::Shape::of::<applied_migrations::Query>(),
     typed::Shape::of::<stores_table_exists::Query>(),

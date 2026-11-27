@@ -72,6 +72,8 @@ pges_postgres::typed_query! {
         params {
             ttl: PgInterval,
             fence: i64,
+            shared_version: i32,
+            store_version: i32,
         },
         row {},
     }

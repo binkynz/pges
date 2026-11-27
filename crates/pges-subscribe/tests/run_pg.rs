@@ -961,3 +961,56 @@ async fn delivered(f: &Fixture, subscriber: &str, count: usize) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+/// A migration that drops support for this crate while a subscription runs (the store's `min_compatible`
+/// raised past the crate's schema version) stops it at its next lease renewal with `CrateTooOld`, sharded or
+/// not, and releases its leases. Another store's scope does not concern it.
+#[tokio::test]
+async fn a_migration_past_the_crate_stops_subscriptions_at_renewal() -> Result<()> {
+    let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    f.append(Cat::Jobs, stream::StreamId::new_v7(), 1).await?;
+    f.sequence_all().await?;
+    sqlx::query(
+        "INSERT INTO pges.scopes (schema_version, min_compatible, scope) VALUES (9, 9, 'other')",
+    )
+    .execute(&f.pool)
+    .await?;
+
+    let builder = |name: &str| {
+        f.store
+            .subscription(subscription::SubscriptionName::parse(name).unwrap())
+            .categories(non_empty![category!("jobs")])
+            .lease(interval!(400 ms))
+    };
+    let single = common::Running::spawn(builder("old").run_pg(Recorder::new("old")));
+    let sharded = common::Running::spawn(
+        builder("old_sharded")
+            .sharded(pges_subscribe::shards!(2))
+            .run_pg(Recorder::new("old_sharded")),
+    );
+    delivered(&f, "old", 1).await?;
+    delivered(&f, "old_sharded", 1).await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!single.handle.is_finished() && !sharded.handle.is_finished());
+
+    sqlx::query("UPDATE pges.scopes SET schema_version = 9, min_compatible = 9 WHERE scope = 'es'")
+        .execute(&f.pool)
+        .await?;
+    for running in [single, sharded] {
+        let error = running.stopped().await?;
+        assert!(
+            matches!(
+                &error,
+                subscription::SubscribeError::CrateTooOld { scope, min_compatible, crate_version }
+                    if scope == "es" && min_compatible.get() == 9 && crate_version.get() == 1
+            ),
+            "{error}"
+        );
+    }
+    let leased: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM es.subscriptions WHERE lease_until IS NOT NULL")
+            .fetch_one(&f.pool)
+            .await?;
+    assert_eq!(leased, 0, "the leases were released");
+    f.finish().await
+}

@@ -16,7 +16,7 @@ use tokio::{
 use uuid::Uuid;
 
 use pges_core::{category, event, frame, high_water, interval, non_empty, position};
-use pges_postgres::store;
+use pges_postgres::{migrate, store};
 
 use crate::{backfill, batch, handler, read, replica, sql, waker};
 
@@ -513,7 +513,7 @@ impl<S> Builder<S> {
 
     /// The longest a caught-up subscription waits for its waker before it reads the log anyway. Default 30 s.
     ///
-    /// A waker can stay quiet without failing: a [`waker::notify::NotifyWaker`] whose connection died
+    /// A waker can stay quiet without failing: a `NotifyWaker` (`wake-notify`) whose connection died
     /// silently (a half-open TCP connection) never hears another notification. Its holder still renews the
     /// lease, so no standby takes over. This backstop bounds how late such a subscription delivers, at the
     /// cost of one read of the log per `max_idle` while nothing is appended. It applies to each shard of
@@ -1037,6 +1037,20 @@ pub enum SubscribeError {
         /// What is wrong.
         reason: &'static str,
     },
+    /// A migration raised the shared or the store's `min_compatible` above this crate's schema version while
+    /// the subscription ran: the database no longer supports this release. Found on the next lease renewal,
+    /// which the database then refuses; the lease is released.
+    #[error(
+        "scope {scope} requires schema version {min_compatible} or newer; this crate knows {crate_version}"
+    )]
+    CrateTooOld {
+        /// `pges` or the store's name.
+        scope: String,
+        /// The oldest schema version the scope still supports.
+        min_compatible: migrate::SchemaVersion,
+        /// The newest schema version this crate knows for the scope.
+        crate_version: migrate::SchemaVersion,
+    },
     /// The waker failed. Retried.
     #[error(transparent)]
     Wake(waker::WakeError),
@@ -1144,6 +1158,7 @@ impl Delivery {
 struct Ctx {
     pool: PgPool,
     sql: Arc<sql::Statements>,
+    store: pges_core::store::StoreName,
     name: String,
     owner: Uuid,
     /// The requested number of shards.
@@ -1316,14 +1331,14 @@ impl Runner {
                     self.running();
                     self.wait(term, &known, shutdown).await
                 }
-                Ok(Step::LostLease) => return Ok(Ended::LostLease),
+                Ok(Step::LostLease) => return self.ctx.lost_lease(term).await,
                 Ok(Step::Shutdown) => Ok(Waited::Shutdown),
                 Err(error) => Err(error),
             };
 
             match outcome {
                 Ok(Waited::Woken) => self.running(),
-                Ok(Waited::LostLease) => return Ok(Ended::LostLease),
+                Ok(Waited::LostLease) => return self.ctx.lost_lease(term).await,
                 Ok(Waited::Shutdown) => {
                     self.ctx.release(term).await;
                     return Ok(Ended::Shutdown);
@@ -1549,6 +1564,7 @@ impl Ctx {
             sql: Arc::new(sql::Statements::new(pges_postgres::sql::store_name(
                 &setup.store,
             ))),
+            store: setup.store.name().clone(),
             name: setup.name.as_str().to_owned(),
             owner: Uuid::now_v7(),
             shards: setup.shards.to_i16(),
@@ -1683,6 +1699,9 @@ impl Ctx {
                     position: read::to_i64(to),
                     fence: term.fence,
                     lease: self.interval,
+                    shared_version: migrate::latest_version(migrate::SHARED).get(),
+                    store: self.store.as_str(),
+                    store_version: migrate::latest_version(migrate::STORE).get(),
                 })
                 .execute(&mut *conn)
                 .await?
@@ -1717,6 +1736,9 @@ impl Ctx {
                 shard,
                 fence,
                 lease: self.interval,
+                shared_version: migrate::latest_version(migrate::SHARED).get(),
+                store: self.store.as_str(),
+                store_version: migrate::latest_version(migrate::STORE).get(),
             })
             .execute(&self.pool)
             .await?;
@@ -1732,6 +1754,29 @@ impl Ctx {
         term.deadline
             .checked_sub(self.lease / 2)
             .unwrap_or_else(Instant::now)
+    }
+
+    /// Ends a term whose lease renewal or fenced checkpoint was refused. Renewals are also refused once a
+    /// migration dropped support for this crate; that stops the subscription with
+    /// [`SubscribeError::CrateTooOld`] instead of standing by. If the check itself fails, the term ends as a
+    /// lost lease and the next renewal checks again.
+    async fn lost_lease(&self, term: &Term) -> Result<Ended, SubscribeError> {
+        let too_old = match self.pool.acquire().await {
+            Ok(mut conn) => {
+                migrate::crate_too_old(&mut conn, migrate::Scopes::OneStore(&self.store)).await
+            }
+            Err(error) => Err(error.into()),
+        };
+        let Ok(Some(too_old)) = too_old else {
+            return Ok(Ended::LostLease);
+        };
+
+        self.release(term).await;
+        Err(SubscribeError::CrateTooOld {
+            scope: too_old.scope,
+            min_compatible: too_old.min_compatible,
+            crate_version: too_old.crate_version,
+        })
     }
 
     /// Gives the lease up, so a standby takes over at once. Best effort: if it fails, the lease lapses.

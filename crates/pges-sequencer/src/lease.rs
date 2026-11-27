@@ -4,6 +4,8 @@
 use pges_postgres::sql::typed::Query as _;
 use sqlx::{Executor, PgConnection, postgres::types::PgInterval};
 
+use pges_postgres::migrate;
+
 use crate::{sequencer, sql::statement};
 
 /// What the acquire statement returns.
@@ -85,7 +87,8 @@ pub(crate) async fn halt_unleased(
     Ok(())
 }
 
-/// Extends the lease. `false`: another sequencer took it over; stand down.
+/// Extends the lease. `false`: another sequencer took it over, or the database no longer supports this
+/// crate ([`migrate::crate_too_old`]); stand down.
 pub(crate) async fn renew(
     conn: &mut PgConnection,
     fence: sequencer::Fence,
@@ -95,6 +98,8 @@ pub(crate) async fn renew(
         .bind(statement::lease_renew::Params {
             ttl,
             fence: fence.sql(),
+            shared_version: migrate::latest_version(migrate::SHARED).get(),
+            store_version: migrate::latest_version(migrate::STORE).get(),
         })
         .execute(&mut *conn)
         .await?;

@@ -244,3 +244,37 @@ async fn lease_held(pool: &PgPool) -> Result<bool> {
             .await?,
     )
 }
+
+/// A migration that drops support for this crate while the sequencer leads (here a store's `min_compatible`
+/// raised past the crate's schema version) stops it at its next lease renewal with `CrateTooOld`, and its
+/// lease is released for a newer sequencer.
+#[tokio::test]
+async fn a_migration_past_the_crate_stops_the_leader_at_renewal() -> Result<()> {
+    let f = Fixture::new().await?;
+    let running = f.start(common::fast()).await?;
+    running.wait_leading().await?;
+    f.append(Target::Job(stream::StreamId::new_v7()), 1).await?;
+    common::wait_sequenced(&f.pool, 1).await?;
+
+    let raised: String = sqlx::query_scalar(
+        "UPDATE pges.scopes SET schema_version = 9, min_compatible = 9 WHERE scope <> 'pges' \
+         RETURNING scope",
+    )
+    .fetch_one(&f.pool)
+    .await?;
+    let result = running.result().await;
+
+    assert!(
+        matches!(
+            &result,
+            Err(sequencer::RunError::CrateTooOld { scope, min_compatible, crate_version })
+                if *scope == raised && min_compatible.get() == 9 && crate_version.get() == 1
+        ),
+        "{result:?}"
+    );
+    let released: bool = sqlx::query_scalar("SELECT lease_until IS NULL FROM pges.sequencer")
+        .fetch_one(&f.pool)
+        .await?;
+    assert!(released);
+    f.finish().await
+}

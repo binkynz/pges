@@ -172,6 +172,68 @@ async fn a_database_beyond_the_compatibility_window_is_refused() -> Result<()> {
     db.cleanup().await
 }
 
+/// `crate_too_old` reads the shared scope first, then one store or every store, and skips option scopes.
+#[tokio::test]
+async fn crate_too_old_names_the_first_scope_past_the_crate() -> Result<()> {
+    let db = pges_testing::TestDb::new().await?;
+    let mut conn = db.connect().await?;
+    run(&mut conn, store_name!("m6")).await?;
+    run(&mut conn, store_name!("m7")).await?;
+    let (m6, m7) = (store_name!("m6"), store_name!("m7"));
+    // A store option's scope has versions of its own and is not compared with the store's.
+    sqlx::query(
+        "INSERT INTO pges.scopes (schema_version, min_compatible, scope) VALUES (9, 9, 'm6.outbox')",
+    )
+    .execute(&mut conn)
+    .await?;
+    assert_eq!(
+        migrate::crate_too_old(&mut conn, migrate::Scopes::AllStores).await?,
+        None
+    );
+
+    sqlx::query("UPDATE pges.scopes SET schema_version = 9, min_compatible = 8 WHERE scope = 'm7'")
+        .execute(&mut conn)
+        .await?;
+    assert_eq!(
+        migrate::crate_too_old(&mut conn, migrate::Scopes::OneStore(&m6)).await?,
+        None
+    );
+    let too_old = migrate::crate_too_old(&mut conn, migrate::Scopes::OneStore(&m7))
+        .await?
+        .unwrap();
+    assert_eq!(
+        (
+            too_old.scope.as_str(),
+            too_old.min_compatible.get(),
+            too_old.crate_version
+        ),
+        ("m7", 8, migrate::latest_version(migrate::STORE))
+    );
+    assert_eq!(
+        migrate::crate_too_old(&mut conn, migrate::Scopes::AllStores).await?,
+        Some(too_old)
+    );
+
+    sqlx::query(
+        "UPDATE pges.scopes SET schema_version = 9, min_compatible = 9 WHERE scope = 'pges'",
+    )
+    .execute(&mut conn)
+    .await?;
+    let too_old = migrate::crate_too_old(&mut conn, migrate::Scopes::OneStore(&m6))
+        .await?
+        .unwrap();
+    assert_eq!(
+        (too_old.scope.as_str(), too_old.min_compatible.get()),
+        ("pges", 9)
+    );
+    assert_eq!(
+        too_old.crate_version,
+        migrate::latest_version(migrate::SHARED)
+    );
+    conn.close().await?;
+    db.cleanup().await
+}
+
 async fn store_names(conn: &mut sqlx::PgConnection) -> Result<Vec<String>> {
     Ok(
         sqlx::query_scalar("SELECT schema_name FROM pges.stores ORDER BY schema_name")

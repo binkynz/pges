@@ -1,7 +1,16 @@
--- Extends the lease held under a fence.
+-- Extends the lease held under a fence, while the database still supports this crate.
 --
 -- $1 how long the lease lasts from now
 -- $2 the holder's fence
+-- $3 the crate's newest shared (pges) schema version
+-- $4 the crate's newest store schema version
 --
--- Zero rows: another process bumped the fence and took the lease over; the holder stands down.
-UPDATE pges.sequencer SET lease_until = now() + $1 WHERE fence = $2
+-- Zero rows: another process bumped the fence and took the lease over, or a migration raised the shared or
+-- some store's min_compatible above the crate's version (the sequencer writes to every store). The holder
+-- stands down, or stops when pges.scopes says the crate is too old. Only the shared scope and the stores'
+-- own scopes are compared: a store option's scope (`<store>.outbox`) would have versions of its own.
+UPDATE pges.sequencer SET lease_until = now() + $1
+WHERE fence = $2
+  AND NOT EXISTS (SELECT FROM pges.scopes
+                  WHERE (scope = 'pges' AND min_compatible > $3)
+                     OR (scope IN (SELECT schema_name FROM pges.stores) AND min_compatible > $4))
