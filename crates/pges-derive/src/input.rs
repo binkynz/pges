@@ -712,7 +712,7 @@ fn check_unique_names(variants: &[EventVariant], errors: &mut Errors) {
     }
 }
 
-/// The rule of `pges_core::category::CategoryName`: `^[a-z][a-z0-9_]{0,39}$`.
+/// The rule of `pges_core::category::CategoryName`: `^[a-z][a-z0-9_]{0,39}$`, without `__`.
 fn validate_category(name: &str) -> Result<(), &'static str> {
     let mut bytes = name.bytes();
 
@@ -728,6 +728,9 @@ fn validate_category(name: &str) -> Result<(), &'static str> {
     }
     if !bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_') {
         return Err("it may only contain a-z, 0-9 and _");
+    }
+    if name.contains("__") {
+        return Err("it may not contain __");
     }
 
     Ok(())

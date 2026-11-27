@@ -683,7 +683,7 @@ async fn create_past_leaves(
         .fetch_all(&mut *tx)
         .await?;
     for bucket in buckets {
-        let leaf = partitions::ident(&format!("commits_{}_{}", category.as_str(), bucket.suffix))?;
+        let leaf = partitions::ident(&format!("commits_{}__{}", category.as_str(), bucket.suffix))?;
         let leaf_values = values
             .clone()
             .ident(template::IdentPlaceholder::Leaf, &leaf)

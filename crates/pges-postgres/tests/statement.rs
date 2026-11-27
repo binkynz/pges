@@ -23,7 +23,7 @@ const EXTRA: category::CategoryName = category!("extra");
 
 #[test]
 fn files_match_the_registry() -> Result<()> {
-    let values = every_value(&ident("commits_jobs_202611"), category::CategoryId::new(1));
+    let values = every_value(&ident("commits_jobs__202611"), category::CategoryId::new(1));
 
     pges_testing::statement::check_files(
         Path::new(env!("CARGO_MANIFEST_DIR")),
@@ -194,7 +194,10 @@ async fn ddl_statements_run() -> Result<()> {
         &mut conn,
         &mut ran,
         &statement::CREATE_CATEGORY_PARTITION,
-        &category_values,
+        &category_values.clone().ident(
+            template::IdentPlaceholder::Index,
+            &ident("commits_extra__pkey"),
+        ),
     )
     .await?;
     run(
@@ -211,7 +214,7 @@ async fn ddl_statements_run() -> Result<()> {
         ("202001", "2020-01-01 00:00:00+00", "2020-02-01 00:00:00+00"),
         ("202002", "2020-02-01 00:00:00+00", "2020-03-01 00:00:00+00"),
     ] {
-        let leaf = ident(&format!("commits_extra_{suffix}"));
+        let leaf = ident(&format!("commits_extra__{suffix}"));
         let values = category_values
             .clone()
             .ident(template::IdentPlaceholder::Leaf, &leaf)
@@ -219,7 +222,7 @@ async fn ddl_statements_run() -> Result<()> {
             .ident(template::IdentPlaceholder::Parent, &parent)
             .ident(
                 template::IdentPlaceholder::Index,
-                &ident(&format!("commits_extra_{suffix}_s")),
+                &ident(&format!("commits_extra__{suffix}_s")),
             )
             .ident(template::IdentPlaceholder::Bound, &ident("bound"))
             .range(

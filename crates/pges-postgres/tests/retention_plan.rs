@@ -38,7 +38,7 @@ impl Fixture {
             .await?;
         pges_testing::create_log_partition(&mut conn, &STORE_NAME, 0).await?;
         let leaf: String = sqlx::query_scalar(
-            "SELECT 'commits_jobs_' || to_char(now() AT TIME ZONE 'UTC' - interval '1 month', 'YYYYMM')",
+            "SELECT 'commits_jobs__' || to_char(now() AT TIME ZONE 'UTC' - interval '1 month', 'YYYYMM')",
         )
         .fetch_one(&mut conn)
         .await?;

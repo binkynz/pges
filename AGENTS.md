@@ -108,7 +108,8 @@ Types are self-descriptive. If a type needs a comment to explain what it is, ren
   `{to}`) and `SnapshotName`. Everything else is a bind parameter.
 - Column order: NOT NULL fixed-width columns widest first, then nullable fixed-width, then variable-width.
 - Store and category names are interpolated into SQL, so they are validated against `^[a-z][a-z0-9_]{0,39}$`
-  first (`StoreName`, `CategoryName`) and never quoted from user input.
+  first (`StoreName`, `CategoryName`) and never quoted from user input. Category names also exclude `__`,
+  which separates the category in the names built from it (`ident.rs`).
 - Hot tables (`streams`, `commits`, `log`, `pending`) carry no foreign keys.
 - Replication slot and origin names are server-wide; derive them from the database.
 

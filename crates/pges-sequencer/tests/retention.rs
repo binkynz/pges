@@ -364,7 +364,7 @@ async fn leaf(f: &Fixture, months_back: i32) -> Result<String> {
 /// The `category` leaf `months_back` months before the current one.
 async fn leaf_of(f: &Fixture, category: &str, months_back: i32) -> Result<String> {
     Ok(sqlx::query_scalar(
-        "SELECT 'commits_' || $2 || '_' || to_char(date_trunc('month', now() AT TIME ZONE 'UTC')
+        "SELECT 'commits_' || $2 || '__' || to_char(date_trunc('month', now() AT TIME ZONE 'UTC')
                                                    - make_interval(months => $1), 'YYYYMM')",
     )
     .bind(months_back)

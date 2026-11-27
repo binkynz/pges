@@ -364,12 +364,17 @@ async fn create_leaves(
         .await?
         .category_id;
     let values = values.clone().category_id(category::CategoryId::new(id));
-    for statement in [
-        &postgres_sql::statement::CREATE_CATEGORY_PARTITION,
-        &postgres_sql::statement::ATTACH_CATEGORY_PARTITION,
-    ] {
-        tx.execute(statement.render_text(&values)).await?;
-    }
+    let key = ident(&format!("commits_{}__pkey", category.as_str()))?;
+    tx.execute(
+        postgres_sql::statement::CREATE_CATEGORY_PARTITION.render_text(
+            &values
+                .clone()
+                .ident(template::IdentPlaceholder::Index, &key),
+        ),
+    )
+    .await?;
+    tx.execute(postgres_sql::statement::ATTACH_CATEGORY_PARTITION.render_text(&values))
+        .await?;
 
     let days = sql::statement::days::Query::fixed()
         .bind(sql::statement::days::Params {
@@ -378,7 +383,7 @@ async fn create_leaves(
         .fetch_all(&mut *tx)
         .await?;
     for sql::statement::days::Row { suffix, from, to } in days {
-        let leaf = ident(&format!("commits_{}_{suffix}", category.as_str()))?;
+        let leaf = ident(&format!("commits_{}__{suffix}", category.as_str()))?;
         let leaf_values = values
             .clone()
             .ident(template::IdentPlaceholder::Leaf, &leaf)

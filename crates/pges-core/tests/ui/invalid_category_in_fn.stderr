@@ -1,4 +1,4 @@
-error[E0080]: evaluation panicked: invalid category name: it must match ^[a-z][a-z0-9_]{0,39}$
+error[E0080]: evaluation panicked: invalid category name: it must match ^[a-z][a-z0-9_]{0,39}$ and not contain __
  --> tests/ui/invalid_category_in_fn.rs:4:16
   |
 4 |     let dash = category!("jobs-board");

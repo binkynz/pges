@@ -19,15 +19,32 @@ pub(crate) fn is_plain_identifier(name: &str) -> bool {
         && chars.all(|c| matches!(c, 'a'..='z' | '0'..='9' | '_'))
 }
 
+/// Separates a category's name from the rest of the names built from it. Category names cannot contain it, so
+/// no name built from a category equals another category's partition `commits_<category>`, and no two of
+/// them are equal: `commits_a__202611` is category `a`'s November leaf, and category `a_202611`'s partition is
+/// `commits_a_202611`.
+pub(crate) const SEPARATOR: &str = "__";
+
 /// The LIST partition of `commits` holding one category: `commits_<category>`.
 pub(crate) fn category_partition(category: &str) -> String {
     format!("commits_{category}")
 }
 
-/// A RANGE leaf of a category partition: `commits_<category>_<suffix>`, where the suffix is the leaf's lower
+/// The primary key of a category partition: `commits_<category>__pkey`. It is named, not derived: the name
+/// PostgreSQL derives, `commits_<category>_pkey`, is category `<category>_pkey`'s partition.
+pub(crate) fn category_partition_key(category: &str) -> String {
+    format!("commits_{category}{SEPARATOR}pkey")
+}
+
+/// A RANGE leaf of a category partition: `commits_<category>__<suffix>`, where the suffix is the leaf's lower
 /// bound as `YYYYMM` (month buckets) or `YYYYMMDD` (day buckets, and the one leaf bridging a bucket change).
 pub(crate) fn leaf(category: &str, suffix: &str) -> String {
-    format!("commits_{category}_{suffix}")
+    format!("commits_{category}{SEPARATOR}{suffix}")
+}
+
+/// A regular expression matching the names of a category's leaves.
+pub(crate) fn leaf_pattern(category: &str) -> String {
+    format!("^commits_{category}{SEPARATOR}[0-9]{{6}}([0-9]{{2}})?$")
 }
 
 /// The leaf's unique `(stream_id, last_version)` index: `<leaf>_s`.
@@ -52,7 +69,7 @@ mod tests {
 
     #[test]
     fn plain_identifiers_fit_and_need_no_quoting() {
-        assert!(is_plain_identifier("commits_jobs_202611"));
+        assert!(is_plain_identifier("commits_jobs__202611"));
         assert!(!is_plain_identifier("Commits"));
         assert!(!is_plain_identifier("commits\"; drop"));
         assert!(!is_plain_identifier(&"a".repeat(MAX_IDENTIFIER + 1)));
@@ -68,7 +85,7 @@ mod tests {
         let day_leaf = leaf(&category, "20261124");
         let month_leaf = leaf(&category, "202611");
         let names = [
-            primary_key(&partition),
+            category_partition_key(&category),
             leaf_stream_index(&day_leaf),
             leaf_stream_index(&month_leaf),
             primary_key(&day_leaf),
@@ -89,7 +106,48 @@ mod tests {
             );
             assert!(is_plain_identifier(name), "{name}");
         }
-        assert_eq!(names[1].len(), 59, "the longest name the crate chooses");
-        assert_eq!(names[3].len(), 62, "the longest name PostgreSQL derives");
+        assert_eq!(names[1].len(), 60, "the longest name the crate chooses");
+        assert_eq!(names[3].len(), 63, "the longest name PostgreSQL derives");
+    }
+
+    /// No name built for one category equals one built for another, or the primary key of `commits`, for
+    /// categories named like each other's leaves, leaf indexes and keys.
+    #[test]
+    fn names_of_different_categories_never_collide() {
+        let categories = [
+            "a",
+            "a_",
+            "a_202611",
+            "a_20261124",
+            "a_202611_s",
+            "a_202611_pkey",
+            "a_pkey",
+            "a_s",
+            "pkey",
+        ];
+        let mut seen = std::collections::HashMap::new();
+        seen.insert("commits__pkey".to_owned(), "commits");
+
+        for category in categories {
+            assert!(
+                pges_core::category::CategoryName::leak(category.to_owned()).is_ok(),
+                "{category}"
+            );
+            let mut names = vec![
+                category_partition(category),
+                category_partition_key(category),
+            ];
+            for suffix in ["202611", "20261124"] {
+                let leaf = leaf(category, suffix);
+                names.push(leaf_stream_index(&leaf));
+                names.push(primary_key(&leaf));
+                names.push(leaf);
+            }
+            for name in names {
+                if let Some(other) = seen.insert(name.clone(), category) {
+                    panic!("{name} is built for {other} and {category}");
+                }
+            }
+        }
     }
 }

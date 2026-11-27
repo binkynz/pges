@@ -16,6 +16,13 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crates
   default 100 holds the default 64 partitions) and the role may write every partition directly. Otherwise
   appends go through `streams` as before. `StoreConfig::append_routing` (`AppendRouting::Auto`, the default,
   or `Streams`) turns it off.
+- **Partition headroom** (`pges-postgres`). `Admin::partition_headroom` reports, per category, the upper
+  bound of its newest time leaf and how far ahead of now it is (`CategoryHeadroom::below_one_bucket` flags
+  less than one bucket), and the positions left in the newest log partition. Alert on it to catch a stopped
+  `Admin::maintain` before appends fail.
+- **`AppendError::NoPartition`** (`pges-postgres`). An append whose commit id no leaf of its category takes
+  (maintenance stopped for about `LEAVES_AHEAD` buckets) fails with `NoPartition { category, commit_id }`
+  instead of a raw database error (SQLSTATE 23514). `delete_stream` reports it as `Write(NoPartition)`.
 
 ### Changed
 
@@ -41,6 +48,16 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crates
   before it is confirmed, so the slot is never ahead of the token on a healthy server. A slot the source
   creates has its consistent point stored as the token at once. design.md now recommends a synchronous
   failover target.
+- **Category names no longer collide with other categories' partitions** (`pges-postgres`, `pges-core`,
+  `pges-derive`). A category named like another's leaf took that leaf's name: `a_202611`'s partition was
+  `a`'s November leaf `commits_a_202611`. Registered first, it left `a` without that leaf, so its appends
+  failed all month while maintenance reported success; registered second, it failed. Names like a leaf's
+  index (`a_202611_s`) or a key (`a_pkey`, `pkey`) failed to register. Leaves are now
+  `commits_<cat>__<suffix>`, the category partition's key `commits_<cat>__pkey` and the key of `commits`
+  `commits__pkey`, and category names may not contain `__` (`CategoryError::DoubleUnderscore`). Maintenance
+  also checks a partition's parent: a name taken by another relation fails with `NameTaken` (on
+  `RegisterCategoryError`, `ChangeBucketError` and `MaintainError`) instead of being skipped or dropped.
+  Store migration 0001 changed in place (nothing is published yet).
 - **The logical source ends only walsenders** (`pges-sequencer`). Before `START_REPLICATION` it ended
   whichever process held the slot, including a session running `pg_drop_replication_slot` or another slot
   function. A drop ended mid-call could remove the slot while its client saw an error. Now only a walsender

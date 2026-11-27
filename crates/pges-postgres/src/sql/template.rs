@@ -183,7 +183,7 @@ pub enum Placeholder {
     Category,
     /// A category's id: a [`category::CategoryId`], as an integer literal.
     CategoryId,
-    /// A time leaf of a category, such as `commits_jobs_202611`.
+    /// A time leaf of a category, such as `commits_jobs__202611`.
     Leaf,
     /// A log partition, such as `log_0000`.
     LogPartition,
@@ -511,7 +511,7 @@ mod tests {
     fn values_are_validated() {
         assert!(store::StoreName::new("pges").is_err());
         assert!(store::StoreName::new("ops;drop").is_err());
-        assert!(Ident::new("commits_jobs_202611").is_some());
+        assert!(Ident::new("commits_jobs__202611").is_some());
         assert!(Ident::new("Commits").is_none());
         assert!(Literal::timestamptz("2026-11-01 00:00:00+00").is_some());
         assert!(Literal::timestamptz("Sun Nov 01 00:00:00 2026 UTC").is_some());

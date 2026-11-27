@@ -220,9 +220,7 @@ async fn freeze(
     candidate: &Candidate,
 ) -> Result<Vacuum, sqlx::Error> {
     let store = admin.store_name();
-    if admin::partition_state(conn, store.as_str(), candidate.name.as_str()).await?
-        == admin::PartitionState::Missing
-    {
+    if !admin::relation_exists(conn, store.as_str(), candidate.name.as_str()).await? {
         return Ok(Vacuum::Gone);
     }
 

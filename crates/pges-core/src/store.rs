@@ -172,12 +172,15 @@ impl fmt::Display for StoreId {
 const RESERVED: [&str; 3] = ["pges", "public", "information_schema"];
 
 pub(crate) const fn validate(name: &str) -> Result<(), StoreNameError> {
-    match category::validate(name) {
+    match category::validate_identifier(name) {
         Ok(()) => {}
         Err(category::CategoryError::Empty) => return Err(StoreNameError::Empty),
         Err(category::CategoryError::TooLong) => return Err(StoreNameError::TooLong),
         Err(category::CategoryError::InvalidStart) => return Err(StoreNameError::InvalidStart),
-        Err(category::CategoryError::InvalidCharacter) => {
+        // Not returned: a store name may contain __, since it never becomes part of a partition's name.
+        Err(
+            category::CategoryError::InvalidCharacter | category::CategoryError::DoubleUnderscore,
+        ) => {
             return Err(StoreNameError::InvalidCharacter);
         }
     }
