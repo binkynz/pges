@@ -30,6 +30,7 @@ pges_postgres::typed_query! {
             leader: Option<&'q str>,
             shared_version: i32,
             store_version: i32,
+            outbox_version: i32,
         },
         row {
             too_old: Option<bool>,
