@@ -100,6 +100,16 @@ async fn a_new_slot_stores_its_consistent_point_and_a_missing_token_halts_only_w
     let result = start_expecting_halt(&f).await?.result().await;
     assert_ahead(&result, &slot, lsn::Lsn::ZERO, confirmed);
 
+    // A source that read no token before another process (a bootstrap) stored one reads it again, so it
+    // opens although a store holds a commit.
+    sqlx::query("UPDATE pges.sequencer SET source = 'logical', source_token = $1")
+        .bind(confirmed.get().to_be_bytes().to_vec())
+        .execute(&f.pool)
+        .await?;
+    let mut late = f.logical_source(f.pool.clone())?;
+    source::Source::open(&mut late, None).await?;
+    source::Source::close(&mut late).await;
+
     f.finish().await
 }
 

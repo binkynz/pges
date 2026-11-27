@@ -726,8 +726,12 @@ consistent point stored as the token (`crates/pges-sequencer/sql/logical/store_i
   is at or behind the token. Past it means the log rows and token of the commits in between were lost, as on
   an asynchronous standby promoted with a synchronised failover slot (design.md, Deployment), and the server
   would silently start streaming at the slot's position: `Halt(SlotLost::Ahead { slot, token, confirmed })`.
-  Without a token the slot counts as ahead when it is past `0/0` and any non-outbox store holds a commit
-  (`store_has_commits.sql` per store, outside a snapshot); with no commit there is nothing to lose.
+  Without a token the stored one is read again after the slot
+  (`crates/pges-sequencer/sql/logical/stored_token.sql`), since a bootstrap may have stored a new slot's
+  consistent point meanwhile; a token is stored before the slot is confirmed to it, so a token read after the
+  slot is never behind it. If there is still none, the slot counts as ahead when it is past `0/0` and any
+  non-outbox store holds a commit (`store_has_commits.sql` per store, outside a snapshot); with no commit
+  there is nothing to lose.
 - Outcomes: a slot with an `invalidation_reason` is `SourceError::Halt(SlotLost::Invalidated)`; no slot but
   a token is `Halt(SlotLost::Missing)`; a slot confirmed past the token is `Halt(SlotLost::Ahead)`; a new slot whose exported snapshot already shows a commit in a store
   is dropped again and gives `Halt(SlotLost::CommitsBeforeSlot)`, because it would never deliver those
