@@ -1776,6 +1776,14 @@ the halt, 43 recovered, 335 after.
   - `append_many` stayed as it was at first (one prepared statement through `streams`, 4 locks per touched
     partition, every partition under a generic plan): running it unprepared fixes the statistics regimes
     but cost 20–25% of batches per second at concurrency 1. Fixed by custom plans (below).
+  - Single appends through `streams` (routing off, or fallen back) keep the plan cache's choice
+    (2026-11-27). Running them in their own transaction with `force_custom_plan`, as `append_many` does, locks
+    only the stream's partition in every regime (70–71 down to 9 at 64 partitions, nearly empty or under
+    `force_generic_plan`), but an autocommit append goes from one round trip to three and holds its row lock
+    until COMMIT: 5.1–5.3k down to 4.3–4.4k appends/s at concurrency 1 and 29–32k down to 22–26k at 16
+    (100k streams, `synchronous_commit = off`), in the regime where plans were already custom. Rejected:
+    every store on that path pays to protect stores analyzed nearly empty, which barely feel the fan-out;
+    routing gives 7 locks in every regime.
 - `append_many` plans for its streams (2026-11-26; schema.md, Append (several streams)):
   - The batch statement runs with `plan_cache_mode = force_custom_plan`: in its own transaction through
     `BEGIN; SET LOCAL plan_cache_mode = force_custom_plan`, one simple-query round trip
