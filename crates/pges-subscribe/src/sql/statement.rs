@@ -196,7 +196,16 @@ pges_postgres::typed_query! {
     pub CHECKPOINT_RENEW, mod checkpoint_renew {
         name: "subscription/checkpoint_renew",
         files: [sql_file!("subscription/checkpoint_renew.sql")],
-        params<'q> { name: &'q str, shard: i16, position: i64, fence: i64, lease: PgInterval },
+        params<'q> {
+            name: &'q str,
+            shard: i16,
+            position: i64,
+            fence: i64,
+            lease: PgInterval,
+            shared_version: i32,
+            store: &'q str,
+            store_version: i32,
+        },
         row {},
     }
 }
@@ -206,7 +215,15 @@ pges_postgres::typed_query! {
     pub RENEW, mod renew {
         name: "subscription/renew",
         files: [sql_file!("subscription/renew.sql")],
-        params<'q> { name: &'q str, shard: i16, fence: i64, lease: PgInterval },
+        params<'q> {
+            name: &'q str,
+            shard: i16,
+            fence: i64,
+            lease: PgInterval,
+            shared_version: i32,
+            store: &'q str,
+            store_version: i32,
+        },
         row {},
     }
 }

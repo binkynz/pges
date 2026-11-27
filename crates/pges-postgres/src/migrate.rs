@@ -293,6 +293,70 @@ impl MigrateError {
     }
 }
 
+/// The newest version of `migrations`: the schema version this crate needs a scope at, and the one it
+/// compares the scope's `min_compatible` with. [`SchemaVersion::NONE`] for no migrations.
+pub fn latest_version(migrations: &[Migration]) -> SchemaVersion {
+    migrations.last().map_or(SchemaVersion::NONE, |m| m.version)
+}
+
+/// The scopes [`crate_too_old`] reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Scopes<'a> {
+    /// The shared `pges` scope and one store's.
+    OneStore(&'a core_store::StoreName),
+    /// The shared `pges` scope and every store's.
+    AllStores,
+}
+
+/// A scope that no longer supports this crate: a newer release migrated it and raised its `min_compatible`
+/// above this crate's newest migration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CrateTooOld {
+    /// `pges` or a store's name.
+    pub scope: String,
+    /// The oldest schema version the scope still supports.
+    pub min_compatible: SchemaVersion,
+    /// The newest schema version this crate knows for the scope.
+    pub crate_version: SchemaVersion,
+}
+
+/// Finds a scope that no longer supports this crate, the check [`store::Store::open`] makes at start: the
+/// shared scope first, then stores by name. `None` when every scope read supports it.
+///
+/// Subscriptions and the sequencer run it after a lease renewal was refused. Their renewals carry the same
+/// check, so a process this crate's version cannot serve any more loses its lease within one renewal and
+/// stops instead of standing by.
+pub async fn crate_too_old(
+    conn: &mut PgConnection,
+    scopes: Scopes<'_>,
+) -> Result<Option<CrateTooOld>, error::DbError> {
+    let (shared_version, store_version) = (latest_version(SHARED), latest_version(STORE));
+    let store = match scopes {
+        Scopes::OneStore(store) => Some(store.as_str()),
+        Scopes::AllStores => None,
+    };
+    let row = statement::too_old::Query::fixed()
+        .bind(statement::too_old::Params {
+            shared_version: shared_version.get(),
+            store_version: store_version.get(),
+            store,
+        })
+        .fetch_optional(conn)
+        .await?;
+
+    Ok(row.map(|row| CrateTooOld {
+        crate_version: if row.scope == SHARED_SCOPE {
+            shared_version
+        } else {
+            store_version
+        },
+        scope: row.scope,
+        min_compatible: SchemaVersion(row.min_compatible),
+    }))
+}
+
 /// How a scope's schema compares with what this crate needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Compatibility {
@@ -364,10 +428,6 @@ pub(crate) async fn compatibility(
 const OUTBOX_MISMATCH: &str = "PGE02";
 
 pub(crate) const OUTBOX_SQL: &str = include_str!("../migrations/store/opt_outbox.sql");
-
-pub(crate) fn latest_version(migrations: &[Migration]) -> SchemaVersion {
-    migrations.last().map_or(SchemaVersion::NONE, |m| m.version)
-}
 
 /// Whether every migration is applied, failing on an edited one.
 fn is_current(

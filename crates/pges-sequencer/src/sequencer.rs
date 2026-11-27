@@ -10,6 +10,7 @@ use sqlx::{Connection, PgPool, Postgres, pool::PoolConnection, postgres::types::
 use tokio::time::Instant;
 
 use pges_core::{interval, lsn, store};
+use pges_postgres::migrate;
 
 #[cfg(feature = "watch-notify")]
 use crate::notify;
@@ -355,6 +356,20 @@ pub enum RunError {
     /// A store's positions would pass `i64::MAX`. Fatal.
     #[error("store {0} ran out of positions")]
     PositionOverflow(store::StoreId),
+    /// A migration raised the shared or a store's `min_compatible` above this crate's schema version while
+    /// the sequencer ran: the database no longer supports this release. Found on the next lease renewal,
+    /// which the database then refuses; the lease is released. Fatal.
+    #[error(
+        "scope {scope} requires schema version {min_compatible} or newer; this crate knows {crate_version}"
+    )]
+    CrateTooOld {
+        /// `pges` or a store's name.
+        scope: String,
+        /// The oldest schema version the scope still supports.
+        min_compatible: migrate::SchemaVersion,
+        /// The newest schema version this crate knows for the scope.
+        crate_version: migrate::SchemaVersion,
+    },
 }
 
 impl RunError {
@@ -444,7 +459,17 @@ async fn standby<S: source::Source>(
         match acquired {
             Ok(Some(mut term)) => match lead(ctx, source, &mut term, shutdown.as_mut()).await? {
                 Ended::Shutdown => return Ok(()),
-                Ended::LeaseLost => ctx.watch.set_status(Status::Standby),
+                Ended::LeaseLost => {
+                    if let Some(too_old) = crate_too_old(ctx).await {
+                        release(ctx, &mut term).await;
+                        return Err(RunError::CrateTooOld {
+                            scope: too_old.scope,
+                            min_compatible: too_old.min_compatible,
+                            crate_version: too_old.crate_version,
+                        });
+                    }
+                    ctx.watch.set_status(Status::Standby);
+                }
             },
             Ok(None) => {}
             Err(error) if error.is_fatal() => return Err(error),
@@ -540,6 +565,18 @@ async fn lead_term<S: source::Source>(
             }
         }
     }
+}
+
+/// After a refused renewal: the scope that no longer supports this crate, if a migration is why. Renewals
+/// check every scope, as the sequencer writes to every store. `None` also when the check fails: the term
+/// then ends as a lost lease, and the next renewal checks again.
+async fn crate_too_old(ctx: &Ctx<'_>) -> Option<migrate::CrateTooOld> {
+    let mut conn = ctx.pool.acquire().await.ok()?;
+
+    migrate::crate_too_old(&mut conn, migrate::Scopes::AllStores)
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Gives the lease up, on the term's connection or, if that one failed, on a new one.

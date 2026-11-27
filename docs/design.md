@@ -1130,6 +1130,16 @@ the halt, 43 recovered, 335 after.
     `Wakers::any` with a poll waker. A read per 30 s is negligible beside the lease renewal every 7.5 s.
     Treating each lease renewal as a wake-up was the alternative; it ties the delivery bound to the lease
     and could not be tuned on its own.
+- Compatibility after start (2026-11-27): `min_compatible` was checked only by `Store::open` and the
+  migration runner, so a subscription or sequencer of a release a later migration stopped supporting kept
+  running. Lease renewals now carry the check (a `NOT EXISTS` on `pges.scopes` in the renewal statement),
+  and a refused renewal is followed by one read of `pges.scopes` that turns it into a fatal `CrateTooOld`
+  and releases the lease. The renewal is the one statement every lease holder runs on a timer, so the
+  check needs no extra round trip, and an old holder cannot keep its lease, so a newer standby takes over.
+  Alternatives: a separate query per renewal (a round trip each), or recording each holder's crate version
+  in its lease row so a contracting migration refuses to run while old holders exist (a schema change, and
+  it blocks the migration instead of stopping the old process). Appends and reads hold no lease and stay
+  checked at open only; the rolling-upgrade rule (one release at a time) covers them.
 - `pges` facade (2026-11-25):
   - Re-exports only, each crate as an inlined module (`pges::core`, `pges::derive`, `pges::postgres`,
     `pges::subscribe`, `pges::sequencer`, `pges::replication`), plus the derive at the root; the facade is the only crate that

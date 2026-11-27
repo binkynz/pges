@@ -58,6 +58,13 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crates
   also checks a partition's parent: a name taken by another relation fails with `NameTaken` (on
   `RegisterCategoryError`, `ChangeBucketError` and `MaintainError`) instead of being skipped or dropped.
   Store migration 0001 changed in place (nothing is published yet).
+- **Schema compatibility is checked at lease renewal** (`pges-postgres`, `pges-subscribe`, `pges-sequencer`).
+  A subscription or sequencer kept running after a migration raised `min_compatible` above its crate's
+  schema version; only `Store::open` checked it. Lease renewals now fail while the database no longer
+  supports the crate, and the holder stops with the new `SubscribeError::CrateTooOld` or
+  `RunError::CrateTooOld` and releases its lease. Roles that renew leases (reader, sequencer) need `SELECT`
+  on `pges.scopes`. New `migrate::crate_too_old`, `migrate::Scopes` and `migrate::CrateTooOld`;
+  `migrate::latest_version` is public.
 - **Subscriptions read the log at least every `max_idle`** (`pges-subscribe`). A caught-up subscription
   whose waker stayed quiet without failing, such as a `NotifyWaker` on a half-open connection, kept renewing
   its lease and delivered nothing, so no standby took over. Every subscription, and each shard, now reads the

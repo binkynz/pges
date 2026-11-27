@@ -681,7 +681,10 @@ pub async fn check_writer_roles(conn: &mut PgConnection, writer_roles: &WriterRo
 a `u64`.
 
 `migrate::SHARED` and `migrate::STORE` list the embedded `Migration`s (version, name, SQL, `min_compatible`,
-SHA-256 checksum); versions and `min_compatible` are `migrate::SchemaVersion`. `register_category` is idempotent, creates the category and its partitions in one
+SHA-256 checksum); versions and `min_compatible` are `migrate::SchemaVersion`. `migrate::latest_version(migrations)`
+is the newest version a list knows, and `migrate::crate_too_old(conn, Scopes::OneStore(&name) | Scopes::AllStores)`
+returns the first scope whose `min_compatible` is above it (`migrate::CrateTooOld { scope, min_compatible,
+crate_version }`), the check `Store::open` makes at start. `register_category` is idempotent, creates the category and its partitions in one
 transaction, and never changes an existing category's bucket. When a rollback fails too, it returns the
 error of the failed attempt, not the rollback's. `change_bucket` does, from the upper bound of
 the newest leaf, so leaves never overlap. `maintain` must run on a schedule: besides leaves, it creates the
@@ -1060,7 +1063,7 @@ The first `.categories(..)` takes a `NonEmpty<CategoryName>`, later ones any ite
 
 | Error | Variants |
 |---|---|
-| `subscription::SubscribeError` | `PoolTooSmall { max_connections, needed }`, `UnknownCategory(CategoryName)`, `DefinitionChanged { stored, requested }`, `ShardsChanged { stored, requested }`, `CursorBeforeHorizon { category, cursor, horizon }`, `HandlerFailed { first, last, source }`, `UnknownEventType { position, category, type_id }`, `Frame { position, source }`, `Corrupt { position, reason }`, `Wake(WakeError)`, `Database(DbError)`, `Aborted` |
+| `subscription::SubscribeError` | `PoolTooSmall { max_connections, needed }`, `UnknownCategory(CategoryName)`, `DefinitionChanged { stored, requested }`, `ShardsChanged { stored, requested }`, `CursorBeforeHorizon { category, cursor, horizon }`, `HandlerFailed { first, last, source }`, `UnknownEventType { position, category, type_id }`, `Frame { position, source }`, `Corrupt { position, reason }`, `CrateTooOld { scope, min_compatible, crate_version }`, `Wake(WakeError)`, `Database(DbError)`, `Aborted` |
 | `waker::WakeError` | `Closed`, `Database(DbError)`, `Other(BoxError)` |
 | `waker::grpc::TlsError` (`pges_core::tls::TlsError`) | `NoCertificate`, `UnreadableCertificate { reason }`, `InvalidCertificate { reason }`, `NoPrivateKey`, `UnreadablePrivateKey { reason }`, `MultiplePrivateKeys { count }`, `KeyMismatch`, `NoCaCertificate`, `UnreadableCaCertificate { reason }`, `InvalidCaCertificate { reason }`, `Rejected { reason }` (Core types) |
 | `backfill::BackfillError` | `PoolTooSmall { max_connections, needed }`, `UnknownCategory(CategoryName)`, `UnknownSubscription(SubscriptionName)`, `DefinitionChanged { stored, requested: Definition }`, `UntilAhead { until, head }`, `Overtaken`, `HandlerFailed { first, last, source }`, `UnknownEventType { position, category, type_id }`, `Frame { position, source }`, `Corrupt { position, reason }`, `Database(DbError)` |
@@ -1216,6 +1219,9 @@ pub enum RunError {
     UnknownStore(StoreId),                   // a source named a store pges.stores does not list
     InvalidStoreName(String),                // pges.stores lists a schema name that is not a store name
     PositionOverflow(StoreId),               // positions would pass i64::MAX
+    CrateTooOld { scope: String, min_compatible: SchemaVersion, crate_version: SchemaVersion },
+                                             // a migration dropped support for this release; found
+                                             // at the next lease renewal (Versioning)
 }
 ```
 
@@ -1884,7 +1890,7 @@ They are ordinary subscribers, so they get leases, checkpoints and backfills for
 | What | Where | Rule |
 |---|---|---|
 | Crates | Cargo | semver; before 1.0 a minor bump is breaking |
-| Database schema, per scope | `pges.migrations`, `pges.scopes` | migrations are embedded and checksummed. `Store::open` fails if the database is behind (run `pges migrate` or enable auto-migrate), and fails if the crate's version is below `min_compatible`. Migrations are expand/contract: a new schema version stays usable by the previous crate release, so `min_compatible` only moves in a later release. Migration 0001 is frozen from 0.1.0 on: schema changes are new migrations, never edits (schema.md, Migrations) |
+| Database schema, per scope | `pges.migrations`, `pges.scopes` | migrations are embedded and checksummed. `Store::open` fails if the database is behind (run `pges migrate` or enable auto-migrate), and fails if the crate's version is below `min_compatible`. Running subscriptions and sequencers check again at every lease renewal (Rolling upgrades). Migrations are expand/contract: a new schema version stays usable by the previous crate release, so `min_compatible` only moves in a later release. Migration 0001 is frozen from 0.1.0 on: schema changes are new migrations, never edits (schema.md, Migrations) |
 | Payload frame | `commits.format`, `snapshots.format` | readers support every format ever written. Writers switch to a new format only via `StoreConfig::write_format`, after all readers are upgraded |
 | Event schemas | per event, inside the frame | additive, defaulted fields need no bump. Anything else, including a codec change, bumps `version` and adds an upcaster. Type names never change |
 | New event types and versions | writers | a writer may emit a new type or a new version only after every reader understands it, or after readers use `OnUnknown::Skip`; the same rule as the frame format |
@@ -1892,6 +1898,28 @@ They are ordinary subscribers, so they get leases, checkpoints and backfills for
 | Projections | subscription name | the version is part of the name (`jobs-board.v3`); a new version is a blue/green rebuild or a field backfill. Changing the categories or the number of shards under the same name needs `.redefine(..)` |
 | Watch protocol | gRPC package | `pges.watch.v1`; fields and enum values are added under new numbers, never reused; breaking changes get `v2`, served side by side |
 | NOTIFY payload | first field of the `Notice` text | `1` today; a new shape is a new version; decoders reject unknown versions, and the subscriber just reads the log again |
+
+### Rolling upgrades
+
+A release N migrates the schema so that release N-1 still works on it (expand). A later release contracts:
+it raises `min_compatible`, and the releases below it no longer work. (2026-11-27)
+
+- Upgrade one release at a time, and finish rolling out N before a release that contracts runs its
+  migrations. A process of N-1 or older that is still running then is refused, as follows.
+- `Store::open` fails with `OpenError::CrateTooOld`, so a process of a release the database no longer
+  supports does not start.
+- A running subscription or sequencer finds out at its next lease renewal (a subscription renews every
+  half lease, 7.5 s by default; the sequencer every `Lease::renew`, 5 s). The renewal statement refuses to
+  renew while the shared scope's or a store's `min_compatible` is above the crate's version: a subscription
+  checks the shared scope and its own store, the sequencer every store, since it writes to all of them.
+  After a refused renewal the process reads `pges.scopes`, releases its lease and stops with
+  `SubscribeError::CrateTooOld` or `RunError::CrateTooOld`, instead of standing by. A `run_pg` batch whose
+  checkpoint carried the refused renewal is rolled back. A standby of the newer release takes over at
+  once.
+- Between the migration and that renewal, an old process keeps working for up to half a lease. Appends,
+  reads and backfills run no lease and are not checked after `Store::open`.
+- The check costs nothing extra while the crate is supported: it is a subquery on `pges.scopes` in the
+  renewal statement. Roles that renew need `SELECT` on `pges.scopes` (schema.md, Roles).
 
 ### Frame format 1
 

@@ -1,13 +1,13 @@
 error[E0308]: mismatched types
-  --> tests/ui/statement_binds_and_reads_are_typed.rs:10:70
+  --> tests/ui/statement_binds_and_reads_are_typed.rs:11:14
    |
-10 |     let _wrong_bind = sql.bind(statement::lease_renew::Params { ttl: 30_000_000_i64, fence });
-   |                                                                      ^^^^^^^^^^^^^^ expected `PgInterval`, found `i64`
+11 |         ttl: 30_000_000_i64,
+   |              ^^^^^^^^^^^^^^ expected `PgInterval`, found `i64`
 
 error[E0308]: mismatched types
-  --> tests/ui/statement_binds_and_reads_are_typed.rs:16:40
+  --> tests/ui/statement_binds_and_reads_are_typed.rs:21:40
    |
-16 |     let _wrong_read: Option<Vec<u8>> = row.and_then(|row| row.source);
+21 |     let _wrong_read: Option<Vec<u8>> = row.and_then(|row| row.source);
    |                      ---------------   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Option<Vec<u8>>`, found `Option<String>`
    |                      |
    |                      expected due to this

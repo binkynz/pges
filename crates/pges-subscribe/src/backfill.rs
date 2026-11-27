@@ -702,6 +702,7 @@ impl BackfillError {
             | E::DefinitionChanged { .. }
             | E::ShardsChanged { .. }
             | E::HandlerFailed { .. }
+            | E::CrateTooOld { .. }
             | E::Wake(_)
             | E::Aborted => Self::Corrupt {
                 position: position::Position::BEGINNING,
