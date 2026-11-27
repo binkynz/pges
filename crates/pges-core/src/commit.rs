@@ -3,7 +3,7 @@
 use std::{fmt, num::NonZeroU16};
 
 use time::OffsetDateTime;
-use uuid::Uuid;
+use uuid::{Uuid, Variant};
 
 /// Identifies one append: the events it wrote share it.
 ///
@@ -18,9 +18,10 @@ impl CommitId {
         Self(Uuid::now_v7())
     }
 
-    /// Wraps an id read from storage. Returns `None` if it is not a UUIDv7.
+    /// Wraps an id read from storage. Returns `None` if it is not a UUIDv7 (version 7 of the RFC 9562
+    /// variant), the only ids the store accepts.
     pub fn from_uuid(id: Uuid) -> Option<Self> {
-        (id.get_version_num() == 7).then_some(Self(id))
+        (id.get_version_num() == 7 && id.get_variant() == Variant::RFC4122).then_some(Self(id))
     }
 
     /// The underlying id.
@@ -134,6 +135,11 @@ mod tests {
     fn accepts_only_v7() {
         assert!(CommitId::from_uuid(Uuid::now_v7()).is_some());
         assert!(CommitId::from_uuid(Uuid::nil()).is_none());
+        // Version 7 in another variant, whose version PostgreSQL's uuid_extract_version does not read.
+        let other_variant =
+            Uuid::from_u128((Uuid::now_v7().as_u128() & !(0b11 << 62)) | (0b11 << 62));
+        assert_eq!(other_variant.get_version_num(), 7);
+        assert!(CommitId::from_uuid(other_variant).is_none());
     }
 
     #[test]
