@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use pges_core::{aggregate, category, commit, event, frame, metadata, stream, version};
 
-use crate::{ambient, catalog, error, ident, load, sql::statement, store, unit_of_work};
+use crate::{admin, ambient, catalog, error, ident, load, sql::statement, store, unit_of_work};
 
 impl store::Store {
     /// Appends `events` to one stream, checking `expected` first.
@@ -1070,7 +1070,8 @@ async fn append_locked(
 /// classification read, used when the row is not locked.
 ///
 /// With [`LockWait::Skip`] a row another transaction holds is not waited for: the result is
-/// [`Lock::Busy`], and the commit id is moved above `seen`.
+/// [`Lock::Busy`], and the commit id is moved above `seen`. The transaction may then be aborted (the lock
+/// timed out), so the caller must roll it back.
 async fn lock_for_retry(
     store: &store::Store,
     conn: &mut PgConnection,
@@ -1083,13 +1084,23 @@ async fn lock_for_retry(
         LockWait::Wait => &store.inner.sql.lock_stream,
         LockWait::Skip => &store.inner.sql.try_lock_stream,
     };
-    let locked = sql
+    let locked = match sql
         .bind(statement::lock_stream::Params {
             stream_id: prepared.stream_id.as_uuid(),
         })
         .fetch_optional(&mut *conn)
-        .await?
-        .map(|row| row.last_commit_id);
+        .await
+    {
+        Ok(row) => row.map(|row| row.last_commit_id),
+        // append/try_lock_stream.sql bounds the one wait SKIP LOCKED does not prevent with lock_timeout.
+        Err(error)
+            if wait == LockWait::Skip
+                && error::sqlstate(&error).as_deref() == Some(admin::LOCK_NOT_AVAILABLE) =>
+        {
+            None
+        }
+        Err(error) => return Err(error.into()),
+    };
 
     if retry == Retry::NewCommitId
         && let Some(last) = locked.or(seen)
@@ -1609,7 +1620,7 @@ async fn run_append_many(
 
 #[cfg(test)]
 mod tests {
-    use sqlx::Connection;
+    use sqlx::{Connection, Executor};
 
     use super::*;
 
@@ -1854,6 +1865,138 @@ mod tests {
         }
 
         conn.close().await?;
+        db.cleanup().await
+    }
+
+    /// The lock a pooled batch takes for a retry never waits for another transaction, even when the row's
+    /// updater commits while the statement locks it: PostgreSQL then locks the newer row version and waits
+    /// for its holder whatever SKIP LOCKED says (`heap_lock_updated_tuple`). Here batches hold `second` and
+    /// lock `first` for a retry, while other transactions lock both in stream id order and updates keep
+    /// moving `first` on; a wait closes a cycle, which the deadlock detector reports. The race is narrow, so
+    /// a run without the timeout in `append/try_lock_stream.sql` fails only some of the time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn the_retry_lock_of_a_batch_never_waits() -> anyhow::Result<()> {
+        const TASKS: usize = 24;
+        const RUN: Duration = Duration::from_secs(4);
+
+        let db = pges_testing::TestDb::new().await?;
+        let name = pges_core::store_name!("retry_lock");
+        let mut conn = db.connect().await?;
+        pges_testing::create_store(
+            &mut conn,
+            &name,
+            &pges_testing::definition(Default::default()),
+        )
+        .await?;
+        let mut ids = [Uuid::now_v7(), Uuid::now_v7()];
+        ids.sort();
+        let [first, second] = ids;
+        for id in ids {
+            sqlx::query(
+                "INSERT INTO retry_lock.streams
+                   (version, stream_id, first_commit_id, last_commit_id, category_id)
+                 VALUES (1, $1, $1, $1, 1)",
+            )
+            .bind(id)
+            .execute(&mut conn)
+            .await?;
+        }
+        let pool = db.pool().await?;
+        let store = store::Store::open(pool.clone(), store::StoreConfig::new(name)).await?;
+        let mut entry = prepared(version::ExpectedVersion::Any, CommitIdOrigin::Generated);
+        entry.stream_id = stream::StreamId::from_uuid(first);
+
+        // The rest of the transaction keeps its lock_timeout.
+        let mut tx = conn.begin().await?;
+        tx.execute("SET LOCAL lock_timeout = '7s'").await?;
+        let lock = lock_for_retry(
+            &store,
+            &mut tx,
+            &mut entry,
+            Retry::Rerun,
+            None,
+            LockWait::Skip,
+        )
+        .await?;
+        let timeout: String = sqlx::query_scalar("SHOW lock_timeout")
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.rollback().await?;
+        conn.close().await?;
+        assert_eq!(lock, Lock::Held);
+        assert_eq!(timeout, "7s");
+
+        let deadline = tokio::time::Instant::now() + RUN;
+        let mut tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
+        for _ in 0..TASKS {
+            let mut conn = db.connect().await?;
+            let store = store.clone();
+            let mut entry = prepared(version::ExpectedVersion::Any, CommitIdOrigin::Generated);
+            entry.stream_id = stream::StreamId::from_uuid(first);
+            tasks.push(tokio::spawn(async move {
+                // xorshift64, seeded from the random bits of a UUIDv7.
+                let mut seed = (Uuid::now_v7().as_u128() as u64) | 1;
+                while tokio::time::Instant::now() < deadline {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    match seed % 10 {
+                        0..4 => {
+                            sqlx::query(
+                                "UPDATE retry_lock.streams SET version = version + 1
+                                 WHERE stream_id = $1",
+                            )
+                            .bind(first)
+                            .execute(&mut conn)
+                            .await?;
+                        }
+                        // As a batch's `locked` step.
+                        4..7 => {
+                            let mut tx = conn.begin().await?;
+                            sqlx::query(
+                                "SELECT 1 FROM retry_lock.streams WHERE stream_id IN ($1, $2)
+                                 ORDER BY stream_id FOR UPDATE",
+                            )
+                            .bind(first)
+                            .bind(second)
+                            .execute(&mut *tx)
+                            .await?;
+                            tx.commit().await?;
+                        }
+                        // As a pooled batch that retries `first`.
+                        _ => {
+                            let mut tx = conn.begin().await?;
+                            sqlx::query(
+                                "SELECT 1 FROM retry_lock.streams WHERE stream_id = $1 FOR UPDATE",
+                            )
+                            .bind(second)
+                            .execute(&mut *tx)
+                            .await?;
+                            let lock = lock_for_retry(
+                                &store,
+                                &mut tx,
+                                &mut entry,
+                                Retry::Rerun,
+                                None,
+                                LockWait::Skip,
+                            )
+                            .await?;
+                            match lock {
+                                Lock::Held => tx.commit().await?,
+                                Lock::Busy => tx.rollback().await?,
+                            }
+                        }
+                    }
+                }
+
+                Ok(())
+            }));
+        }
+        for task in tasks {
+            task.await??;
+        }
+
+        pool.close().await;
         db.cleanup().await
     }
 

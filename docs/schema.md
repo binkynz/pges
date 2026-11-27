@@ -288,7 +288,11 @@ category would be reported as a deduplicated retry of this append.
 Before a rerun with a new crate-generated commit id, the crate locks the stream's row until the transaction
 ends (`crates/pges-postgres/sql/append/lock_stream.sql`). `append_many`, in its own transaction, uses
 `crates/pges-postgres/sql/append/try_lock_stream.sql` instead, which does not wait for a lock another
-transaction holds.
+transaction holds. `SKIP LOCKED` alone still waits in one case: when the updater of the row version the
+statement found commits while it locks the row, PostgreSQL 18 goes on to lock the newer versions and waits for
+a transaction holding one, whatever the wait policy (`heap_lock_updated_tuple`). So the statement lowers
+`lock_timeout` to 1 ms around its lock (set, lock, and restore are ordered by one-time filters) and the crate
+takes a timeout (SQLSTATE 55P03) as a busy row; the batch then rolls back as for any busy row.
 
 | Result | Outcome |
 |---|---|
@@ -394,7 +398,8 @@ row.
   for a lock-only row lock, because `ON CONFLICT` ignores a lock-only xmax. A batch runs `created` before
   `bumped` (`head` is `created UNION ALL bumped`), and nothing after `bumped` waits: the `commits` insert
   conflicts only with the stream's own creator or locker. So a transaction that has already bumped a stream
-  never waits on another batch. Retry locks use `SKIP LOCKED`. `crates/pges-postgres/tests/append_many.rs`
+  never waits on another batch. Retry locks use `SKIP LOCKED` under a 1 ms `lock_timeout`, since `SKIP
+  LOCKED` alone can wait for the holder of a newer row version (above). `crates/pges-postgres/tests/append_many.rs`
   races such batches. Inside a unit of work the retry waits for the lock, so the retryable deadlock above
   remains there.
 - `locked` takes the row locks of the existing streams in stream id order (LockRows above Sort) before

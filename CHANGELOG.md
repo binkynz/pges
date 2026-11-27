@@ -38,6 +38,12 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crates
 
 ### Fixed
 
+- **`append_many` could deadlock against another batch** (`pges-postgres`). A batch in its own transaction
+  that retried a stream created after its statement started locked it with `SKIP LOCKED`, which still waits
+  when the row's updater commits during the lock: PostgreSQL then locks the newer row version and waits for
+  its holder. Holding its other streams' locks, the batch could wait for a batch that was waiting for it, and
+  one of them failed with a deadlock error. The retry lock now runs with `lock_timeout` at 1 ms and treats a
+  timeout as a busy row, so the batch starts over.
 - **A slot ahead of the token halts sequencing** (`pges-sequencer`). After promoting an asynchronous
   standby with a synchronised failover slot, the slot could be confirmed past the standby's stored token:
   the sequencer's batch with the log rows and the token comes later in WAL than the commits it confirms.
