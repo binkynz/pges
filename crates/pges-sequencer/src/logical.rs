@@ -1281,6 +1281,11 @@ async fn ensure_publication(
 
 /// The first store that holds a commit in `snapshot`, the snapshot exported at a new slot's consistent
 /// point: the slot never delivers the commits visible in it.
+///
+/// Fails with a transient error when the snapshot holds a store without the outbox that `routes` lacks: it
+/// was created after the routes were read, so neither its commits nor its place in the publication were
+/// checked (created while the publication was missing, it is not in it). The caller drops the slot, and the
+/// next attempt reads the stores again and publishes it.
 async fn commits_before_slot(
     pool: &PgPool,
     snapshot: &name::SnapshotName,
@@ -1289,6 +1294,20 @@ async fn commits_before_slot(
     let mut conn = pool.acquire().await?;
     let mut tx = conn.begin().await?;
     import_snapshot(&mut tx, snapshot).await?;
+
+    let stores = statement::logical_stores::Query::fixed()
+        .bind(statement::logical_stores::Params {})
+        .fetch_all(&mut *tx)
+        .await?;
+    if let Some(store) = stores
+        .iter()
+        .find(|store| !store.outbox && !routes.contains_key(&store.schema_name))
+    {
+        return Err(transient_message(&format!(
+            "store {} was created while the slot was created; creating the slot again",
+            store.schema_name
+        )));
+    }
 
     for (schema, route) in routes {
         if *route == Route::Skipped {

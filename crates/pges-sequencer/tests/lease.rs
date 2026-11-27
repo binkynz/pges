@@ -245,70 +245,83 @@ async fn lease_held(pool: &PgPool) -> Result<bool> {
     )
 }
 
-/// A migration that drops support for this crate while the sequencer leads (here a store's `min_compatible`
-/// raised past the crate's schema version) stops it at its next lease renewal with `CrateTooOld`, and its
-/// lease is released for a newer sequencer.
+/// A migration that drops support for this crate while the sequencer leads (here the `min_compatible` of a
+/// store, or of its outbox scope, raised past the crate's schema version) stops it at its next lease renewal
+/// with `CrateTooOld`, and its lease is released for a newer sequencer.
 #[tokio::test]
 async fn a_migration_past_the_crate_stops_the_leader_at_renewal() -> Result<()> {
-    let f = Fixture::new().await?;
-    let running = f.start(common::fast()).await?;
-    running.wait_leading().await?;
-    f.append(Target::Job(stream::StreamId::new_v7()), 1).await?;
-    common::wait_sequenced(&f.pool, 1).await?;
+    for raised in ["es", "es.outbox"] {
+        let f = Fixture::new().await?;
+        let running = f.start(common::fast()).await?;
+        running.wait_leading().await?;
+        f.append(Target::Job(stream::StreamId::new_v7()), 1).await?;
+        common::wait_sequenced(&f.pool, 1).await?;
 
-    let raised: String = sqlx::query_scalar(
-        "UPDATE pges.scopes SET schema_version = 9, min_compatible = 9 WHERE scope <> 'pges' \
-         RETURNING scope",
-    )
-    .fetch_one(&f.pool)
-    .await?;
-    let result = running.result().await;
-
-    assert!(
-        matches!(
-            &result,
-            Err(sequencer::RunError::CrateTooOld { scope, min_compatible, crate_version })
-                if *scope == raised && min_compatible.get() == 9 && crate_version.get() == 1
-        ),
-        "{result:?}"
-    );
-    let released: bool = sqlx::query_scalar("SELECT lease_until IS NULL FROM pges.sequencer")
-        .fetch_one(&f.pool)
+        let updated = sqlx::query(
+            "UPDATE pges.scopes SET schema_version = 9, min_compatible = 9 WHERE scope = $1",
+        )
+        .bind(raised)
+        .execute(&f.pool)
         .await?;
-    assert!(released);
-    f.finish().await
+        assert_eq!(updated.rows_affected(), 1, "{raised}");
+        let result = running.result().await;
+
+        assert!(
+            matches!(
+                &result,
+                Err(sequencer::RunError::CrateTooOld { scope, min_compatible, crate_version })
+                    if scope == raised && min_compatible.get() == 9 && crate_version.get() == 1
+            ),
+            "{raised}: {result:?}"
+        );
+        let released: bool = sqlx::query_scalar("SELECT lease_until IS NULL FROM pges.sequencer")
+            .fetch_one(&f.pool)
+            .await?;
+        assert!(released, "{raised}");
+        f.finish().await?;
+    }
+    Ok(())
 }
 
-/// A sequencer of a release a migration no longer supports (here the shared scope's `min_compatible` raised
-/// past the crate's schema version) does not take a free lease: it stops with `CrateTooOld`, and the lease
-/// row is left as it was.
+/// A sequencer of a release a migration no longer supports (here the `min_compatible` of the shared scope,
+/// a store or its outbox scope raised past the crate's schema version) does not take a free lease: it stops
+/// with `CrateTooOld`, and the lease row is left as it was.
 #[tokio::test]
 async fn a_sequencer_past_its_crate_does_not_take_a_free_lease() -> Result<()> {
-    let f = Fixture::new().await?;
-    sqlx::query(
-        "UPDATE pges.scopes SET schema_version = 9, min_compatible = 9 WHERE scope = 'pges'",
-    )
-    .execute(&f.pool)
-    .await?;
-    let lease_row = || {
-        sqlx::query_as::<_, (i64, Option<String>, bool)>(
-            "SELECT fence, leader, lease_until IS NULL FROM pges.sequencer",
+    for raised in ["pges", "es", "es.outbox"] {
+        let f = Fixture::new().await?;
+        let updated = sqlx::query(
+            "UPDATE pges.scopes SET schema_version = 9, min_compatible = 9 WHERE scope = $1",
         )
-        .fetch_one(&f.pool)
-    };
-    let before = lease_row().await?;
-    assert!(before.2, "the lease is free");
+        .bind(raised)
+        .execute(&f.pool)
+        .await?;
+        assert_eq!(updated.rows_affected(), 1, "{raised}");
+        let lease_row = || {
+            sqlx::query_as::<_, (i64, Option<String>, bool)>(
+                "SELECT fence, leader, lease_until IS NULL FROM pges.sequencer",
+            )
+            .fetch_one(&f.pool)
+        };
+        let before = lease_row().await?;
+        assert!(before.2, "the lease is free");
 
-    let result = f.start(common::fast()).await?.result().await;
+        let result = f.start(common::fast()).await?.result().await;
 
-    assert!(
-        matches!(
-            &result,
-            Err(sequencer::RunError::CrateTooOld { scope, min_compatible, crate_version })
-                if scope == "pges" && min_compatible.get() == 9 && crate_version.get() == 1
-        ),
-        "{result:?}"
-    );
-    assert_eq!(lease_row().await?, before, "the lease was not touched");
-    f.finish().await
+        assert!(
+            matches!(
+                &result,
+                Err(sequencer::RunError::CrateTooOld { scope, min_compatible, crate_version })
+                    if scope == raised && min_compatible.get() == 9 && crate_version.get() == 1
+            ),
+            "{raised}: {result:?}"
+        );
+        assert_eq!(
+            lease_row().await?,
+            before,
+            "{raised}: the lease was not touched"
+        );
+        f.finish().await?;
+    }
+    Ok(())
 }
