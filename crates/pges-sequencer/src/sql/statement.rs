@@ -491,6 +491,7 @@ pges_postgres::typed_query! {
             invalidation_reason: Option<String>,
             failover: Option<bool>,
             active: Option<bool>,
+            confirmed_flush: Option<i64>,
         },
     }
 }
@@ -517,6 +518,19 @@ pges_postgres::typed_query! {
             source: Option<String>,
             source_token: Option<Vec<u8>>,
         },
+    }
+}
+
+pges_postgres::typed_query! {
+    /// Stores a new slot's consistent point as the token while none is stored.
+    pub STORE_INITIAL_TOKEN, mod store_initial_token {
+        name: "logical/store_initial_token",
+        files: [sql_file!("logical/store_initial_token.sql")],
+        params<'q> {
+            source: &'q str,
+            token: &'q [u8],
+        },
+        row {},
     }
 }
 
@@ -704,6 +718,7 @@ pub const ALL: &[&template::Statement] = &[
     &SLOT,
     &STORE_HAS_COMMITS,
     &LOGICAL_STORED_TOKEN,
+    &STORE_INITIAL_TOKEN,
     &TERMINATE_HOLDER,
     &RESEQUENCE_SHORTEST_MAX_TXN_AGE,
     &RESEQUENCE_WINDOW,
@@ -750,6 +765,7 @@ pub const TYPED: &[typed::Shape] = &[
     typed::Shape::of::<slot::Query>(),
     typed::Shape::of::<store_has_commits::Query>(),
     typed::Shape::of::<logical_stored_token::Query>(),
+    typed::Shape::of::<store_initial_token::Query>(),
     typed::Shape::of::<terminate_holder::Query>(),
     typed::Shape::of::<resequence_shortest_max_txn_age::Query>(),
     typed::Shape::of::<resequence_window::Query>(),

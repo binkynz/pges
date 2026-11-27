@@ -696,7 +696,8 @@ On every `open` the logical source runs, through the sequencer's pool: the datab
 (`crates/pges-sequencer/sql/logical/slot.sql`). Only after this source created the slot, on a pool connection,
 in the snapshot the slot exported: `BEGIN`, `crates/pges-sequencer/sql/transaction/repeatable_read.sql`,
 `crates/pges-sequencer/sql/transaction/snapshot.sql`,
-`crates/pges-sequencer/sql/logical/store_has_commits.sql` per non-outbox store, `ROLLBACK`.
+`crates/pges-sequencer/sql/logical/store_has_commits.sql` per non-outbox store, `ROLLBACK`, and then the
+consistent point stored as the token (`crates/pges-sequencer/sql/logical/store_initial_token.sql`).
 
 - The publication is repaired, not refused: a missing one is created with the migration's definition, and
   missing non-outbox stores' `commits` are added with the migration's column list, each with a warning. That
@@ -716,24 +717,41 @@ in the snapshot the slot exported: `BEGIN`, `crates/pges-sequencer/sql/transacti
   `DROP_REPLICATION_SLOT pges_<oid>` on the same connection, after the check. It then fails:
   `Halt(SlotLost::CommitsBeforeSlot)`, which the sequencer records in `halted`, or the check's error. If the
   drop also fails, it fails `Fatal` with a message naming the slot, which an operator must drop.
+- The new slot's consistent point is stored as the token right after the check, without the lease, and only
+  while no token is stored (none, or the outbox's empty one): `UPDATE pges.sequencer SET source = 'logical',
+  source_token = <consistent point>`. A failure drops the slot like a failed check. From then on the slot
+  always has a token to be compared with.
+- An existing slot's `confirmed_flush_lsn` (read by `slot.sql` as a byte offset) is compared with the stored
+  token before `START_REPLICATION`. The source confirms only stored tokens, so on a healthy server the slot
+  is at or behind the token. Past it means the log rows and token of the commits in between were lost, as on
+  an asynchronous standby promoted with a synchronised failover slot (design.md, Deployment), and the server
+  would silently start streaming at the slot's position: `Halt(SlotLost::Ahead { slot, token, confirmed })`.
+  Without a token the slot counts as ahead when it is past `0/0` and any non-outbox store holds a commit
+  (`store_has_commits.sql` per store, outside a snapshot); with no commit there is nothing to lose.
 - Outcomes: a slot with an `invalidation_reason` is `SourceError::Halt(SlotLost::Invalidated)`; no slot but
-  a token is `Halt(SlotLost::Missing)`; a new slot whose exported snapshot already shows a commit in a store
+  a token is `Halt(SlotLost::Missing)`; a slot confirmed past the token is `Halt(SlotLost::Ahead)`; a new slot whose exported snapshot already shows a commit in a store
   is dropped again and gives `Halt(SlotLost::CommitsBeforeSlot)`, because it would never deliver those
   commits. Each is recovered with `pges-sequencer resequence` (Resequence, below).
 - The check runs in the snapshot at the slot's consistent point, so it sees exactly the commits the slot
   will not stream: no append is skipped silently. An append that commits while the slot is created can
   still make the first start fail. Create the slot before writers start, with `LogicalSource::bootstrap` /
   `pges-sequencer bootstrap` (Slot bootstrap, below).
-- A residual window remains. A crash, or a shutdown or lost lease that drops `open`, between
-  `CREATE_REPLICATION_SLOT` and the end of the check leaves a slot that was never checked; a later open
-  streams from it, and commits from that creation window are skipped. It matters only if writers already
-  run during the first start.
+- A crash, or a shutdown or lost lease that drops `open`, between `CREATE_REPLICATION_SLOT` and the stored
+  consistent point leaves a slot that was never checked and no token. A later open then halts with
+  `SlotLost::Ahead` (token `0/0`) if the stores hold any commit, and `resequence` recovers; with no commit it
+  streams from the slot. Until 2026-11-27 it streamed in either case, and commits from that creation window
+  were skipped.
 - Token: `source = 'logical'`; `source_token` is the end LSN of the last transaction of the batch, 8 bytes
   big-endian; empty means none. `open` drops every transaction that ends at or below it.
-- `ack` confirms only persisted tokens. While idle, it confirms a keepalive's `wal_end`, or the end LSN of a
-  transaction with nothing to sequence, once nothing is buffered, no transaction is open and the newest
-  token handed out was acknowledged. On PostgreSQL 15+ pgoutput skips transactions with no published
-  changes, so unrelated WAL shows up only as keepalives.
+- `ack` confirms only persisted tokens, and nothing else confirms the slot. While idle (nothing buffered, no
+  transaction open), a keepalive's `wal_end`, or the end LSN of a transaction with nothing to sequence,
+  becomes the idle position. Once `status_interval` has passed since the last one, `ready` returns and
+  `next` hands it out as the token of an empty batch; the sequencer stores it with the next coarse token and
+  acks it, and only then is the slot confirmed past the idle WAL. Every buffered transaction ends after the
+  idle position, so a batch with both carries the transaction's end. On PostgreSQL 15+ pgoutput skips
+  transactions with no published changes, so unrelated WAL shows up only as keepalives. The empty batches
+  write WAL of their own (the fence lock, and the token about once a `token_interval`), which later
+  keepalives report: hence the `status_interval` spacing.
 - A status update goes out at least every `status_interval` (10 s): in `ready`, `next` and `ack`, and in
   `keep_alive` while a batch's database work runs.
 - `close` (when a term ends) sends CopyDone and Terminate, with a 1 s timeout after which it just drops the
@@ -746,8 +764,9 @@ the database, the stores, the publication repair and `pg_replication_slots`. It 
 
 - A database whose stores all use the outbox is `SourceError::Invalid`, so no slot holds WAL for nothing. A
   database with no stores yet gets a slot.
-- An existing valid slot is kept (`Bootstrap::Exists`). An invalidated one is `Halt(SlotLost::Invalidated)`
-  and a foreign one `Invalid`.
+- An existing valid slot is kept (`Bootstrap::Exists`). An invalidated one is `Halt(SlotLost::Invalidated)`,
+  one confirmed past the stored token (`crates/pges-sequencer/sql/logical/stored_token.sql`) is
+  `Halt(SlotLost::Ahead)`, neither recorded in `halted`, and a foreign one `Invalid`.
 - An existing valid slot keeps its `failover` unless `LogicalConfig.failover` is `SlotFailover::Set` to
   another value. Then bootstrap connects for
   replication and checks `IDENTIFY_SYSTEM`, then reads the slot again. When it is `active`, bootstrap fails
@@ -758,7 +777,8 @@ the database, the stores, the publication repair and `pg_replication_slots`. It 
   A non-empty token with `source = 'logical'` is `Halt(SlotLost::Missing)`. Bootstrap does not record it
   in `halted`: a sequencer already ran and records it itself, as it does `Invalidated`.
 - Otherwise it connects for replication, checks `IDENTIFY_SYSTEM`, creates the slot with the
-  exported-snapshot check above (`Bootstrap::Created`, or `Exists` on 42710), and closes the connection.
+  exported-snapshot check and the stored consistent point above (`Bootstrap::Created`, or `Exists` on
+  42710), and closes the connection.
   Commits found by the check give `Halt(SlotLost::CommitsBeforeSlot)`, which bootstrap records in `halted`
   through `crates/pges-sequencer/sql/lease/halt_unleased.sql` (Sequencer lease, above), so resequence can
   run at once.
@@ -767,7 +787,8 @@ It is safe to run again, and while a sequencer streams from an existing slot, un
 must change. Do not run it while a
 sequencer creates the slot on its first start: the sequencer's START ends the walsender holding the slot
 (the bootstrap's, during its check). The bootstrap then fails with a message that the slot could not be
-checked, and the sequencer streams from a slot that was never checked.
+checked, and no token is stored: the sequencer halts with `SlotLost::Ahead` if the stores hold commits, and
+streams from the unchecked slot otherwise.
 
 ### Resequence
 

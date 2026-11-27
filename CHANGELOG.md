@@ -31,6 +31,16 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crates
 
 ### Fixed
 
+- **A slot ahead of the token halts sequencing** (`pges-sequencer`). After promoting an asynchronous
+  standby with a synchronised failover slot, the slot could be confirmed past the standby's stored token:
+  the sequencer's batch with the log rows and the token comes later in WAL than the commits it confirms.
+  The server then silently started after those commits, and they were never sequenced. The logical source
+  now reads `confirmed_flush_lsn` whenever it opens and halts with `SlotLost::Ahead` when it is past the
+  token; `pges-sequencer resequence` recovers the commits. The source no longer confirms idle WAL from
+  keepalives directly: it hands the position out as an empty batch's token, which the sequencer stores
+  before it is confirmed, so the slot is never ahead of the token on a healthy server. A slot the source
+  creates has its consistent point stored as the token at once. design.md now recommends a synchronous
+  failover target.
 - **The logical source ends only walsenders** (`pges-sequencer`). Before `START_REPLICATION` it ended
   whichever process held the slot, including a session running `pg_drop_replication_slot` or another slot
   function. A drop ended mid-call could remove the slot while its client saw an error. Now only a walsender

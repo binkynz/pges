@@ -35,9 +35,13 @@ mod resequence;
 ///   `wal_sender_timeout`.
 /// - The token is the end LSN of the last transaction of a batch (eight bytes, big-endian). Opening from a
 ///   token drops every transaction that ends at or below it. [`Source::ack`](source::Source::ack) confirms
-///   the token to the slot, so the server can release the WAL before it.
-/// - While idle, with nothing buffered and the latest token acknowledged, it confirms the WAL position of
-///   the server's keepalives, so the slot does not hold back WAL that carried nothing for the publication.
+///   the token to the slot, so the server can release the WAL before it. Nothing else confirms the slot:
+///   it is never confirmed past a token stored in `pges.sequencer`.
+/// - While idle, with nothing buffered, it hands out the WAL position of the server's keepalives as the
+///   token of an empty batch, at most once per [`LogicalConfig::status_interval`]. Once the sequencer
+///   stores that token it is confirmed like any other, so the slot does not hold back WAL that carried
+///   nothing for the publication.
+/// - A slot it creates gets its consistent point stored as the token at once, if no token is stored.
 /// - [`Source::close`](source::Source::close) ends streaming when the sequencer stops leading, so the slot is
 ///   free for the next leader at once.
 /// - Stores created with the outbox option are left to [`OutboxSource`](crate::outbox::OutboxSource): their
@@ -45,9 +49,14 @@ mod resequence;
 ///
 /// # Slot loss
 ///
-/// An invalidated slot, or a missing slot while a token is stored, means commits may have been skipped. The
-/// source then fails with [`source::SourceError::Halt`] carrying a [`SlotLost`]; the sequencer records it
-/// in `pges.sequencer.halted` and stops. It never recreates the slot by itself.
+/// An invalidated slot, or a missing slot while a token is stored, means commits may have been skipped. So
+/// does a slot confirmed past the stored token ([`SlotLost::Ahead`]): the server would silently start
+/// after the slot's confirmed position. That happens when a physical standby is promoted that has the slot
+/// (a failover slot) but not the sequencer's last transactions: their log rows and token are lost, and the
+/// commits they sequenced would never be delivered again. The source then fails with
+/// [`source::SourceError::Halt`] carrying a [`SlotLost`]; the sequencer records it in
+/// `pges.sequencer.halted` and stops. It never recreates the slot by itself. The checks run every time the
+/// source opens, before `START_REPLICATION`.
 ///
 /// A slot created without a stored token only sees commits from its creation on. When the source creates
 /// the slot, it checks the stores in the snapshot exported at the slot's consistent point: if they hold any
@@ -82,6 +91,10 @@ pub struct LogicalSource {
     resume: lsn::Lsn,
     delivered: lsn::Lsn,
     acked: lsn::Lsn,
+    /// The newest WAL position up to which the stream carried nothing to sequence, seen while nothing was
+    /// buffered: the token of the next empty batch.
+    idle: lsn::Lsn,
+    idle_reported: Instant,
     status_sent: Instant,
 }
 
@@ -105,6 +118,8 @@ impl LogicalSource {
             resume: lsn::Lsn::ZERO,
             delivered: lsn::Lsn::ZERO,
             acked: lsn::Lsn::ZERO,
+            idle: lsn::Lsn::ZERO,
+            idle_reported: Instant::now(),
             status_sent: Instant::now(),
         }
     }
@@ -125,15 +140,17 @@ impl LogicalSource {
     ///   (PostgreSQL 17+): [`Bootstrap::FailoverChanged`]. That fails with
     ///   [`source::SourceError::Transient`] while a process (a sequencer) streams from the slot.
     /// - A missing slot is created ([`Bootstrap::Created`]) if no token is stored, after the same check of
-    ///   the stores in the snapshot exported at the slot's consistent point. If they already hold commits,
-    ///   the slot is dropped again and this fails with [`source::SourceError::Halt`] carrying
-    ///   [`SlotLost::CommitsBeforeSlot`]. Bootstrap records that halt in `pges.sequencer.halted`, as a
-    ///   sequencer would, unless a sequencer holds the lease, so [`LogicalSource::resequence`] can recover
-    ///   at once.
+    ///   the stores in the snapshot exported at the slot's consistent point, and the consistent point is
+    ///   stored as the token. If the stores already hold commits, the slot is dropped again and this fails
+    ///   with [`source::SourceError::Halt`] carrying [`SlotLost::CommitsBeforeSlot`]. Bootstrap records that
+    ///   halt in `pges.sequencer.halted`, as a sequencer would, unless a sequencer holds the lease, so
+    ///   [`LogicalSource::resequence`] can recover at once.
     /// - A missing slot with a stored token fails with [`source::SourceError::Halt`] carrying
-    ///   [`SlotLost::Missing`], and an invalidated slot with [`SlotLost::Invalidated`]. Bootstrap does not
-    ///   record these halts in `pges.sequencer.halted`: a sequencer already ran, and meets them itself. A slot of another database or plugin, a database whose stores use the
-    ///   outbox, or a replication connection to another database is [`source::SourceError::Invalid`].
+    ///   [`SlotLost::Missing`], an invalidated slot with [`SlotLost::Invalidated`], and a slot confirmed
+    ///   past the stored token with [`SlotLost::Ahead`]. Bootstrap does not record these halts in
+    ///   `pges.sequencer.halted`: a sequencer already ran, and meets them itself. A slot of another database
+    ///   or plugin, a database whose stores use the outbox, or a replication connection to another database
+    ///   is [`source::SourceError::Invalid`].
     ///
     /// Safe to run again. Run it before sequencers and writers start: run during a sequencer's first start, the
     /// sequencer can end the bootstrap's walsender before its check finishes. It needs the same grants as the source.
@@ -151,6 +168,12 @@ impl LogicalSource {
         }
         if let Some(state) = prepared.existing {
             state.check(&prepared.slot, &prepared.database.name)?;
+            let token = stored_token(&self.pool)
+                .await?
+                .map(|token| decode_token(&token))
+                .transpose()?
+                .flatten();
+            self.check_confirmed(&state, &prepared.slot, token).await?;
             let failover = match self.config.failover {
                 SlotFailover::Set(failover) if failover != state.failover => failover,
                 _ => return Ok(Bootstrap::Exists),
@@ -235,11 +258,14 @@ impl source::Source for LogicalSource {
         self.resume = token.unwrap_or(lsn::Lsn::ZERO);
         self.delivered = self.resume;
         self.acked = self.resume;
+        self.idle = self.resume;
+        self.idle_reported = Instant::now();
 
         let prepared = self.prepare().await?;
         let create = match &prepared.existing {
             Some(state) => {
                 state.check(&prepared.slot, &prepared.database.name)?;
+                self.check_confirmed(state, &prepared.slot, token).await?;
                 false
             }
             None if token.is_some() => {
@@ -268,13 +294,16 @@ impl source::Source for LogicalSource {
             if !waiting && self.buffered >= self.config.read_ahead.get() {
                 return self.heartbeat().await;
             }
+            if waiting && self.idle_due() {
+                return Ok(());
+            }
 
             let message = match self.held.take() {
                 Some(message) => message,
                 None => {
                     // While transactions are buffered, read only what has already arrived.
                     let wait = if waiting {
-                        self.config.status_interval.get()
+                        self.idle_wait()
                     } else {
                         Duration::ZERO
                     };
@@ -308,6 +337,11 @@ impl source::Source for LogicalSource {
     ) -> Result<source::SourceBatch, source::SourceError> {
         self.heartbeat().await?;
 
+        // Recorded only while nothing was buffered, so every buffered transaction ends after it.
+        if self.idle > self.delivered {
+            self.delivered = self.idle;
+            self.idle_reported = Instant::now();
+        }
         let mut commits = Vec::new();
         while let Some(front) = self.buffer.front() {
             if !commits.is_empty() && commits.len() + front.commits.len() > limit.get() {
@@ -318,7 +352,7 @@ impl source::Source for LogicalSource {
             };
             self.buffered -= transaction.commits.len();
             commits.extend(transaction.commits);
-            self.delivered = transaction.end;
+            self.delivered = self.delivered.max(transaction.end);
         }
 
         Ok(source::SourceBatch::new(
@@ -395,10 +429,15 @@ pub struct LogicalConfig {
     /// with `sync_replication_slots` on the standby). [`Source::open`](source::Source::open) and
     /// [`LogicalSource::bootstrap`] apply it to a slot they create; only `bootstrap` changes an existing
     /// slot, and only for [`SlotFailover::Set`]. Default [`SlotFailover::Keep`].
+    ///
+    /// Promote a synchronous standby (in `synchronous_standby_names` and `synchronized_standby_slots`). An
+    /// asynchronous one can have the slot's position without the sequencer's last transactions; the
+    /// source then halts with [`SlotLost::Ahead`] until [`LogicalSource::resequence`] runs.
     pub failover: SlotFailover,
     /// The longest time between status updates to the server. Keep it well below the server's
     /// `wal_sender_timeout` (60 s by default), which ends a replication connection that stays silent for
-    /// longer. Default 10 s.
+    /// longer. While idle, it is also the shortest time between two empty batches that move the token, and
+    /// so the slot, past WAL with nothing to sequence. Default 10 s.
     pub status_interval: interval::Interval,
     /// How many commits [`Source::ready`](source::Source::ready) buffers ahead while messages keep arriving.
     /// A transaction is always buffered whole. Default 1000.
@@ -553,6 +592,22 @@ pub enum SlotLost {
         /// The slot.
         slot: String,
     },
+    /// The slot was confirmed past the stored token, so the server would start streaming after commits that
+    /// were never sequenced, or whose log rows were lost. This happens after promoting an asynchronous
+    /// standby that had the slot (synchronised as a failover slot) but not the sequencer's last
+    /// transactions. A missing token counts as `0/0`, when the stores hold commits.
+    #[error(
+        "replication slot {slot} is confirmed up to {confirmed}, past the stored token {token}; commits in \
+         between may never have been sequenced"
+    )]
+    Ahead {
+        /// The slot.
+        slot: String,
+        /// The stored token.
+        token: lsn::Lsn,
+        /// The slot's `confirmed_flush_lsn`.
+        confirmed: lsn::Lsn,
+    },
     /// No slot and no token exist yet, but the store already holds commits: a new slot would never deliver
     /// them. The new slot was dropped again.
     #[error("store {store} holds commits from before replication slot {slot} existed")]
@@ -612,6 +667,7 @@ struct SlotState {
     invalidation_reason: Option<String>,
     failover: connection::Failover,
     activity: SlotActivity,
+    confirmed_flush: Option<lsn::Lsn>,
 }
 
 /// Whether a process streams from a slot (`pg_replication_slots.active`).
@@ -629,6 +685,17 @@ impl SlotState {
                 slot: slot.to_string(),
                 reason: reason.clone(),
             })
+    }
+
+    /// [`SlotLost::Ahead`] if the slot was confirmed past `token`, the stored token.
+    fn ahead_of(&self, slot: &name::SlotName, token: lsn::Lsn) -> Option<SlotLost> {
+        let confirmed = self.confirmed_flush?;
+
+        (confirmed > token).then(|| SlotLost::Ahead {
+            slot: slot.to_string(),
+            token,
+            confirmed,
+        })
     }
 
     fn check(&self, slot: &name::SlotName, database: &str) -> Result<(), source::SourceError> {
@@ -724,7 +791,8 @@ impl LogicalSource {
     }
 
     /// Creates the slot and checks, in the snapshot exported at its consistent point, that no store holds a
-    /// commit yet: those committed before the slot and would never be delivered. If one does, or the check
+    /// commit yet: those committed before the slot and would never be delivered. Then stores the consistent
+    /// point as the token, unless one is stored. If a store holds a commit, or the check or the store
     /// fails, the slot is dropped again. [`Bootstrap::Exists`]: another process created it meanwhile.
     async fn create_slot(
         &self,
@@ -752,6 +820,12 @@ impl LogicalSource {
             Some(snapshot) => commits_before_slot(&self.pool, snapshot, &self.routes).await,
             None => Err(transient_message("the new slot exported no snapshot")),
         };
+        let checked = match checked {
+            Ok(None) => store_initial_token(&self.pool, created.consistent_point)
+                .await
+                .map(|()| None),
+            other => other,
+        };
         let error = match checked {
             Ok(None) => return Ok(Bootstrap::Created),
             Ok(Some(store)) => halt(SlotLost::CommitsBeforeSlot {
@@ -776,6 +850,57 @@ impl LogicalSource {
         }
 
         Err(error)
+    }
+
+    /// Halts with [`SlotLost::Ahead`] if the slot was confirmed past the stored token. The source confirms
+    /// only stored tokens, so on a healthy server the slot is at or behind the token (behind after a
+    /// crash, when the slot's position was not saved yet).
+    ///
+    /// A slot the source creates has its consistent point stored as the token at once. A slot without a
+    /// token therefore comes from a source that failed before storing it, or the token's transaction was
+    /// lost together with the commits after it; only the stores tell. Without commits there is nothing to
+    /// lose.
+    async fn check_confirmed(
+        &self,
+        state: &SlotState,
+        slot: &name::SlotName,
+        token: Option<lsn::Lsn>,
+    ) -> Result<(), source::SourceError> {
+        let Some(lost) = state.ahead_of(slot, token.unwrap_or(lsn::Lsn::ZERO)) else {
+            return Ok(());
+        };
+        if token.is_none() && !stores_hold_commits(&self.pool, &self.routes).await? {
+            return Ok(());
+        }
+
+        Err(halt(lost))
+    }
+
+    /// Whether the idle position goes out as an empty batch: it moved past the last token, and the last
+    /// one went out at least [`LogicalConfig::status_interval`] ago. Each empty batch writes WAL of its own,
+    /// which the next keepalive reports, so they are spaced out.
+    fn idle_due(&self) -> bool {
+        self.idle > self.delivered
+            && self.idle_reported.elapsed() >= self.config.status_interval.get()
+    }
+
+    /// How long to wait for a message while nothing is buffered: until the next status update, or until
+    /// the idle position is due.
+    fn idle_wait(&self) -> Duration {
+        let interval = self.config.status_interval.get();
+        if self.idle <= self.delivered {
+            return interval;
+        }
+
+        interval.saturating_sub(self.idle_reported.elapsed())
+    }
+
+    /// Records `lsn` as the idle position if everything received before it is handed out: nothing
+    /// buffered and no transaction open.
+    fn note_idle(&mut self, lsn: lsn::Lsn) {
+        if self.buffer.is_empty() && self.open.is_none() && lsn > self.delivered.max(self.idle) {
+            self.idle = lsn;
+        }
     }
 
     /// Forgets everything read from the previous stream; the server sends it again from the token.
@@ -895,7 +1020,7 @@ impl LogicalSource {
         let data = match message {
             stream::ReplicationMessage::XLogData(data) => data,
             stream::ReplicationMessage::Keepalive(keepalive) => {
-                self.confirm_idle(keepalive.wal_end).await?;
+                self.note_idle(keepalive.wal_end);
                 return Ok(Handled::Done);
             }
             _ => return Ok(Handled::Done),
@@ -936,7 +1061,7 @@ impl LogicalSource {
                     return Ok(Handled::Done);
                 }
                 if commits.is_empty() {
-                    self.confirm_idle(commit.end_lsn).await?;
+                    self.note_idle(commit.end_lsn);
                     return Ok(Handled::Done);
                 }
 
@@ -950,20 +1075,6 @@ impl LogicalSource {
         }
 
         Ok(Handled::Done)
-    }
-
-    /// Confirms `lsn` if everything received before it is durable: nothing buffered, no transaction open,
-    /// and every token handed out acknowledged.
-    async fn confirm_idle(&mut self, lsn: lsn::Lsn) -> Result<(), source::SourceError> {
-        let idle = self.buffer.is_empty() && self.open.is_none() && self.acked >= self.delivered;
-        let stream = self.stream()?;
-        if !idle || lsn <= stream.confirmed() {
-            return Ok(());
-        }
-
-        stream.confirm(lsn).await.map_err(transient)?;
-        self.status_sent = Instant::now();
-        Ok(())
     }
 
     /// Sends a status update if none went out for [`LogicalConfig::status_interval`], so the server does not
@@ -1099,6 +1210,10 @@ async fn slot_state(
             } else {
                 SlotActivity::Inactive
             },
+            confirmed_flush: row
+                .confirmed_flush
+                .and_then(|confirmed| u64::try_from(confirmed).ok())
+                .map(lsn::Lsn::new),
         })
     })
     .transpose()
@@ -1186,6 +1301,45 @@ async fn commits_before_slot(
     tx.rollback().await?;
 
     Ok(None)
+}
+
+/// Whether any store this source sequences holds a commit.
+async fn stores_hold_commits(
+    pool: &PgPool,
+    routes: &HashMap<String, Route>,
+) -> Result<bool, source::SourceError> {
+    for (schema, route) in routes {
+        if *route == Route::Skipped {
+            continue;
+        }
+
+        let values = template::Values::new().store(&store_name(schema)?);
+        let found = statement::store_has_commits::Query::render(&values)
+            .bind(statement::store_has_commits::Params {})
+            .fetch_optional(pool)
+            .await?;
+        if found.is_some() {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Stores a new slot's consistent point as the token, unless a token is stored.
+async fn store_initial_token(
+    pool: &PgPool,
+    consistent_point: lsn::Lsn,
+) -> Result<(), source::SourceError> {
+    statement::store_initial_token::Query::fixed()
+        .bind(statement::store_initial_token::Params {
+            source: KIND.as_str(),
+            token: &encode_token(consistent_point),
+        })
+        .execute(pool)
+        .await?;
+
+    Ok(())
 }
 
 /// The logical token stored in `pges.sequencer`, if any.
@@ -1292,6 +1446,7 @@ mod tests {
             failover: connection::Failover::Disabled,
             activity: SlotActivity::Inactive,
             invalidation_reason: reason.map(str::to_owned),
+            confirmed_flush: None,
         };
 
         assert!(state("app", "pgoutput", None).check(&slot, "app").is_ok());
@@ -1315,6 +1470,32 @@ mod tests {
             state("app", "test_decoding", None).check(&slot, "app"),
             Err(source::SourceError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn a_slot_confirmed_past_the_token_is_ahead() {
+        let slot = slot_name(7).unwrap();
+        let state = |confirmed: Option<u64>| SlotState {
+            database: Some("app".to_owned()),
+            plugin: Some("pgoutput".to_owned()),
+            failover: connection::Failover::Enabled,
+            activity: SlotActivity::Inactive,
+            invalidation_reason: None,
+            confirmed_flush: confirmed.map(lsn::Lsn::new),
+        };
+        let token = lsn::Lsn::new(0x200);
+
+        assert_eq!(state(Some(0x200)).ahead_of(&slot, token), None);
+        assert_eq!(state(Some(0x100)).ahead_of(&slot, token), None);
+        assert_eq!(state(None).ahead_of(&slot, token), None);
+        assert_eq!(
+            state(Some(0x201)).ahead_of(&slot, token),
+            Some(SlotLost::Ahead {
+                slot: "pges_7".to_owned(),
+                token,
+                confirmed: lsn::Lsn::new(0x201),
+            })
+        );
     }
 
     #[test]

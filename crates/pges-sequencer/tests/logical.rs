@@ -174,6 +174,21 @@ async fn the_slot_is_confirmed_up_to_the_token_and_past_idle_wal() -> Result<()>
     wait_confirmed(&f.pool, &slot, written as u64).await?;
     assert_eq!(common::check_log(&f.pool).await?.len(), 1);
 
+    // The slot is confirmed only up to a stored token, also while idle, so a restart finds it at or behind
+    // the token and resumes instead of halting with `SlotLost::Ahead`.
+    running.stop().await?;
+    let token = stored_token(&f.pool).await?.context("no token")?;
+    let token = u64::from_be_bytes(token.try_into().unwrap());
+    let confirmed = confirmed_flush(&f.pool, &slot).await?;
+    assert!(
+        confirmed <= token,
+        "the slot is confirmed to {confirmed:X}, past the stored token {token:X}"
+    );
+    let running = f.start(common::fast()).await?;
+    running.wait_leading().await?;
+    f.append(Target::Job(stream::StreamId::new_v7()), 1).await?;
+    common::wait_sequenced(&f.pool, 2).await?;
+
     running.stop().await?;
     f.finish().await
 }

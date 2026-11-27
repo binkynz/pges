@@ -27,16 +27,25 @@ Detail: [schema.md](schema.md) (tables, column order, queries, partitions, roles
 |---|---|---|
 | PG18 primary | yes | with the default logical source: `wal_level = logical`, REPLICATION role for the sequencer; the outbox source needs neither |
 | Sequencer | yes | one active instance plus standbys; leader elected by a lease row |
-| HA standby | no | if present, use failover slots (`failover = true`) so the slot survives promotion |
+| HA standby | no | if present, use failover slots (`failover = true`) so the slot survives promotion, and make the failover target a synchronous standby (Guardrails) |
 | Read replicas | no | offload subscriber catch-up reads |
 
 Guardrails:
 
 - Deploy order with the logical source: migrations, then `pges-sequencer bootstrap` (creates the
   publication and the slot), then writers. A sequencer that creates the slot itself while writers already
-  run may halt (`CommitsBeforeSlot`) until `pges-sequencer resequence` runs or, if interrupted mid-creation,
-  leave an unchecked slot (schema.md, Logical source). A bootstrap run after writers started halts the same
+  run may halt (`CommitsBeforeSlot`, or `Ahead` if interrupted mid-creation) until `pges-sequencer resequence`
+  runs (schema.md, Logical source). A bootstrap run after writers started halts the same
   way and records the halt, so `pges-sequencer resequence` can run next, before any sequencer starts.
+- Failover slots need a synchronous failover target. The sequencer confirms a source commit to the slot only
+  after its token is stored, but that transaction comes later in WAL than the commits it covers. Slot
+  synchronisation copies the slot's position to a standby that has the commits, even when it does not yet
+  have the token's transaction. An asynchronous standby promoted in that window has a slot ahead of its
+  token: the server would skip the commits in between. The sequencer halts there instead
+  (`SlotLost::Ahead`), and `pges-sequencer resequence` recovers them (Sequencer, Slot loss). To avoid the
+  halt, put the standby you would promote in `synchronous_standby_names` and in `synchronized_standby_slots`:
+  the token's transaction (`synchronous_commit = on`) then waits for the standby's flush before the slot is
+  confirmed. With a quorum (`ANY k`), only the standbys that confirmed are covered, so promote one of them.
 - `max_slot_wal_keep_size` and `idle_replication_slot_timeout` (PG18), so an abandoned or stuck slot cannot
   fill the disk. Either one invalidates the slot when it fires, and commits whose WAL was not yet confirmed
   are then never sequenced until an operator runs `pges-sequencer resequence` (Sequencer, Slot loss). Set
@@ -161,8 +170,9 @@ pin the slot's `restart_lsn` and so retained WAL; `max_txn_age` caps them.
 ### Slot loss
 
 1. The sequencer treats `pg_replication_slots.invalidation_reason IS NOT NULL`, a missing slot while
-   `source_token` is set, a `START_REPLICATION` error naming an invalidated slot, or a store with commits
-   before the first slot (`CommitsBeforeSlot`) as fatal. It sets
+   `source_token` is set, a slot whose `confirmed_flush_lsn` is past the stored token (`Ahead`), a
+   `START_REPLICATION` error naming an invalidated slot, or a store with commits before the first slot
+   (`CommitsBeforeSlot`) as fatal. It sets
    `pges.sequencer.halted`, stops sequencing, puts the watch into an error state and alerts. It never
    recreates the slot by itself. Retention refuses to run while `halted` is set. Built:
    `SourceError::Halt(logical::SlotLost)`; the sequencer writes `pges.sequencer.halted` under its fence,
@@ -185,6 +195,15 @@ pin the slot's `restart_lsn` and so retained WAL; `max_txn_age` caps them.
    (schema.md, Resequence).
 3. The recovered range is ordered by `commit_id`, not true commit order; causal order inside it is
    best-effort.
+4. A slot ahead of the token (`SlotLost::Ahead`) comes from promoting a standby that had a synchronised
+   failover slot but not the sequencer's last transactions. Their log rows and token are lost with the old
+   primary; the commits they sequenced are on the new primary, and START_REPLICATION from the old token
+   would silently start at the slot's position, past them. The procedure is the same as for any halt: stop
+   every sequencer (they have stopped by themselves), run `pges-sequencer resequence` against the new
+   primary, then start them. The orphan search finds those commits: they are newer than the last commit the
+   new primary has a log row for. Subscribers whose cursor passed positions the old primary handed out see
+   those positions again with other commits; treat a promotion like any restore and rebuild or rewind
+   projections fed from positions above the promoted log's newest row.
 
 ## Subscribers
 
@@ -326,7 +345,8 @@ feature flags are in [api.md](api.md).
    publication. Restart and failover correctness is done (Crash correctness, below): kills before
    the log commit, between the commit and the ack, and between the ack and the next batch, on both sources,
    with a restart or a standby taking over, plus SIGKILL of the binary. No commit twice, gap-free, every
-   commit once, commit order kept per category and per store. Promoting a physical standby is not covered.
+   commit once, commit order kept per category and per store. Promoting a physical standby with a
+   failover slot is covered by `tests/promotion.rs` (Decided, Slot ahead of the token).
    Throughput and lag are measured on durable storage. Open: the payload-size, projection and
    `pg_logical_emit_message` variants.
 3. Join read rate `log ⋈ commits` across partitions (runtime pruning) and catch-up with PG18 async I/O;
@@ -866,7 +886,8 @@ source, and a fourth drains the rest. No bug was found.
   logical property test; acking the source before the log commit fails 3 logical tests with missing commits;
   draining the outbox outside the batch transaction fails the outbox before-commit cases (in 0.9 s, through
   the rolled-back check).
-- Not covered: overlapping appends in the order check, and promoting a physical standby (failover slots).
+- Not covered: overlapping appends in the order check. Promoting a physical standby (failover slots) is
+  covered by `tests/promotion.rs`.
 
 ### Slot loss under load (spike 7, 2026-11-25)
 
@@ -1061,7 +1082,8 @@ the halt, 43 recovered, 335 after.
     `CREATE_REPLICATION_SLOT` and the end of the snapshot check leaves a persisted slot that was never
     checked; later opens stream from it. Bootstrapping the slot before writers start avoids this. Running
     bootstrap while a sequencer creates the slot can also leave an unchecked slot (schema.md, Slot
-    bootstrap).
+    bootstrap). Since 2026-11-27 such a slot has no token, and a later open halts if the stores hold
+    commits (Slot ahead of the token, below).
   - `Source::close` is a trait hook with a no-op default. It cannot fail and is awaited before the lease is
     released. It is called whenever a term ends (lease lost, shutdown, fatal error), not on a recoverable
     error inside a term: the next `open` already resets the source and ends the previous walsender.
@@ -1826,6 +1848,28 @@ the halt, 43 recovered, 335 after.
     streams at 64 partitions). The batch unprepared: 20–25% slower at concurrency 1 (earlier).
   - The single append keeps the plan cache's choice: a routed append names its partition, and the fallback
     through `streams` runs in autocommit, with no `BEGIN` to carry the setting.
+
+- Slot ahead of the token (2026-11-27; schema.md, Logical source):
+  - The logical source confirms the slot only through `Source::ack`, so the slot is never confirmed past a
+    token stored in `pges.sequencer`. Idle WAL is no longer confirmed directly from a keepalive: the source
+    hands its position out as the token of an empty batch, at most once per `status_interval`, and the
+    sequencer stores and acks it like any other. Each such batch writes a little WAL (the fence row lock and,
+    about once a `token_interval`, the token), which the next keepalive reports, so they are spaced out.
+  - Every `open` (each term and each reconnect) reads `confirmed_flush_lsn` and halts with
+    `SlotLost::Ahead { slot, token, confirmed }` when it is past the stored token, before
+    `START_REPLICATION`. A slot at or behind the token is normal: a restart after a crash finds the slot
+    behind, because its position is saved lazily.
+  - A slot the source creates (in `open` or `bootstrap`) has its consistent point stored as the token at
+    once, if none is stored, so the check has something to compare with from the start. A slot with no
+    token at all halts only when the stores hold commits; with none, nothing can be lost.
+  - Recovery is the existing `resequence`, not an automatic one: it needs the writer roles' transaction cap
+    and a stopped fleet, which only the operator can vouch for. Rejected: storing the timeline with the token
+    and halting on any timeline change (it halts on every switchover, including a clean one where nothing
+    was lost), and confirming the batch transaction's own end LSN (it would skip source commits that end
+    between the last delivered one and the batch).
+  - Tested with a real promotion: a replica pair (`replica::Pair::start_failover`) whose replica
+    synchronises the failover slot, has its WAL stream cut before the batch that sequences the last commit,
+    and is promoted; and with the state built directly by `pg_replication_slot_advance`.
 
 ## Open decisions
 

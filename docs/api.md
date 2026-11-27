@@ -1445,7 +1445,7 @@ Contract for any source, built in or custom:
 
 | Source | Feature | How | Needs | Trade-offs |
 |---|---|---|---|---|
-| Logical replication (`logical::LogicalSource`, built) | `source-logical` (default) | pgoutput from slot `pges_<database oid>` via `pges-replication`, `streaming = off`; Inserts are routed by root relation id to the store named by `Relation.namespace`, and `commits` columns are looked up by name; token = 8 bytes, big-endian end LSN of the last transaction in the batch (empty: none); `open` drops transactions ending at or below it; `ack` confirms only persisted tokens; idle keepalives (and transactions with nothing to sequence) confirm `Keepalive.wal_end` once nothing is buffered, no transaction is open and the newest token was acknowledged; status updates at least every `status_interval`, also during batches (`keep_alive`); outbox stores' inserts are skipped | `wal_level = logical`, REPLICATION role; `pges-replication/tls` for TLS, which `source-logical` turns on | true commit order; slot WAL retention must be watched, and slot loss halts until `pges-sequencer resequence` (design.md); a new slot is checked in the snapshot exported at its consistent point; if a store already has commits it is dropped and sequencing halts (`SlotLost::CommitsBeforeSlot`): run `pges-sequencer bootstrap` before writers start |
+| Logical replication (`logical::LogicalSource`, built) | `source-logical` (default) | pgoutput from slot `pges_<database oid>` via `pges-replication`, `streaming = off`; Inserts are routed by root relation id to the store named by `Relation.namespace`, and `commits` columns are looked up by name; token = 8 bytes, big-endian end LSN of the last transaction in the batch (empty: none); `open` drops transactions ending at or below it, and halts with `SlotLost::Ahead` if the slot is confirmed past it; `ack` confirms only persisted tokens, and nothing else confirms the slot; idle keepalives (and transactions with nothing to sequence) give an empty batch whose token is `Keepalive.wal_end`, at most once per `status_interval`, once nothing is buffered and no transaction is open; status updates at least every `status_interval`, also during batches (`keep_alive`); outbox stores' inserts are skipped | `wal_level = logical`, REPLICATION role; `pges-replication/tls` for TLS, which `source-logical` turns on | true commit order; slot WAL retention must be watched, and slot loss halts until `pges-sequencer resequence` (design.md); a new slot is checked in the snapshot exported at its consistent point; if a store already has commits it is dropped and sequencing halts (`SlotLost::CommitsBeforeSlot`): run `pges-sequencer bootstrap` before writers start |
 | Outbox queue (`outbox::OutboxSource`, built) | none (always built) | appends insert into `pending`; the source drains it with `DELETE … RETURNING` inside the batch transaction and sorts the returned rows by `seq` (schema.md); woken by `NOTIFY pges__outbox` from a trigger on `pending`; drains until short; fallback probe on the listening connection every `recheck_interval` (1 s) without a notification; `close` stops listening, so a standby holds no connection; empty token (presence is the state) | nothing beyond Postgres | transactional outbox; an extra insert and delete per commit, vacuum churn on `pending`; NOTIFY serialises committing appends (server-wide lock), so the logical source is the scale option; one extra listening connection, not from the pool |
 | Kafka (planned) | `source-kafka` | consume a single-partition topic carrying commit refs (e.g. produced by an existing CDC pipeline capturing `commits`); token = offset | Kafka | reuses existing CDC infrastructure; adds a broker hop and its latency |
 
@@ -1485,6 +1485,8 @@ pub struct LogicalConfig {                   // Default
 pub enum SlotLost {                          // boxed in SourceError::Halt
     Invalidated { slot: String, reason: String },   // pg_replication_slots.invalidation_reason
     Missing { slot: String },                       // no slot, but a token is stored
+    Ahead { slot: String, token: Lsn, confirmed: Lsn },  // confirmed_flush_lsn past the stored token
+                                                         // (0/0 when none is stored and stores hold commits)
     CommitsBeforeSlot { slot: String, store: String },   // the new slot's exported snapshot shows
                                                          // commits; the slot was dropped again
 }
@@ -1523,6 +1525,13 @@ pub enum ResequenceError {
 - Slot loss is a typed `SlotLost` boxed in `SourceError::Halt`; callers downcast it. `CommitsBeforeSlot` is a
   `Halt` too, which the sequencer records in `pges.sequencer.halted`; recover with `pges-sequencer
   resequence`.
+- The slot is confirmed only through `ack`, so never past a stored token. While idle, the keepalives' WAL
+  position goes out as the token of an empty batch, at most once per `status_interval`, and is confirmed
+  once stored. A slot the source creates has its consistent point stored as the token at once, if none is
+  stored. Every `open` checks the slot's `confirmed_flush_lsn` against the token and halts with
+  `SlotLost::Ahead` when it is past it, as after promoting an asynchronous standby with a synchronised
+  failover slot (design.md, Deployment and Slot loss). Recover with `pges-sequencer resequence` on the new
+  primary.
 - `resequence` refuses with `WriterRole` unless every writer role caps its transactions at the shortest
   `max_txn_age` of the logical stores, with `NotHalted` unless `halted` is set, and with `LeaseHeld` while a
   sequencer holds the lease. Otherwise it takes the lease, drops the old slot (`SlotInUse` while it is
@@ -1544,11 +1553,11 @@ pub enum ResequenceError {
   (`Exists`), also when `failover` is `Set` to the slot's current value; an existing slot whose failover
   differs from `Set` is altered (`FailoverChanged`), or refused `Transient` while active; with `Keep` its
   failover is never changed; a missing one is created with the same check as `open` (`Created`); a missing
-  slot with a stored token is `Halt(Missing)`, an invalidated one `Halt(Invalidated)`, and commits found
-  before a new slot `Halt(CommitsBeforeSlot)`. Bootstrap records `CommitsBeforeSlot` in
+  slot with a stored token is `Halt(Missing)`, an invalidated one `Halt(Invalidated)`, one confirmed past
+  the token `Halt(Ahead)`, and commits found before a new slot `Halt(CommitsBeforeSlot)`. Bootstrap records `CommitsBeforeSlot` in
   `pges.sequencer.halted` while no process holds the lease (a reason already recorded is kept), so
-  `resequence` can run at once; it does not record `Missing` or `Invalidated`, which only arise after a
-  sequencer ran and recorded them itself. A foreign slot, or a database whose stores use the outbox, is
+  `resequence` can run at once; it does not record `Missing`, `Invalidated` or `Ahead`, which only arise
+  after a sequencer ran and records them itself. A foreign slot, or a database whose stores use the outbox, is
   `Invalid`. Do not run it while a sequencer creates the slot on its first start. The sequencer still
   creates a missing slot itself on `open`.
 - Requirements: `wal_level = logical`; a role with `REPLICATION`, allowed by `pg_hba.conf` to connect to the
