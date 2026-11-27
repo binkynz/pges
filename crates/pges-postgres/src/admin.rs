@@ -102,9 +102,10 @@ impl Admin {
     /// An append whose commit id is past the newest leaf of its category fails with
     /// [`AppendError::NoPartition`](crate::append::AppendError::NoPartition); alert when
     /// [`CategoryHeadroom::below_one_bucket`] holds for a category. When the log fills its newest partition,
-    /// the sequencer stops assigning positions (it retries until a partition is added); alert when
-    /// [`LogHeadroom::remaining`] falls below half of a partition, [`LOG_PARTITION_POSITIONS`] / 2, which
-    /// `maintain` keeps it above.
+    /// the sequencer stops assigning positions (it retries until a partition is added). `maintain` adds the
+    /// next partition once half of the newest is used, so [`LogHeadroom::remaining`] dips just below
+    /// [`LOG_PARTITION_POSITIONS`] / 2 until its next run; alert when it falls below
+    /// [`LOG_PARTITION_POSITIONS`] / 4.
     ///
     /// It reads the catalog only and does not take the maintenance lock, so it answers while maintenance,
     /// retention or a freeze runs.
