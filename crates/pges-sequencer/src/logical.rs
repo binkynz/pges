@@ -168,12 +168,8 @@ impl LogicalSource {
         }
         if let Some(state) = prepared.existing {
             state.check(&prepared.slot, &prepared.database.name)?;
-            let token = stored_token(&self.pool)
-                .await?
-                .map(|token| decode_token(&token))
-                .transpose()?
-                .flatten();
-            self.check_confirmed(&state, &prepared.slot, token).await?;
+            // Without a token of its own, the check reads the stored one.
+            self.check_confirmed(&state, &prepared.slot, None).await?;
             let failover = match self.config.failover {
                 SlotFailover::Set(failover) if failover != state.failover => failover,
                 _ => return Ok(Bootstrap::Exists),
@@ -859,13 +855,23 @@ impl LogicalSource {
     /// A slot the source creates has its consistent point stored as the token at once. A slot without a
     /// token therefore comes from a source that failed before storing it, or the token's transaction was
     /// lost together with the commits after it; only the stores tell. Without commits there is nothing to
-    /// lose.
+    /// lose. Without a token the stored one is read again first: a bootstrap may have created the slot and
+    /// stored its consistent point after the caller read the token. It is read after `state`, and a token is
+    /// stored before the slot is confirmed to it, so a token read later is never behind the slot.
     async fn check_confirmed(
         &self,
         state: &SlotState,
         slot: &name::SlotName,
         token: Option<lsn::Lsn>,
     ) -> Result<(), source::SourceError> {
+        let token = match token {
+            Some(token) => Some(token),
+            None => stored_token(&self.pool)
+                .await?
+                .map(|token| decode_token(&token))
+                .transpose()?
+                .flatten(),
+        };
         let Some(lost) = state.ahead_of(slot, token.unwrap_or(lsn::Lsn::ZERO)) else {
             return Ok(());
         };
