@@ -710,8 +710,9 @@ log partitions the sequencer writes to.
   passed); `CategoryHeadroom::below_one_bucket` holds when that is under one bucket (a day, or 28 days for
   `Month`), which with `maintain` running happens only after it has stopped for about `LEAVES_AHEAD` buckets.
   Appends past `leaves_until` fail with `AppendError::NoPartition`. For the log it gives the end of the
-  newest log partition and the positions left in it; `maintain` adds a partition once half is used, so alert
-  when `remaining` falls below `LOG_PARTITION_POSITIONS / 2`. It reads only the catalog and takes no lock.
+  newest log partition and the positions left in it; `maintain` adds a partition once half is used, so
+  `remaining` dips just below `LOG_PARTITION_POSITIONS / 2` until its next run: alert when it falls below
+  `LOG_PARTITION_POSITIONS / 4`. It reads only the catalog and takes no lock.
   The crate has no logging dependency, so `Store::open` does not warn about low headroom itself.
 - `set_writer_limits` raises the store's `max_clock_skew` and `max_txn_age` under the maintenance lock, so a
   retention run in progress finishes with the old values; retention and `resequence` use the new ones from

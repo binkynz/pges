@@ -354,3 +354,108 @@ async fn drop_leaf(f: &Fixture, partition: &str, leaf: &str) -> Result<()> {
 
     Ok(())
 }
+
+/// `NoPartition` is reported the same in a caller's transaction, on a caller's connection in autocommit,
+/// with the outbox on, and by `delete_stream`.
+#[tokio::test]
+async fn no_partition_is_reported_in_every_transaction_mode() -> Result<()> {
+    let f = Fixture::with_outbox(store::Outbox::Enabled).await?;
+    let created = [JobEvent::created("a")];
+    let existing = stream::StreamId::new_v7();
+    f.store
+        .append(existing, version::ExpectedVersion::NoStream, &created)
+        .await?;
+    drop_leaves(&f, "commits_jobs").await?;
+    let is_no_partition = |error: &append::AppendError| matches!(error, append::AppendError::NoPartition { category, .. } if *category == JOBS);
+
+    let pooled = f
+        .store
+        .append(
+            stream::StreamId::new_v7(),
+            version::ExpectedVersion::NoStream,
+            &created,
+        )
+        .await
+        .unwrap_err();
+    assert!(is_no_partition(&pooled), "{pooled}");
+
+    let mut conn = f.pool.acquire().await?;
+    let autocommit = f
+        .store
+        .append_in(
+            &mut conn,
+            stream::StreamId::new_v7(),
+            version::ExpectedVersion::NoStream,
+            &created,
+        )
+        .await
+        .unwrap_err();
+    assert!(is_no_partition(&autocommit), "{autocommit}");
+
+    let mut tx = conn.begin().await?;
+    let in_tx = f
+        .store
+        .append_in(
+            &mut tx,
+            stream::StreamId::new_v7(),
+            version::ExpectedVersion::NoStream,
+            &created,
+        )
+        .await
+        .unwrap_err();
+    assert!(is_no_partition(&in_tx), "{in_tx}");
+    tx.rollback().await?;
+    drop(conn);
+
+    let deleted = f
+        .store
+        .delete_stream::<JobEvent>(existing, pges_postgres::delete::DeleteExpected::Any)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&deleted, pges_postgres::delete::DeleteStreamError::Write(e) if is_no_partition(e)),
+        "{deleted}"
+    );
+    f.finish().await
+}
+
+/// Day buckets and a bucket change name their leaves with the separator too: a day-bucketed category named
+/// like another's day leaf, registered first, leaves no hole, and the bridging leaf of a bucket change does
+/// not collide either.
+#[tokio::test]
+async fn day_leaves_and_bucket_changes_do_not_collide() -> Result<()> {
+    let f = Fixture::new().await?;
+    let admin = f.store.admin();
+    let today: String = sqlx::query_scalar("SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYYMMDD')")
+        .fetch_one(&f.pool)
+        .await?;
+    let mut daily = admin::CategoryConfig::default();
+    daily.bucket = admin::Bucket::Day;
+    let like_a_leaf = category::CategoryName::leak(format!("parts_{today}"))?;
+    admin.register_category(like_a_leaf, daily).await?;
+    admin.register_category(category!("parts"), daily).await?;
+    admin.maintain().await?;
+    assert_eq!(
+        parent(&f.pool, &format!("commits_parts__{today}")).await?,
+        Some("commits_parts".to_owned())
+    );
+    assert_eq!(
+        parent(&f.pool, &format!("commits_parts_{today}")).await?,
+        Some("commits".to_owned())
+    );
+
+    admin.change_bucket(JOBS, admin::Bucket::Day).await?;
+    admin.maintain().await?;
+    let headroom = admin.partition_headroom().await?;
+    for category in &headroom.categories {
+        assert!(!category.below_one_bucket(), "{category:?}");
+    }
+    f.store
+        .append(
+            stream::StreamId::new_v7(),
+            version::ExpectedVersion::NoStream,
+            &[JobEvent::created("a")],
+        )
+        .await?;
+    f.finish().await
+}
