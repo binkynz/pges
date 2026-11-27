@@ -357,8 +357,9 @@ pub enum RunError {
     #[error("store {0} ran out of positions")]
     PositionOverflow(store::StoreId),
     /// A migration raised the shared or a store's `min_compatible` above this crate's schema version while
-    /// the sequencer ran: the database no longer supports this release. Found on the next lease renewal,
-    /// which the database then refuses; the lease is released. Fatal.
+    /// the sequencer ran: the database no longer supports this release. Found on the next lease renewal or
+    /// attempt to take the lease, which the database then refuses: a leader releases its lease, and a
+    /// standby does not take it. Fatal.
     #[error(
         "scope {scope} requires schema version {min_compatible} or newer; this crate knows {crate_version}"
     )]
@@ -489,9 +490,20 @@ async fn acquire(
     mut conn: PoolConnection<Postgres>,
 ) -> Result<Option<Term>, RunError> {
     let sent = Instant::now();
-    let Some(acquired) = lease::acquire(&mut conn, ctx.ttl, ctx.config.leader.as_deref()).await?
-    else {
-        return Ok(None);
+    let acquired = match lease::acquire(&mut conn, ctx.ttl, ctx.config.leader.as_deref()).await? {
+        lease::Acquire::Taken(acquired) => acquired,
+        lease::Acquire::Held => return Ok(None),
+        lease::Acquire::TooOld => {
+            drop(conn);
+            return match crate_too_old(ctx).await {
+                Some(too_old) => Err(RunError::CrateTooOld {
+                    scope: too_old.scope,
+                    min_compatible: too_old.min_compatible,
+                    crate_version: too_old.crate_version,
+                }),
+                None => Ok(None),
+            };
+        }
     };
     if let Some(reason) = acquired.halted {
         let _ = lease::release(&mut conn, acquired.fence).await;
@@ -567,9 +579,9 @@ async fn lead_term<S: source::Source>(
     }
 }
 
-/// After a refused renewal: the scope that no longer supports this crate, if a migration is why. Renewals
-/// check every scope, as the sequencer writes to every store. `None` also when the check fails: the term
-/// then ends as a lost lease, and the next renewal checks again.
+/// After a refused renewal or acquire: the scope that no longer supports this crate, if a migration is why.
+/// Both check every scope, as the sequencer writes to every store. `None` also when the check fails: a term
+/// then ends as a lost lease and a standby tries again, and the next renewal or acquire checks again.
 async fn crate_too_old(ctx: &Ctx<'_>) -> Option<migrate::CrateTooOld> {
     let mut conn = ctx.pool.acquire().await.ok()?;
 

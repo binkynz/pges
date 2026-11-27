@@ -278,3 +278,37 @@ async fn a_migration_past_the_crate_stops_the_leader_at_renewal() -> Result<()> 
     assert!(released);
     f.finish().await
 }
+
+/// A sequencer of a release a migration no longer supports (here the shared scope's `min_compatible` raised
+/// past the crate's schema version) does not take a free lease: it stops with `CrateTooOld`, and the lease
+/// row is left as it was.
+#[tokio::test]
+async fn a_sequencer_past_its_crate_does_not_take_a_free_lease() -> Result<()> {
+    let f = Fixture::new().await?;
+    sqlx::query(
+        "UPDATE pges.scopes SET schema_version = 9, min_compatible = 9 WHERE scope = 'pges'",
+    )
+    .execute(&f.pool)
+    .await?;
+    let lease_row = || {
+        sqlx::query_as::<_, (i64, Option<String>, bool)>(
+            "SELECT fence, leader, lease_until IS NULL FROM pges.sequencer",
+        )
+        .fetch_one(&f.pool)
+    };
+    let before = lease_row().await?;
+    assert!(before.2, "the lease is free");
+
+    let result = f.start(common::fast()).await?.result().await;
+
+    assert!(
+        matches!(
+            &result,
+            Err(sequencer::RunError::CrateTooOld { scope, min_compatible, crate_version })
+                if scope == "pges" && min_compatible.get() == 9 && crate_version.get() == 1
+        ),
+        "{result:?}"
+    );
+    assert_eq!(lease_row().await?, before, "the lease was not touched");
+    f.finish().await
+}

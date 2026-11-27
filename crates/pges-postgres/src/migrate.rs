@@ -325,9 +325,9 @@ pub struct CrateTooOld {
 /// Finds a scope that no longer supports this crate, the check [`store::Store::open`] makes at start: the
 /// shared scope first, then stores by name. `None` when every scope read supports it.
 ///
-/// Subscriptions and the sequencer run it after a lease renewal was refused. Their renewals carry the same
-/// check, so a process this crate's version cannot serve any more loses its lease within one renewal and
-/// stops instead of standing by.
+/// Subscriptions and the sequencer run it after a lease renewal or acquire was refused. Both carry the same
+/// check, so a process this crate's version cannot serve any more loses its lease within one renewal, a
+/// standby takes none, and either stops instead of standing by.
 pub async fn crate_too_old(
     conn: &mut PgConnection,
     scopes: Scopes<'_>,

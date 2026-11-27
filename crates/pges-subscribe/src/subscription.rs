@@ -733,13 +733,14 @@ impl Subscription {
                     }
                     continue;
                 }
-                Err(error) => {
-                    runner.recovering(SubscribeError::Database(error.into()));
+                Err(error) if error.is_retried() => {
+                    runner.recovering(error);
                     if sleep_or_shutdown(setup.retry_interval, shutdown).await == Wait::Shutdown {
                         return Ok(());
                     }
                     continue;
                 }
+                Err(error) => return Err(error),
             };
 
             match runner
@@ -1038,8 +1039,9 @@ pub enum SubscribeError {
         reason: &'static str,
     },
     /// A migration raised the shared or the store's `min_compatible` above this crate's schema version while
-    /// the subscription ran: the database no longer supports this release. Found on the next lease renewal,
-    /// which the database then refuses; the lease is released.
+    /// the subscription ran: the database no longer supports this release. Found on the next lease renewal or
+    /// attempt to take a lease, which the database then refuses: a holder releases its lease, and a standby
+    /// does not take one.
     #[error(
         "scope {scope} requires schema version {min_compatible} or newer; this crate knows {crate_version}"
     )]
@@ -1615,8 +1617,10 @@ impl Ctx {
         }
     }
 
-    /// Takes the lease of the lowest shard whose lease is free or lapsed.
-    async fn acquire(&self) -> Result<Option<Term>, sqlx::Error> {
+    /// Takes the lease of the lowest shard whose lease is free or lapsed. `None`: every shard is leased.
+    /// Fails with [`SubscribeError::CrateTooOld`], taking nothing, once a migration dropped support for this
+    /// crate.
+    async fn acquire(&self) -> Result<Option<Term>, SubscribeError> {
         let sent = Instant::now();
         let row = self
             .sql
@@ -1626,28 +1630,52 @@ impl Ctx {
                 owner: self.owner,
                 lease: self.interval,
                 shards: self.shards,
+                shared_version: migrate::latest_version(migrate::SHARED).get(),
+                store: self.store.as_str(),
+                store_version: migrate::latest_version(migrate::STORE).get(),
             })
-            .fetch_optional(&self.pool)
+            .fetch_one(&self.pool)
             .await?;
-        let Some(row) = row else {
+        if row.too_old == Some(true) {
+            let mut conn = self.pool.acquire().await?;
+            let too_old = migrate::crate_too_old(&mut conn, migrate::Scopes::OneStore(&self.store))
+                .await
+                .map_err(SubscribeError::Database)?;
+            return match too_old {
+                Some(too_old) => Err(SubscribeError::CrateTooOld {
+                    scope: too_old.scope,
+                    min_compatible: too_old.min_compatible,
+                    crate_version: too_old.crate_version,
+                }),
+                None => Ok(None),
+            };
+        }
+
+        let Some(shard) = row.shard else {
             return Ok(None);
         };
+        let (Some(fence), Some(position), Some(shards), Some(category_ids)) =
+            (row.fence, row.position, row.shards, row.category_ids)
+        else {
+            return Err(SubscribeError::Corrupt {
+                position: position::Position::BEGINNING,
+                reason: "a taken subscription lease came back with a NULL column",
+            });
+        };
 
-        let mut stored: Vec<category::CategoryId> = row
-            .category_ids
+        let mut stored: Vec<category::CategoryId> = category_ids
             .into_iter()
             .map(category::CategoryId::new)
             .collect();
         stored.sort_unstable();
 
         Ok(Some(Term {
-            shard: row.shard,
-            fence: row.fence,
-            cursor: position::Position::from_i64(row.position)
-                .unwrap_or(position::Position::BEGINNING),
+            shard,
+            fence,
+            cursor: position::Position::from_i64(position).unwrap_or(position::Position::BEGINNING),
             deadline: sent + self.lease,
             stored,
-            stored_shards: row.shards,
+            stored_shards: shards,
             cursor_state: CursorState::Confirmed,
         }))
     }

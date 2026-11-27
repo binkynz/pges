@@ -95,8 +95,8 @@ pub(super) async fn run(
                         lock(&coordinator.board).set_phase(Phase::Ready);
                         next_tick = Instant::now() + coordinator.tick;
                     }
+                    Err(error) if !error.is_retried() => break Err(error),
                     Err(error) => {
-                        let error = subscription::SubscribeError::Database(error.into());
                         lock(&coordinator.board).set_phase(Phase::Recovering(Arc::new(error)));
                         next_tick = Instant::now() + coordinator.setup.retry_interval;
                     }
@@ -139,7 +139,9 @@ struct Holding {
 impl Coordinator {
     /// Records this instance as alive, then releases the shards above its share or takes free ones up to
     /// it.
-    async fn rebalance(&mut self) -> Result<(), sqlx::Error> {
+    /// Fails with [`subscription::SubscribeError::CrateTooOld`] when the database no longer supports this
+    /// crate; no shard is taken then.
+    async fn rebalance(&mut self) -> Result<(), subscription::SubscribeError> {
         let members = self
             .ctx
             .sql

@@ -61,6 +61,10 @@ The first release: `pges`, `pges-core`, `pges-derive`, `pges-postgres`, `pges-su
 ### Stability
 
 - Migration 0001 (shared and per store) is frozen as released: later schema changes are new migrations.
+- Schema compatibility: a crate whose schema version is below a scope's `min_compatible` is refused by
+  `Store::open`, and subscriptions and the sequencer can neither take nor renew a lease. They stop with
+  `SubscribeError::CrateTooOld` or `RunError::CrateTooOld`, which is not retried, so during a rolling upgrade
+  a standby of a release the database no longer supports does not take over.
 - Experimental: the gRPC watch and waker, the outbox source, sharded subscriptions, replica reads,
   backfills, `otel`, and `pges-testing` (README, Stability).
 - MSRV 1.94. The MSRV follows sqlx; raising it is a minor-version change.
