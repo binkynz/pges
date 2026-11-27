@@ -15,12 +15,12 @@ use anyhow::{Context, Result};
 use sqlx::{Connection, PgConnection, PgPool};
 use tokio::sync::Notify;
 
-use pges_core::{category, interval, non_empty, stream};
+use pges_core::{category, high_water, interval, non_empty, stream};
 use pges_subscribe::{
     batch, handler,
     subscription::{self, StoreExt},
     subscription_name,
-    waker::recheck,
+    waker::{self, recheck},
 };
 use pges_testing::{cancel, proxy};
 
@@ -889,4 +889,75 @@ async fn a_renewal_that_finds_the_fence_moved_stops_the_checkpoint() -> Result<(
     )?;
 
     f.finish().await
+}
+
+/// A waker that never resolves, like a LISTEN connection that died without an error.
+struct Silent;
+
+impl waker::Waker for Silent {
+    async fn changed(
+        &mut self,
+        _: &high_water::HighWater,
+    ) -> Result<high_water::HighWater, waker::WakeError> {
+        std::future::pending().await
+    }
+}
+
+/// A caught-up subscription whose waker stays quiet still reads the log after `max_idle`, sharded or not,
+/// while it renews its short lease. Before the backstop it renewed the lease and delivered nothing.
+#[tokio::test]
+async fn a_silent_waker_still_delivers_after_max_idle() -> Result<()> {
+    let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    let job = stream::StreamId::new_v7();
+    f.append(Cat::Jobs, job, 1).await?;
+    f.sequence_all().await?;
+
+    let builder = |name: &str| {
+        f.store
+            .subscription(subscription::SubscriptionName::parse(name).unwrap())
+            .categories(non_empty![category!("jobs")])
+            .lease(interval!(400 ms))
+            .max_idle(interval!(300 ms))
+            .waker(Silent)
+    };
+    let single = common::Running::spawn(builder("silent").run_pg(Recorder::new("silent")));
+    let sharded = common::Running::spawn(
+        builder("silent_sharded")
+            .sharded(pges_subscribe::shards!(2))
+            .run_pg(Recorder::new("silent_sharded")),
+    );
+    delivered(&f, "silent", 1).await?;
+    delivered(&f, "silent_sharded", 1).await?;
+
+    // Both are caught up and waiting on the silent waker; only the backstop reads the new commits.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for _ in 0..2 {
+        f.append(Cat::Jobs, job, 1).await?;
+    }
+    f.sequence_all().await?;
+    delivered(&f, "silent", 3).await?;
+    delivered(&f, "silent_sharded", 3).await?;
+
+    assert!(single.errors().is_empty(), "{:?}", single.errors());
+    assert!(sharded.errors().is_empty(), "{:?}", sharded.errors());
+    single.stop().await?;
+    sharded.stop().await?;
+    f.finish().await
+}
+
+/// Waits until `subscriber` has recorded `count` events.
+async fn delivered(f: &Fixture, subscriber: &str, count: usize) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let delivered = f.delivered(subscriber).await?.len();
+        if delivered >= count {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "{subscriber} delivered {delivered} of {count} events"
+        );
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

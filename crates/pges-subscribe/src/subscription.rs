@@ -324,6 +324,7 @@ pub struct Builder<S = NoScope> {
     waker: Option<Box<dyn waker::DynWaker>>,
     acquire_interval: interval::Interval,
     retry_interval: interval::Interval,
+    max_idle: interval::Interval,
     replica: Option<replica::Replica>,
     chosen: PhantomData<fn() -> S>,
 }
@@ -346,6 +347,7 @@ impl Builder<NoScope> {
             waker: None,
             acquire_interval: DEFAULT_ACQUIRE_INTERVAL,
             retry_interval: DEFAULT_RETRY_INTERVAL,
+            max_idle: DEFAULT_MAX_IDLE,
             replica: None,
             chosen: PhantomData,
         }
@@ -490,7 +492,8 @@ impl<S> Builder<S> {
 
     /// What tells the caught-up subscription that new events may exist. Call it once; to combine several,
     /// pass a [`waker::Wakers`]. Without a waker, a caught-up subscription reads the log again every 500 ms
-    /// ([`waker::recheck::Recheck`]).
+    /// ([`waker::recheck::Recheck`]). Whatever the waker, it also reads the log after
+    /// [`Builder::max_idle`] without a wake-up.
     pub fn waker(mut self, waker: impl waker::Waker + 'static) -> Self {
         self.waker = Some(Box::new(waker));
         self
@@ -505,6 +508,18 @@ impl<S> Builder<S> {
     /// The pause after a database or waker error before trying again. Default 1 s.
     pub fn retry_interval(mut self, interval: interval::Interval) -> Self {
         self.retry_interval = interval;
+        self
+    }
+
+    /// The longest a caught-up subscription waits for its waker before it reads the log anyway. Default 30 s.
+    ///
+    /// A waker can stay quiet without failing: a [`waker::notify::NotifyWaker`] whose connection died
+    /// silently (a half-open TCP connection) never hears another notification. Its holder still renews the
+    /// lease, so no standby takes over. This backstop bounds how late such a subscription delivers, at the
+    /// cost of one read of the log per `max_idle` while nothing is appended. It applies to each shard of
+    /// [`Builder::sharded`] on its own.
+    pub fn max_idle(mut self, max_idle: interval::Interval) -> Self {
+        self.max_idle = max_idle;
         self
     }
 
@@ -541,6 +556,7 @@ impl<S> Builder<S> {
             waker: self.waker,
             acquire_interval: self.acquire_interval,
             retry_interval: self.retry_interval,
+            max_idle: self.max_idle,
             replica: self.replica,
             chosen: PhantomData,
         }
@@ -597,6 +613,7 @@ impl<S: Scope> Builder<S> {
                 retry: self.retry,
                 acquire_interval: self.acquire_interval.get(),
                 retry_interval: self.retry_interval.get(),
+                max_idle: self.max_idle.get(),
                 pool_needs,
                 replica: self.replica,
             },
@@ -689,6 +706,7 @@ impl Subscription {
             status,
             retry: setup.retry,
             retry_interval: setup.retry_interval,
+            max_idle: setup.max_idle,
             replica: setup.replica(),
         };
 
@@ -1049,6 +1067,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const DEFAULT_LEASE: interval::Interval = pges_core::interval!(15 s);
 const DEFAULT_ACQUIRE_INTERVAL: interval::Interval = pges_core::interval!(1 s);
 const DEFAULT_RETRY_INTERVAL: interval::Interval = pges_core::interval!(1 s);
+const DEFAULT_MAX_IDLE: interval::Interval = pges_core::interval!(30 s);
 const DEFAULT_BATCH_SIZE: NonZeroU32 = match NonZeroU32::new(1024) {
     Some(size) => size,
     None => NonZeroU32::MIN,
@@ -1073,6 +1092,7 @@ struct Setup {
     retry: RetryPolicy,
     acquire_interval: Duration,
     retry_interval: Duration,
+    max_idle: Duration,
     /// The fewest connections the store's pool must allow.
     pool_needs: u32,
     replica: Option<replica::Replica>,
@@ -1230,6 +1250,7 @@ struct Runner {
     status: watch::Sender<Status>,
     retry: RetryPolicy,
     retry_interval: Duration,
+    max_idle: Duration,
     replica: Option<replica::Reader>,
 }
 
@@ -1461,19 +1482,27 @@ impl Runner {
         }
     }
 
-    /// Waits for the waker, renewing the lease when it is due.
+    /// Waits for the waker, renewing the lease when it is due, and for at most `max_idle`.
     async fn wait(
         &mut self,
         term: &mut Term,
         known: &high_water::HighWater,
         shutdown: &mut Shutdown,
     ) -> Result<Waited, SubscribeError> {
+        let idle_until = Instant::now() + self.max_idle;
+
         loop {
             let renew_at = self.ctx.renew_at(term);
 
             let woken = tokio::select! {
                 woken = waker::DynWaker::changed(&mut *self.waker, known) => Some(woken),
                 () = tokio::time::sleep_until(renew_at) => None,
+                () = tokio::time::sleep_until(idle_until) => {
+                    if let Some(replica) = &mut self.replica {
+                        replica.woken(None);
+                    }
+                    return Ok(Waited::Woken);
+                }
                 () = shutdown.as_mut() => return Ok(Waited::Shutdown),
             };
 
