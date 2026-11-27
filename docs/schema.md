@@ -384,7 +384,11 @@ leaf dropped by hand) fails the insert into `commits` with PostgreSQL's routing 
 constraint, and the table where routing stopped, `commits_<cat>` (or `commits` when the category partition
 itself is missing). Only that shape, in the store's schema, naming `commits` or the category partition of one
 of the append's commits, becomes `AppendError::NoPartition { category, commit_id }`; a CHECK violation names
-its constraint and stays a database error. `Admin::partition_headroom` reports how far each category's
+its constraint and stays a database error. When `commits` is named and the append's commits are in several
+categories, the category is the one whose id the error's detail gives (`Partition key of the failing row
+contains (category_id) = (3).`; only the untranslated `(category_id) = (3)` part is read). PostgreSQL omits
+the detail when the role may not read `commits.category_id` or `commits` has row-level security; the error
+then stays a database error. `Admin::partition_headroom` reports how far each category's
 leaves reach (`crates/pges-postgres/sql/partition/headroom.sql`) and how many positions the newest log
 partition has left, so the condition can be alerted on before appends fail.
 
@@ -1172,7 +1176,11 @@ even when there is nothing to drop. A leaf left detached by an interrupted creat
 parent of a name that is a partition: a partition counts as present only under the parent maintenance means
 (`commits` for a category partition, `commits_<cat>` for a leaf, `log` for a log partition). A name taken by
 anything else (a partition of another parent, an index, a sequence) fails registration, `change_bucket` and
-`maintain` with `NameTaken`, and nothing is dropped, skipped or attached under it.
+`maintain` with `NameTaken`, and nothing is dropped, skipped or attached under it. The names of the indexes
+created with a partition, the category partition's primary key `commits_<cat>__pkey` and a leaf's
+`<leaf>_s`, are checked the same way before the partition is created (the leaf's after a detached leaf is
+dropped, which drops its own index), so a taken one fails with `NameTaken` naming it instead of SQLSTATE
+42P07, and no leaf is left detached.
 
 `Admin::register_category` runs in one transaction: the `categories` row, then the category partition and its
 leaves. No store sees the category before its partitions exist; an append in between fails with

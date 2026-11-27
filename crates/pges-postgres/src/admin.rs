@@ -256,11 +256,12 @@ pub enum RegisterCategoryError {
         /// The category.
         category: category::CategoryName,
     },
-    /// The name of one of the category's partitions is taken by a relation of the store's schema that is not
-    /// that partition.
-    #[error("{name} is taken by a relation that is not the partition of that name")]
+    /// The name of one of the category's partitions, or of an index the crate creates for one (the category
+    /// partition's primary key `commits_<category>__pkey`, a leaf's `<leaf>_s`), is taken by a relation of
+    /// the store's schema that is not that partition or index.
+    #[error("{name} is taken by a relation the crate did not create under that name")]
     NameTaken {
-        /// The partition's name.
+        /// The taken name: the partition's, or its index's.
         name: retention::PartitionName,
     },
     /// A database error, including DDL that kept timing out waiting for a lock.
@@ -275,11 +276,12 @@ pub enum ChangeBucketError {
     /// The category is not registered in the store.
     #[error("category {0} is not registered in the store")]
     UnknownCategory(category::CategoryName),
-    /// The name of one of the category's leaves is taken by a relation of the store's schema that is not
-    /// that leaf. The new bucket is recorded; [`Admin::maintain`] creates the leaves once the name is free.
-    #[error("{name} is taken by a relation that is not the partition of that name")]
+    /// The name of one of the category's leaves, or of a leaf's index `<leaf>_s`, is taken by a relation of
+    /// the store's schema that is not that leaf or index. The new bucket is recorded; [`Admin::maintain`]
+    /// creates the leaves once the name is free.
+    #[error("{name} is taken by a relation the crate did not create under that name")]
     NameTaken {
-        /// The leaf's name.
+        /// The taken name: the leaf's, or its index's.
         name: retention::PartitionName,
     },
     /// A database error, including DDL that kept timing out waiting for a lock. The new bucket may already
@@ -298,10 +300,12 @@ pub enum MaintainError {
         /// The category.
         category: category::CategoryName,
     },
-    /// The name of a partition is taken by a relation of the store's schema that is not that partition.
-    #[error("{name} is taken by a relation that is not the partition of that name")]
+    /// The name of a partition, or of an index the crate creates for one (a category partition's primary key
+    /// `commits_<category>__pkey`, a leaf's `<leaf>_s`), is taken by a relation of the store's schema that is
+    /// not that partition or index.
+    #[error("{name} is taken by a relation the crate did not create under that name")]
     NameTaken {
-        /// The partition's name.
+        /// The taken name: the partition's, or its index's.
         name: retention::PartitionName,
     },
     /// A database error, including DDL that kept timing out waiting for a lock.
@@ -625,6 +629,12 @@ async fn ensure_category_partition(
         PartitionState::Attached => return Ok(()),
         PartitionState::Detached => {}
         PartitionState::Missing => {
+            // CREATE TABLE would fail on a taken key name with a bare 42P07, which names no relation.
+            let key_name = ident::category_partition_key(category.as_str());
+            if relation_exists(conn, store.as_str(), &key_name).await? {
+                return Err(EnsureError::name_taken(key_name));
+            }
+
             let create = statement::CREATE_CATEGORY_PARTITION.render_text(&values);
             ddl(conn, create, on_timeout).await?;
         }
@@ -682,7 +692,8 @@ async fn ensure_leaves(
         let (suffix, from, to) = (row.to_char, row.lower, row.upper);
         let name = ident::leaf(category.as_str(), &suffix);
         let leaf = plain(&name)?;
-        let index = plain(&ident::leaf_stream_index(&name))?;
+        let index_name = ident::leaf_stream_index(&name);
+        let index = plain(&index_name)?;
         let values = template::Values::new()
             .store(store)
             .category(category)
@@ -706,6 +717,11 @@ async fn ensure_leaves(
             }
             PartitionState::Missing => {}
             PartitionState::Taken => return Err(EnsureError::name_taken(name)),
+        }
+        // Checked after the drop above, which drops a detached leaf's own index. CREATE UNIQUE INDEX would
+        // fail on a taken name with a bare 42P07 and leave the new leaf detached.
+        if relation_exists(conn, store.as_str(), &index_name).await? {
+            return Err(EnsureError::name_taken(index_name));
         }
 
         for statement in [

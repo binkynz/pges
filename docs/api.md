@@ -785,7 +785,8 @@ pub enum AppendError {
     NoPartition { category: CategoryName, commit_id: CommitId },       // no leaf of the category takes the
                                                                        // commit id: maintain has stopped;
                                                                        // in append_many, the first commit
-                                                                       // of that category
+                                                                       // of that category; also when the
+                                                                       // category partition is missing
     NoSpareConnection(CategoryName),                                   // registering needs a second pooled
                                                                        // connection; the unit of work holds
                                                                        // the pool's only one

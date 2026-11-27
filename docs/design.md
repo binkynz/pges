@@ -1914,10 +1914,14 @@ the halt, 43 recovered, 335 after.
     (`_\d{6}(\d{2})?$`, `_s`, `_pkey`): it patches the cases known today and leaves the scheme ambiguous.
   - Maintenance checks a partition's parent, not only its name: a name that is a partition of another
     parent, or a relation that is not a table, fails with `NameTaken` instead of being skipped, dropped or
-    attached under.
+    attached under. The index names created with a partition (`commits_<cat>__pkey`, `<leaf>_s`) are checked
+    before creating it, so a taken one is `NameTaken` too, not a 42P07 that names no relation.
   - A commit id no leaf takes fails with `AppendError::NoPartition { category, commit_id }`, recognized from
     PostgreSQL's routing error (23514 with no constraint, naming `commits` or the category's partition), not
-    a database error. No default partition and no leaf created on demand: an append must not run DDL, and a
+    a database error. When it names `commits` and a batch spans several categories, the category id comes
+    from the error's detail; there is no other reliable source, since the transaction is aborted and a
+    catalog lookup on another connection could race with the partition being reattached. Without the
+    detail (no SELECT on `commits.category_id`, or row-level security) it stays a database error. No default partition and no leaf created on demand: an append must not run DDL, and a
     default partition would take rows that later block attaching the leaf for their range.
     `Admin::partition_headroom` reports each category's newest leaf bound and how far ahead it is, and the
     positions left in the newest log partition; that is what to alert on. `Store::open` does not warn about
