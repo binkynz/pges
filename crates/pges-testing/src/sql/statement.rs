@@ -211,6 +211,44 @@ pges_postgres::typed_query! {
     }
 }
 
+/// Creates the role a failover replica connects as.
+pub const CREATE_STANDBY_ROLE: template::Statement = template::Statement {
+    name: "replica/create_standby_role",
+    files: &[sql_file!("replica/create_standby_role.sql")],
+    kind: template::Kind::Ddl,
+    params: &[],
+    columns: &[],
+};
+
+/// Takes REPLICATION from the failover replica's role.
+pub const CUT_OFF: template::Statement = template::Statement {
+    name: "replica/cut_off",
+    files: &[sql_file!("replica/cut_off.sql")],
+    kind: template::Kind::Ddl,
+    params: &[],
+    columns: &[],
+};
+
+pges_postgres::typed_query! {
+    /// Ends the walsender streaming to the failover replica.
+    pub END_STREAM, mod end_stream {
+        name: "replica/end_stream",
+        files: [sql_file!("replica/end_stream.sql")],
+        params {},
+        row { terminated: Option<bool> as "pg_terminate_backend" },
+    }
+}
+
+pges_postgres::typed_query! {
+    /// Promotes the replica.
+    pub PROMOTE, mod promote {
+        name: "replica/promote",
+        files: [sql_file!("replica/promote.sql")],
+        params {},
+        row { promoted: Option<bool> as "pg_promote" },
+    }
+}
+
 pges_postgres::typed_query! {
     /// What the other connections of this connection's application hold: open transactions and locks.
     pub CONNECTIONS, mod connections {
@@ -253,6 +291,10 @@ pub const ALL: &[&template::Statement] = &[
     &REPLAYED,
     &PAUSE_REPLAY,
     &RESUME_REPLAY,
+    &CREATE_STANDBY_ROLE,
+    &CUT_OFF,
+    &END_STREAM,
+    &PROMOTE,
     &CONNECTIONS,
     &WAITING,
 ];
@@ -272,6 +314,8 @@ pub const TYPED: &[typed::Shape] = &[
     typed::Shape::of::<replayed::Query>(),
     typed::Shape::of::<pause_replay::Query>(),
     typed::Shape::of::<resume_replay::Query>(),
+    typed::Shape::of::<end_stream::Query>(),
+    typed::Shape::of::<promote::Query>(),
     typed::Shape::of::<connections::Query>(),
     typed::Shape::of::<waiting::Query>(),
 ];

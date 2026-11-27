@@ -11,6 +11,11 @@
 //! The pair is private to the test: the shared server is never touched. Both servers run with the same
 //! settings as the shared one (logical WAL, no fsync). [`Pair::stop`] removes it; a pair dropped without
 //! `stop` is removed too, best effort.
+//!
+//! [`Pair::start_failover`] starts a replica that can take over: it streams through the physical slot
+//! `pges_standby` as the role `pges_standby`, and synchronises failover slots (`sync_replication_slots`,
+//! `hot_standby_feedback`, `dbname` in `primary_conninfo`). [`Pair::cut_off`] stops its WAL stream while
+//! slot synchronisation goes on, and [`Pair::promote`] promotes it.
 
 use std::{path::PathBuf, process::Command, time::Duration};
 
@@ -37,9 +42,18 @@ pub struct Pair {
 impl Pair {
     /// Starts a primary and a replica of it, and waits until the replica accepts read-only connections.
     pub async fn start() -> Result<Self> {
+        Self::start_as(Standby::ReadOnly).await
+    }
+
+    /// Starts a primary and a replica that synchronises the primary's failover slots and can be promoted.
+    pub async fn start_failover() -> Result<Self> {
+        Self::start_as(Standby::Failover).await
+    }
+
+    async fn start_as(standby: Standby) -> Result<Self> {
         match Backend::select()? {
-            Backend::Local { .. } => start_local().await,
-            Backend::Docker | Backend::Url(_) => start_docker().await,
+            Backend::Local { .. } => start_local(standby).await,
+            Backend::Docker | Backend::Url(_) => start_docker(standby).await,
         }
     }
 
@@ -110,6 +124,33 @@ impl Pair {
         self.on_replica(&sql::statement::RESUME_REPLAY).await
     }
 
+    /// Stops the WAL stream to a replica started with [`Pair::start_failover`]: its role loses
+    /// `REPLICATION` and its walsender is ended, so it receives nothing more. Its slot synchronisation goes
+    /// on, so it keeps copying the primary's failover slots as far as the WAL it has.
+    pub async fn cut_off(&self) -> Result<()> {
+        let mut primary = PgConnection::connect(&self.primary_url("postgres")?).await?;
+        primary.execute(sql::statement::CUT_OFF.sql()).await?;
+        sql::statement::end_stream::Query::fixed()
+            .bind(sql::statement::end_stream::Params {})
+            .fetch_all(&mut primary)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Promotes the replica and waits until it accepts writes.
+    pub async fn promote(&self) -> Result<()> {
+        let mut replica = PgConnection::connect(&self.replica_url("postgres")?).await?;
+        let promoted = sql::statement::promote::Query::fixed()
+            .bind(sql::statement::promote::Params {})
+            .fetch_one(&mut replica)
+            .await?
+            .promoted;
+        ensure!(promoted == Some(true), "the replica was not promoted");
+
+        Ok(())
+    }
+
     /// Stops and removes both servers.
     pub async fn stop(mut self) -> Result<()> {
         match std::mem::replace(&mut self.servers, Servers::Stopped) {
@@ -156,6 +197,27 @@ impl std::fmt::Debug for Pair {
     }
 }
 
+/// What the replica is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Standby {
+    /// Replica reads.
+    ReadOnly,
+    /// Taking over: it synchronises failover slots and can be cut off and promoted.
+    Failover,
+}
+
+/// The physical slot and the role of a failover replica, as `replica/create_standby_role.sql` creates it.
+const STANDBY_ROLE: &str = "pges_standby";
+const STANDBY_PASSWORD: &str = "pges_standby";
+
+/// Settings a failover replica needs to synchronise slots, besides the shared ones.
+const FAILOVER_ARGS: &[&str] = &[
+    "-c",
+    "sync_replication_slots=on",
+    "-c",
+    "hot_standby_feedback=on",
+];
+
 enum Servers {
     Docker {
         primary: Box<ContainerAsync<Postgres>>,
@@ -175,16 +237,23 @@ const ALLOW_REPLICATION: &str =
 const LOCAL_PRIMARY_PORT: u16 = 54401;
 const LOCAL_REPLICA_PORT: u16 = 54402;
 
-async fn start_docker() -> Result<Pair> {
+async fn start_docker(standby: Standby) -> Result<Pair> {
     let id = uuid::Uuid::now_v7().simple().to_string();
     let network = format!("pges-test-replica-{id}");
     let primary_name = format!("pges-test-primary-{id}");
+    let mut init = ALLOW_REPLICATION.to_owned();
+    if standby == Standby::Failover {
+        init.push_str(&format!(
+            "psql -v ON_ERROR_STOP=1 -U postgres -c \"{}\"\n",
+            sql::statement::CREATE_STANDBY_ROLE.sql()
+        ));
+    }
     let primary = Postgres::default()
         .with_tag("18")
         .with_cmd(SERVER_ARGS.iter().copied())
         .with_copy_to(
             "/docker-entrypoint-initdb.d/allow-replication.sh",
-            ALLOW_REPLICATION.as_bytes().to_vec(),
+            init.into_bytes(),
         )
         .with_network(&network)
         .with_container_name(&primary_name)
@@ -194,12 +263,20 @@ async fn start_docker() -> Result<Pair> {
 
     // The replica needs at least the primary's max_connections and max_wal_senders, so it gets the same
     // settings. pg_basebackup is retried: the primary's name may take a moment to resolve.
-    let args = SERVER_ARGS.join(" ");
+    let (args, connect) = match standby {
+        Standby::ReadOnly => (SERVER_ARGS.join(" "), "-U postgres".to_owned()),
+        Standby::Failover => (
+            [SERVER_ARGS, FAILOVER_ARGS].concat().join(" "),
+            format!(
+                "-U {STANDBY_ROLE} -d 'dbname=postgres password={STANDBY_PASSWORD}' -C -S {STANDBY_ROLE}"
+            ),
+        ),
+    };
     let script = format!(
         "set -e
          mkdir -p /var/lib/postgresql/replica
          chown postgres:postgres /var/lib/postgresql/replica
-         until gosu postgres pg_basebackup -h {primary_name} -U postgres \
+         until gosu postgres pg_basebackup -h {primary_name} {connect} \
                -D /var/lib/postgresql/replica/data -R -X stream -c fast; do
            rm -rf /var/lib/postgresql/replica/data
            sleep 0.5
@@ -238,14 +315,14 @@ async fn start_docker() -> Result<Pair> {
     })
 }
 
-async fn start_local() -> Result<Pair> {
+async fn start_local(standby: Standby) -> Result<Pair> {
     let dir = std::env::temp_dir().join(format!(
         "pges-replica-{}",
         &uuid::Uuid::now_v7().simple().to_string()[20..]
     ));
     let started = {
         let dir = dir.clone();
-        tokio::task::spawn_blocking(move || start_local_clusters(&dir)).await?
+        tokio::task::spawn_blocking(move || start_local_clusters(&dir, standby)).await?
     };
     if let Err(error) = started {
         let _ = remove_local(&dir);
@@ -265,16 +342,32 @@ async fn start_local() -> Result<Pair> {
     })
 }
 
-fn start_local_clusters(dir: &std::path::Path) -> Result<()> {
+fn start_local_clusters(dir: &std::path::Path, standby: Standby) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     let primary = dir.join("primary");
     let replica = dir.join("replica");
     let socket_dir = dir.display().to_string();
-    let options = |port: u16| {
+    let options = |port: u16, extra: &[&str]| {
         format!(
-            "-k {socket_dir} -c listen_addresses= -p {port} {}",
-            SERVER_ARGS.join(" ")
+            "-k {socket_dir} -c listen_addresses= -p {port} {} {}",
+            SERVER_ARGS.join(" "),
+            extra.join(" ")
         )
+    };
+    let (replica_args, connect): (&[&str], Vec<String>) = match standby {
+        Standby::ReadOnly => (&[], vec!["-U".to_owned(), "postgres".to_owned()]),
+        Standby::Failover => (
+            FAILOVER_ARGS,
+            vec![
+                "-U".to_owned(),
+                STANDBY_ROLE.to_owned(),
+                "-d".to_owned(),
+                "dbname=postgres".to_owned(),
+                "-C".to_owned(),
+                "-S".to_owned(),
+                STANDBY_ROLE.to_owned(),
+            ],
+        ),
     };
 
     run(Command::new("initdb").arg("-D").arg(&primary).args([
@@ -290,10 +383,25 @@ fn start_local_clusters(dir: &std::path::Path) -> Result<()> {
         .arg(&primary)
         .arg("-l")
         .arg(dir.join("primary.log"))
-        .args(["-w", "start", "-o", &options(LOCAL_PRIMARY_PORT)]))?;
+        .args(["-w", "start", "-o", &options(LOCAL_PRIMARY_PORT, &[])]))?;
+    if standby == Standby::Failover {
+        run(Command::new("psql")
+            .args(["-h", &socket_dir, "-p", &LOCAL_PRIMARY_PORT.to_string()])
+            .args([
+                "-U",
+                "postgres",
+                "-d",
+                "postgres",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-c",
+            ])
+            .arg(sql::statement::CREATE_STANDBY_ROLE.sql()))?;
+    }
     run(Command::new("pg_basebackup")
         .args(["-h", &socket_dir, "-p", &LOCAL_PRIMARY_PORT.to_string()])
-        .args(["-U", "postgres", "-D"])
+        .args(&connect)
+        .arg("-D")
         .arg(&replica)
         .args(["-R", "-X", "stream", "-c", "fast"]))?;
     run(Command::new("pg_ctl")
@@ -301,7 +409,12 @@ fn start_local_clusters(dir: &std::path::Path) -> Result<()> {
         .arg(&replica)
         .arg("-l")
         .arg(dir.join("replica.log"))
-        .args(["-w", "start", "-o", &options(LOCAL_REPLICA_PORT)]))
+        .args([
+            "-w",
+            "start",
+            "-o",
+            &options(LOCAL_REPLICA_PORT, replica_args),
+        ]))
 }
 
 /// Stops both local clusters, if running, and deletes the directory.
