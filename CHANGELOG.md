@@ -64,6 +64,7 @@ The first release: `pges`, `pges-core`, `pges-derive`, `pges-postgres`, `pges-su
   `NameTaken { name }` when a partition's name, or the name of an index the crate creates for one (a category
   partition's primary key `commits_<cat>__pkey`, a leaf's `<leaf>_s`), is taken by another relation of the
   store's schema, instead of a raw database error (SQLSTATE 42P07). Nothing is dropped or attached under it.
+  `name` is an `admin::RelationName`, since it may be an index's.
 
 ### Stability
 

@@ -9,6 +9,7 @@
 //! a bucket change applies from there.
 
 use std::{
+    fmt,
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -262,7 +263,7 @@ pub enum RegisterCategoryError {
     #[error("{name} is taken by a relation the crate did not create under that name")]
     NameTaken {
         /// The taken name: the partition's, or its index's.
-        name: retention::PartitionName,
+        name: RelationName,
     },
     /// A database error, including DDL that kept timing out waiting for a lock.
     #[error(transparent)]
@@ -282,7 +283,7 @@ pub enum ChangeBucketError {
     #[error("{name} is taken by a relation the crate did not create under that name")]
     NameTaken {
         /// The taken name: the leaf's, or its index's.
-        name: retention::PartitionName,
+        name: RelationName,
     },
     /// A database error, including DDL that kept timing out waiting for a lock. The new bucket may already
     /// be recorded; [`Admin::maintain`] creates the leaves it needs.
@@ -306,7 +307,7 @@ pub enum MaintainError {
     #[error("{name} is taken by a relation the crate did not create under that name")]
     NameTaken {
         /// The taken name: the partition's, or its index's.
-        name: retention::PartitionName,
+        name: RelationName,
     },
     /// A database error, including DDL that kept timing out waiting for a lock.
     #[error(transparent)]
@@ -851,15 +852,57 @@ pub(crate) async fn relation_exists(
     Ok(row.is_some())
 }
 
+/// The name of a relation (a table or an index) in a store's schema, without the schema. Its `Debug` is the
+/// quoted name, as for a string.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RelationName(String);
+
+impl RelationName {
+    /// The name, without the schema.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for RelationName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl fmt::Display for RelationName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for RelationName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq<str> for RelationName {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for RelationName {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
 /// Why a partition could not be created.
 pub(crate) enum EnsureError {
-    NameTaken(retention::PartitionName),
+    NameTaken(RelationName),
     Database(sqlx::Error),
 }
 
 impl EnsureError {
     fn name_taken(name: String) -> Self {
-        Self::NameTaken(retention::PartitionName::new(name))
+        Self::NameTaken(RelationName(name))
     }
 }
 
