@@ -147,7 +147,32 @@ async fn check_sharded_delivery(f: &Fixture, subscriber: &str) -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn instances_share_the_shards_and_deliver_every_event_once() -> Result<()> {
     let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
-    let streams: Vec<stream::StreamId> = (0..24).map(|_| stream::StreamId::new_v7()).collect();
+    // Six streams in each of the 4 shards, so every shard has events whatever the random ids.
+    let candidates: Vec<uuid::Uuid> = (0..400)
+        .map(|_| stream::StreamId::new_v7().as_uuid())
+        .collect();
+    let shard_of: Vec<(uuid::Uuid, i64)> = sqlx::query_as(
+        "SELECT id, (substring(sha256(uuid_send(id)) FROM 1 FOR 8)::int8 & 9223372036854775807) % 4
+         FROM unnest($1::uuid[]) AS id",
+    )
+    .bind(&candidates)
+    .fetch_all(&f.pool)
+    .await?;
+    let mut per_shard = [0usize; 4];
+    let streams: Vec<stream::StreamId> = shard_of
+        .into_iter()
+        .filter(|(_, shard)| {
+            let count = &mut per_shard[*shard as usize];
+            *count += 1;
+            *count <= 6
+        })
+        .map(|(id, _)| stream::StreamId::from_uuid(id))
+        .collect();
+    assert_eq!(
+        streams.len(),
+        24,
+        "400 random ids cover every shard six times"
+    );
     append(&f, &streams, 3).await?;
 
     // One instance takes every shard.
@@ -181,7 +206,7 @@ async fn instances_share_the_shards_and_deliver_every_event_once() -> Result<()>
     second.stop().await?;
     check_sharded_delivery(&f, "split").await?;
 
-    // Every shard got some of the 24 streams.
+    // Every shard got its six streams.
     let per_shard: Vec<i64> = sqlx::query_scalar(
         "SELECT count(DISTINCT stream_id) FROM es.commits
          GROUP BY (substring(sha256(uuid_send(stream_id)) FROM 1 FOR 8)::int8
