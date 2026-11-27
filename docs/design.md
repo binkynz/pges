@@ -972,8 +972,8 @@ the halt, 43 recovered, 335 after.
   the lock was tried and failed: appends that arrive later can overtake one waiting for the row lock. The
   new id is not computed in the append statement, because the crate must know the id it sent to deduplicate
   a retry after a lost response. `append_many` in its own transaction takes the retry lock with SKIP LOCKED
-  and restarts the batch if another transaction holds it, so a retry never waits for a lock out of stream id
-  order. (2026-11-25)
+  (and a 1 ms `lock_timeout`, see below) and restarts the batch if another transaction holds it, so a retry
+  never waits for a lock out of stream id order. (2026-11-25)
   - Hot-stream retry id (2026-11-26): when `last_commit_id` is less than `min(1 s, max_clock_skew / 2)` behind a fresh UUIDv7, or
     ahead of it, the new id is a random step of 1 to 2^60 above it, in its millisecond; otherwise it is the
     greater of a fresh UUIDv7 and that id. A fresh id jumps past every queued waiter's id, so each waiter
@@ -1174,11 +1174,25 @@ the halt, 43 recovered, 335 after.
   a lock-only xmax. A batch runs `created` before `bumped` (`head` is `created UNION ALL bumped`), and
   nothing after `bumped` waits: the `commits` insert conflicts only with the stream's own creator or locker.
   So a transaction that has already bumped a stream never waits on another batch. Inserts run in stream id
-  order after every `locked` step, and retry locks use SKIP LOCKED, so no wait cycle can form.
+  order after every `locked` step, and retry locks do not wait, so no wait cycle can form.
   `batches_creating_the_same_streams_never_deadlock` (16 writers, two plan shapes, single appends making
   streams new for one snapshot and existing for another) passes; the same test deadlocks within seconds
   when the pooled retry waits instead of skipping. Inside a unit of work the retry waits, and the
   documented retryable deadlock remains. (2026-11-25)
+  - The retry lock runs with `lock_timeout` at 1 ms (2026-11-27). SKIP LOCKED did not keep it from waiting:
+    when the updater of the row version the statement found commits between PostgreSQL's visibility check and
+    its conditional wait, `heap_lock_tuple` follows the update chain with `heap_lock_updated_tuple`, which
+    waits for the holder of a newer version whatever the wait policy (PostgreSQL 18.7; NOWAIT is the same).
+    A batch holding its own streams then waited for a batch locking the retried stream and one of its
+    streams in id order: a deadlock, seen once in CI in the test above. In plain SQL, pgbench running
+    autocommit updates of one row, transactions locking it and a second row in order, and transactions
+    holding the second row while locking the first with SKIP LOCKED (24 clients, 30 s) hit 68 deadlocks in
+    about 400,000 transactions.
+    `append::tests::the_retry_lock_of_a_batch_never_waits` hammers that shape with the crate's statement; the
+    race is narrow, so without the timeout it fails about half its runs. A timeout aborts the transaction,
+    which the batch rolls back to start over anyway. Alternatives: three round trips (set, lock, restore),
+    or not locking a stream the batch does not hold and always starting over, which needs the batch
+    statement to report the streams it locked.
 - Migration versions are `pges_postgres::migrate::SchemaVersion`, owned by pges-postgres, not pges-core,
   because only the migration runner uses them (2026-11-25).
 - Small polish (2026-11-25):
