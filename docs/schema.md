@@ -813,7 +813,11 @@ consistent point stored as the token (`crates/pges-sequencer/sql/logical/store_i
 - Outcomes: a slot with an `invalidation_reason` is `SourceError::Halt(SlotLost::Invalidated)`; no slot but
   a token is `Halt(SlotLost::Missing)`; a slot confirmed past the token is `Halt(SlotLost::Ahead)`; a new slot whose exported snapshot already shows a commit in a store
   is dropped again and gives `Halt(SlotLost::CommitsBeforeSlot)`, because it would never deliver those
-  commits. Each is recovered with `pges-sequencer resequence` (Resequence, below).
+  commits. Each is recovered with `pges-sequencer resequence` (Resequence, below). A new slot whose exported
+  snapshot shows a store without the outbox that the source had not read is dropped again with a transient
+  error, and the next attempt reads the stores, publishes the new one and creates the slot again: the store
+  was created while the slot was, so its commits were not checked, and one created while the publication was
+  missing is not in it.
 - The check runs in the snapshot at the slot's consistent point, so it sees exactly the commits the slot
   will not stream: no append is skipped silently. An append that commits while the slot is created can
   still make the first start fail. Create the slot before writers start, with `LogicalSource::bootstrap` /

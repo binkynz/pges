@@ -1955,8 +1955,12 @@ the halt, 43 recovered, 335 after.
   - Hash partitions widen above 1000: `<table>_p<remainder>` padded to 3 digits or the digits of the highest
     remainder, so up to 1000 the names are unchanged. No cap below the `u16` of `stream_partitions`: every
     name fits, and the lock table is the practical limit.
-  - Store creation adds `commits` to the publication only when the creating role has the owner's privileges
-    and the publication exists; otherwise it skips an outbox store, and refuses a logical one (42501).
+  - Store creation adds `commits` to the publication when it exists and the creating role has the owner's
+    privileges. Without the publication it skips every store: the logical source creates the publication and
+    adds every store before it streams, and a new slot whose snapshot shows a store the source had not read
+    is created again (2026-11-27, review). A publication dropped while a slot exists already costs every
+    store's commits; skipping does not make that worse. Without the privileges it skips an outbox store, and
+    refuses a logical one (42501).
     Rejected: skipping the logical store too, leaving it to the logical source's publication repair. That
     repair runs only when the source opens, and a slot that already exists never delivers commits made
     before their table joined the publication, with nothing to detect it (the commits check runs only for a
