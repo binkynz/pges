@@ -834,6 +834,8 @@ Errors that name a store carry a `StoreName`: `OpenError::StoreNotFound`,
 `SetWriterLimitsError::StoreNotFound`, `SetDefaultRetentionError::StoreNotFound`,
 `RetentionError::StoreNotFound`, `FreezeError::StoreNotFound` and `MigrateError::OutboxMismatch`'s
 `store`. Retention reports carry `CategoryName` and `PartitionName`, freeze reports `PartitionName`.
+`NameTaken { name }` carries an `admin::RelationName` (a table's or an index's name, without the schema;
+`as_str`, `Display`, `AsRef<str>`, `PartialEq<str>`).
 
 `StoreDefinition::outbox` must match the database's other stores. A store whose outbox setting differs fails
 with `MigrateError::OutboxMismatch` (through `OpenError::Migrate` when auto-migrating, and from
