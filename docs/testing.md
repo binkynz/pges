@@ -469,10 +469,66 @@ the MSRV build and `cargo deny`. The lint and test jobs are pinned to Rust 1.97.
 also builds each crate's rustdoc with no features and with each feature alone (`-D warnings`); the list of
 crates and features in that step is generated from `cargo metadata`, and it also runs `cargo test --doc` per
 feature. GitHub service containers cannot pass `-c wal_level=logical` to PostgreSQL, so the tests start their
-own container.
+own container. A separate nightly workflow repeats the concurrency tests under contention (Stress, below).
 
 The test job also runs `cargo test -p pges-core -p pges-postgres -p pges-subscribe -p pges-sequencer` on
 default features (since 79b7004). `pges-examples` enables optional features of `pges` (`otel` among them),
 and feature unification turns them on for every crate in a workspace run, even without `--all-features`. So
 `cargo test --workspace` never builds pges-postgres without `otel`, and only a per-crate run tests the paths
 that exist without a feature (for example metadata resolution without a span).
+
+## Stress
+
+`.github/workflows/stress.yml` runs every night (03:17 UTC) and on demand (`workflow_dispatch`, with a budget
+in minutes and a filter). It is not a required check, and `ci.yml` is unchanged. It runs the tests in
+`.github/stress/tests.txt` over and over, one test per process, against a server held to few CPUs, several at
+once, to find races that a single run rarely hits: the `append_many` deadlock that the retry lock's
+`lock_timeout` fixed passed more than 1000 local runs of `batches_creating_the_same_streams_never_deadlock`
+and showed up once in CI, on a starved runner.
+
+`.github/stress/tests.txt` is the one list, a line per test: package, target (`lib` for unit tests, otherwise
+the integration test file), the exact test name or `*` for every test of the target not `#[ignore]`d, and an
+optional weight (runs per round of the list). It holds the tests where repetition adds signal: `append_many`'s
+lock order and retries (`the_retry_lock_of_a_batch_never_waits` and the deadlock tests weighted highest), the
+contended and racing appends, concurrent store creation, the cancellation tests of all three crates, the
+sequencer's lease, term and crash tests, and the subscriptions' takeover, fencing, lease and shard tests.
+Tests that start private containers or clusters (`replica::Pair`, `invalidation.rs`, TLS, auth) are left out.
+The script checks every line against the built test binaries (`--list`) before it starts and fails if one
+names a package, target or test that no longer exists, so a renamed test cannot drop out silently. A new
+concurrency test belongs in the list; a `*` line picks up new tests of its file by itself.
+
+`.github/stress/run.sh` builds the workspace's tests once (`--all-features`), starts its own `postgres:18`
+container (the settings of pges-testing's `SERVER_ARGS`, plus `max_connections = 600`,
+`deadlock_timeout = 50ms` so a deadlock fails its run sooner, and `log_lock_waits`), points the tests at it
+with `PGES_TEST_DATABASE_URL`, and runs `STRESS_JOBS` workers until `STRESS_BUDGET_SECS` is over. Each worker
+goes round the list from its own starting point, running one test per process (`--exact --test-threads 1`,
+in the package's directory as `cargo test` would); a run still going after `STRESS_RUN_TIMEOUT_SECS` (600) is
+killed and counted as timed out. Failures do not stop the run. At the end it prints a table (test, runs,
+failed, timed out, mean and max seconds) and the count of `deadlock detected` lines in the server log, writes
+it to the job summary, and exits 1 if any run failed. The workflow uploads `target/stress/` (the summary, each
+failed run's output named by time, test and outcome, and the server log with each deadlock's DETAIL) as the
+`stress-<profile>` artifact.
+
+A failure counts only while the server is up. After each run that fails or times out the script checks the
+container (`docker inspect`, then `pg_isready` with retries); if the server is gone (killed, out of memory,
+Docker restarted) the run is recorded as `server-lost`, not as a failure, every worker stops, the server's
+container state goes to `server-state.json`, and the job fails with an error saying the server stopped and the
+run is incomplete. Without that check, a server lost mid-run turned into dozens of `connecting to the test
+server` / `Connection refused` failures in a few seconds, as the workers kept starting tests against nothing.
+
+The workflow runs two profiles side by side, each with a 45 minute budget: `slow-server` (server on 1 CPU, 4
+runs at once) and `starved-runner` (server on half a CPU, 3 runs at once, 3 busy loops taking CPU from the
+test processes too). A build takes about ten minutes more. A manual run takes a budget of 1 to 75 minutes, so
+the budget, the build and a last run past the budget fit in the job's 110 minute limit.
+
+Run it locally with a short budget (it needs Docker, and `STRESS_FILTER` narrows the tests by an extended
+regex over `package/target/test`):
+
+```sh
+STRESS_BUDGET_SECS=180 STRESS_JOBS=2 STRESS_FILTER='append_many|retry_lock' .github/stress/run.sh
+```
+
+`STRESS_PG_CPUS`, `STRESS_PG_CPUSET` (docker `--cpuset-cpus`, to keep the server on given CPUs of a shared
+machine), `STRESS_CPU_HOGS` and `STRESS_OUT` (default `target/stress`) set the rest. Changing
+`set_config('lock_timeout', '1ms', true)` to `'0'` in `crates/pges-postgres/sql/append/try_lock_stream.sql`
+brings the deadlock back; the stress run should then fail.

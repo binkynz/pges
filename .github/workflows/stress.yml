@@ -1,0 +1,85 @@
+name: stress
+
+# Runs the concurrency tests in .github/stress/tests.txt over and over against a server with few CPUs, to find
+# races that one run in ci.yml rarely hits. Not a required check. docs/testing.md (Stress) describes it.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      budget-minutes:
+        description: Minutes of runs per profile (1 to 75)
+        default: "45"
+      filter:
+        description: Extended regex over package/target/test; empty runs every listed test
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stress
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  stress:
+    # Scheduled runs only on the main repository, not on forks.
+    if: github.event_name == 'workflow_dispatch' || github.repository == 'binkynz/pges'
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The server held to one CPU, four runs at once on the runner's four.
+          - profile: slow-server
+            pg-cpus: "1"
+            jobs: "4"
+            hogs: "0"
+          # The server on half a CPU and the runner oversubscribed: busy loops take CPU from the test
+          # processes too, as on a starved CI runner.
+          - profile: starved-runner
+            pg-cpus: "0.5"
+            jobs: "3"
+            hogs: "3"
+    name: stress (${{ matrix.profile }})
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - run: docker pull postgres:18
+      - name: Run the stress tests
+        env:
+          STRESS_PROFILE: ${{ matrix.profile }}
+          STRESS_PG_CPUS: ${{ matrix.pg-cpus }}
+          STRESS_JOBS: ${{ matrix.jobs }}
+          STRESS_CPU_HOGS: ${{ matrix.hogs }}
+          STRESS_BUDGET_MINUTES: ${{ inputs.budget-minutes || '45' }}
+          STRESS_FILTER: ${{ inputs.filter }}
+          STRESS_OUT: target/stress
+        # The budget, the build and a last run past the budget (up to 10 minutes) fit in timeout-minutes.
+        run: |
+          if [[ ! $STRESS_BUDGET_MINUTES =~ ^[1-9][0-9]?$ ]] || ((STRESS_BUDGET_MINUTES > 75)); then
+            echo "::error::budget-minutes must be 1 to 75, not $STRESS_BUDGET_MINUTES"
+            exit 1
+          fi
+          STRESS_BUDGET_SECS=$((STRESS_BUDGET_MINUTES * 60)) .github/stress/run.sh
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: stress-${{ matrix.profile }}
+          path: |
+            target/stress/summary.md
+            target/stress/summary.tsv
+            target/stress/failures/
+            target/stress/postgres.log
+            target/stress/server-state.json
+            target/stress/server-lost
+          if-no-files-found: ignore
+          retention-days: 14
