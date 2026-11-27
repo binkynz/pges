@@ -1,0 +1,47 @@
+# Tests the nightly stress workflow (.github/workflows/stress.yml) runs over and over under contention.
+# docs/testing.md (Stress) explains the choice. One test per line:
+#
+#   <package> <target> <test> [weight]
+#
+# <target> is `lib` for a crate's unit tests, otherwise the name of an integration test file in tests/.
+# <test> is the full test name (`--exact`), or `*` for every test of the target that is not #[ignore]d.
+# [weight] (default 1) runs the test that many times per round of the list, for races that need many runs.
+# The run fails before it starts if a line names a package, target or test that no longer exists.
+
+# append_many lock order, retries and the deadlock fixed by the retry lock's lock_timeout
+pges-postgres    lib          append::tests::the_retry_lock_of_a_batch_never_waits  8
+pges-postgres    append_many  batches_creating_the_same_streams_never_deadlock  12
+pges-postgres    append_many  a_batch_whose_retry_is_locked_elsewhere_starts_over  3
+pges-postgres    append       concurrent_append_many_never_deadlocks  6
+pges-postgres    append       contended_any_appends_all_succeed  2
+pges-postgres    append       contended_any_append_many_all_succeed  2
+pges-postgres    append       contended_any_appends_in_units_of_work_all_succeed  2
+pges-postgres    append       racing_exact_appends_have_exactly_one_winner
+pges-postgres    append       any_racing_the_stream_creation_is_retried
+pges-postgres    append       no_stream_racing_the_stream_creation_conflicts
+
+# store creation racing itself
+pges-postgres    migrate      concurrent_runners_create_the_store_once
+pges-postgres    migrate      concurrent_stores_of_different_kinds_are_refused
+
+# futures dropped at every await point
+pges-postgres    cancel       *
+pges-sequencer   cancel       *
+pges-subscribe   cancel       *
+
+# sequencer leases, terms, takeover and crashes
+pges-sequencer   lease        *
+pges-sequencer   term         *
+pges-sequencer   crash        *
+
+# subscription leases, fencing, takeover and shards
+pges-subscribe   run_pg       a_standby_takes_over_from_the_checkpoint
+pges-subscribe   run_pg       a_deposed_instance_is_fenced_out
+pges-subscribe   run_pg       a_slow_batch_does_not_lose_the_lease_while_idle
+pges-subscribe   run_pg       a_batch_slower_than_the_lease_keeps_it
+pges-subscribe   run_pg       a_retry_backoff_longer_than_the_lease_keeps_it
+pges-subscribe   run_pg       a_renewal_that_finds_the_fence_moved_stops_the_checkpoint
+pges-subscribe   shard        instances_share_the_shards_and_deliver_every_event_once
+pges-subscribe   shard        the_shards_of_a_dead_instance_move_to_the_others
+pges-subscribe   shard        interleavings_deliver_every_event_once_and_each_stream_in_order
+pges-subscribe   merge        concurrent_sequencer_batches_never_skip_an_event
