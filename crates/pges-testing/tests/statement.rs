@@ -244,6 +244,13 @@ async fn ddl_statements_run() -> Result<()> {
     .await?;
     let mut admin = pges_testing::server().await?.admin().await?;
 
+    // The failover replica's role, in a transaction rolled back at once: the shared server keeps no role.
+    let mut roles = sqlx::Connection::begin(&mut admin).await?;
+    for statement in [&statement::CREATE_STANDBY_ROLE, &statement::CUT_OFF] {
+        run(&mut roles, &mut ran, statement, &template::Values::new()).await?;
+    }
+    roles.rollback().await?;
+
     let building = test_database();
     let built = test_database();
     let clone = test_database();
