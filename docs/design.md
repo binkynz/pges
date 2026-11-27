@@ -1140,6 +1140,12 @@ the halt, 43 recovered, 335 after.
   in its lease row so a contracting migration refuses to run while old holders exist (a schema change, and
   it blocks the migration instead of stopping the old process). Appends and reads hold no lease and stay
   checked at open only; the rolling-upgrade rule (one release at a time) covers them.
+  Taking a lease carries the same check (2026-11-27), so an old standby cannot take a released lease and
+  work until its first renewal. The acquire statement always returns one row with a `too_old` flag, so a
+  held lease and a too-old crate are told apart in the same round trip; a separate `crate_too_old` read
+  follows only a refusal, for the error's details. A too-old standby stops even when the lease is held: it
+  could never lead. The alternative, an extra read of `pges.scopes` after every acquire that returned no
+  row, costs a round trip on each standby poll.
 - `pges` facade (2026-11-25):
   - Re-exports only, each crate as an inlined module (`pges::core`, `pges::derive`, `pges::postgres`,
     `pges::subscribe`, `pges::sequencer`, `pges::replication`), plus the derive at the root; the facade is the only crate that

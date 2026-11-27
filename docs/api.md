@@ -1221,7 +1221,7 @@ pub enum RunError {
     PositionOverflow(StoreId),               // positions would pass i64::MAX
     CrateTooOld { scope: String, min_compatible: SchemaVersion, crate_version: SchemaVersion },
                                              // a migration dropped support for this release; found
-                                             // at the next lease renewal (Versioning)
+                                             // at the next lease renewal or acquire (Versioning)
 }
 ```
 
@@ -1890,7 +1890,7 @@ They are ordinary subscribers, so they get leases, checkpoints and backfills for
 | What | Where | Rule |
 |---|---|---|
 | Crates | Cargo | semver; before 1.0 a minor bump is breaking |
-| Database schema, per scope | `pges.migrations`, `pges.scopes` | migrations are embedded and checksummed. `Store::open` fails if the database is behind (run `pges migrate` or enable auto-migrate), and fails if the crate's version is below `min_compatible`. Running subscriptions and sequencers check again at every lease renewal (Rolling upgrades). Migrations are expand/contract: a new schema version stays usable by the previous crate release, so `min_compatible` only moves in a later release. Migration 0001 is frozen from 0.1.0 on: schema changes are new migrations, never edits (schema.md, Migrations) |
+| Database schema, per scope | `pges.migrations`, `pges.scopes` | migrations are embedded and checksummed. `Store::open` fails if the database is behind (run `pges migrate` or enable auto-migrate), and fails if the crate's version is below `min_compatible`. Running subscriptions and sequencers check again whenever they renew or take a lease (Rolling upgrades). Migrations are expand/contract: a new schema version stays usable by the previous crate release, so `min_compatible` only moves in a later release. Migration 0001 is frozen from 0.1.0 on: schema changes are new migrations, never edits (schema.md, Migrations) |
 | Payload frame | `commits.format`, `snapshots.format` | readers support every format ever written. Writers switch to a new format only via `StoreConfig::write_format`, after all readers are upgraded |
 | Event schemas | per event, inside the frame | additive, defaulted fields need no bump. Anything else, including a codec change, bumps `version` and adds an upcaster. Type names never change |
 | New event types and versions | writers | a writer may emit a new type or a new version only after every reader understands it, or after readers use `OnUnknown::Skip`; the same rule as the frame format |
@@ -1909,18 +1909,20 @@ it raises `min_compatible`, and the releases below it no longer work. (2026-11-2
 - `Store::open` fails with `OpenError::CrateTooOld`, so a process of a release the database no longer
   supports does not start.
 - A running subscription or sequencer finds out at its next lease renewal (a subscription renews every
-  half lease, 7.5 s by default; the sequencer every `Lease::renew`, 5 s). The renewal statement refuses to
-  renew while the shared scope's or a store's `min_compatible` is above the crate's version: a subscription
-  checks the shared scope and its own store, the sequencer every store, since it writes to all of them.
-  After a refused renewal the process reads `pges.scopes`, releases its lease and stops with
+  half lease, 7.5 s by default; the sequencer every `Lease::renew`, 5 s) or its next attempt to take a
+  lease (a standby tries every `acquire_interval`, 1 s by default). The renewal and acquire statements
+  refuse while the shared scope's or a store's `min_compatible` is above the crate's version: a
+  subscription checks the shared scope and its own store, the sequencer every store, since it writes to all
+  of them. After a refused renewal the process reads `pges.scopes`, releases its lease and stops with
   `SubscribeError::CrateTooOld` or `RunError::CrateTooOld`, instead of standing by. A `run_pg` batch whose
-  checkpoint carried the refused renewal is rolled back. A standby takes over at once.
-- Between the migration and that renewal, an old process keeps working for up to half a lease. Taking a
-  lease is not checked, so a standby of the old release may take the released lease and work until its
-  own first renewal, then stop the same way. Appends, reads and backfills run no lease and are not checked
-  after `Store::open`.
+  checkpoint carried the refused renewal is rolled back. A refused acquire takes no lease, changes no fence
+  and stops the standby with the same error, whether or not the lease was free; it is not retried. So only
+  a standby of a supported release takes over the released lease.
+- Between the migration and that renewal, an old leader keeps working for up to half a lease. Appends,
+  reads and backfills run no lease and are not checked after `Store::open`.
 - The check costs nothing extra while the crate is supported: it is a subquery on `pges.scopes` in the
-  renewal statement. Roles that renew need `SELECT` on `pges.scopes` (schema.md, Roles).
+  renewal and acquire statements. Roles that renew or take leases need `SELECT` on `pges.scopes`
+  (schema.md, Roles).
 
 ### Frame format 1
 

@@ -21,16 +21,19 @@ macro_rules! sql_file {
 }
 
 pges_postgres::typed_query! {
-    /// Takes the lease if it is free or expired.
+    /// Takes the lease if it is free or expired, while the database still supports this crate.
     pub LEASE_ACQUIRE, mod lease_acquire {
         name: "lease/acquire",
         files: [sql_file!("lease/acquire.sql")],
         params<'q> {
             ttl: PgInterval,
             leader: Option<&'q str>,
+            shared_version: i32,
+            store_version: i32,
         },
         row {
-            fence: i64,
+            too_old: Option<bool>,
+            fence: Option<i64>,
             source: Option<String>,
             source_token: Option<Vec<u8>>,
             halted: Option<String>,

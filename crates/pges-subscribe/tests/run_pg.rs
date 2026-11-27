@@ -1014,3 +1014,64 @@ async fn a_migration_past_the_crate_stops_subscriptions_at_renewal() -> Result<(
     assert_eq!(leased, 0, "the leases were released");
     f.finish().await
 }
+
+/// A subscription of a release a migration no longer supports (the store's `min_compatible` raised past the
+/// crate's schema version) does not take a released lease, sharded or not: it stops with `CrateTooOld`
+/// without recovering first, and every shard's fence and lease are left as they were.
+#[tokio::test]
+async fn a_subscription_past_its_crate_does_not_take_a_released_lease() -> Result<()> {
+    let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    f.append(Cat::Jobs, stream::StreamId::new_v7(), 1).await?;
+    f.sequence_all().await?;
+
+    let builder = |name: &str| {
+        f.store
+            .subscription(subscription::SubscriptionName::parse(name).unwrap())
+            .categories(non_empty![category!("jobs")])
+            .lease(interval!(400 ms))
+    };
+    let single = || common::Running::spawn(builder("old").run_pg(Recorder::new("old")));
+    let sharded = || {
+        common::Running::spawn(
+            builder("old_sharded")
+                .sharded(pges_subscribe::shards!(2))
+                .run_pg(Recorder::new("old_sharded")),
+        )
+    };
+    let (first, first_sharded) = (single(), sharded());
+    delivered(&f, "old", 1).await?;
+    delivered(&f, "old_sharded", 1).await?;
+    first.stop().await?;
+    first_sharded.stop().await?;
+
+    let leases = || {
+        sqlx::query_as::<_, (String, i16, i64, Option<String>, bool)>(
+            "SELECT name, shard, fence, lease_owner::text, lease_until IS NULL FROM es.subscriptions \
+             ORDER BY name, shard",
+        )
+        .fetch_all(&f.pool)
+    };
+    let before = leases().await?;
+    assert_eq!(before.len(), 3);
+    assert!(
+        before.iter().all(|row| row.4),
+        "every lease was released: {before:?}"
+    );
+
+    sqlx::query("UPDATE pges.scopes SET schema_version = 9, min_compatible = 9 WHERE scope = 'es'")
+        .execute(&f.pool)
+        .await?;
+    for running in [single(), sharded()] {
+        let error = running.stopped().await?;
+        assert!(
+            matches!(
+                &error,
+                subscription::SubscribeError::CrateTooOld { scope, min_compatible, crate_version }
+                    if scope == "es" && min_compatible.get() == 9 && crate_version.get() == 1
+            ),
+            "{error}"
+        );
+    }
+    assert_eq!(leases().await?, before, "no lease was taken or changed");
+    f.finish().await
+}

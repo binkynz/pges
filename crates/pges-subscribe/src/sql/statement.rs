@@ -162,12 +162,28 @@ pges_postgres::typed_query! {
 }
 
 pges_postgres::typed_query! {
-    /// Takes over the lapsed lease of the lowest free shard and bumps its fence.
+    /// Takes over the lapsed lease of the lowest free shard and bumps its fence, while the database still
+    /// supports this crate.
     pub ACQUIRE, mod acquire {
         name: "subscription/acquire",
         files: [sql_file!("subscription/acquire.sql")],
-        params<'q> { name: &'q str, owner: Uuid, lease: PgInterval, shards: i16 },
-        row { shard: i16, fence: i64, position: i64, shards: i16, category_ids: Vec<i32> },
+        params<'q> {
+            name: &'q str,
+            owner: Uuid,
+            lease: PgInterval,
+            shards: i16,
+            shared_version: i32,
+            store: &'q str,
+            store_version: i32,
+        },
+        row {
+            too_old: Option<bool>,
+            shard: Option<i16>,
+            fence: Option<i64>,
+            position: Option<i64>,
+            shards: Option<i16>,
+            category_ids: Option<Vec<i32>>,
+        },
     }
 }
 

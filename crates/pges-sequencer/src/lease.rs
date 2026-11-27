@@ -9,6 +9,16 @@ use pges_postgres::migrate;
 use crate::{sequencer, sql::statement};
 
 /// What the acquire statement returns.
+pub(crate) enum Acquire {
+    Taken(Acquired),
+    /// Another sequencer holds the lease.
+    Held,
+    /// A migration raised the shared or a store's `min_compatible` above this crate's schema version
+    /// ([`migrate::crate_too_old`] tells which); the lease was not taken.
+    TooOld,
+}
+
+/// A lease taken.
 pub(crate) struct Acquired {
     pub(crate) fence: sequencer::Fence,
     pub(crate) halted: Option<String>,
@@ -20,21 +30,31 @@ pub(crate) struct StoredToken {
     pub(crate) token: Option<Vec<u8>>,
 }
 
-/// Takes the lease if it is free or expired, bumping the fence. `None`: another sequencer holds it.
+/// Takes the lease if it is free or expired, bumping the fence, unless the database no longer supports this
+/// crate.
 pub(crate) async fn acquire(
     conn: &mut PgConnection,
     ttl: PgInterval,
     leader: Option<&str>,
-) -> Result<Option<Acquired>, sqlx::Error> {
+) -> Result<Acquire, sqlx::Error> {
     let row = statement::lease_acquire::Query::fixed()
-        .bind(statement::lease_acquire::Params { ttl, leader })
-        .fetch_optional(&mut *conn)
+        .bind(statement::lease_acquire::Params {
+            ttl,
+            leader,
+            shared_version: migrate::latest_version(migrate::SHARED).get(),
+            store_version: migrate::latest_version(migrate::STORE).get(),
+        })
+        .fetch_one(&mut *conn)
         .await?;
 
-    Ok(row.map(|row| Acquired {
-        fence: sequencer::Fence::new(row.fence),
-        halted: row.halted,
-    }))
+    Ok(match (row.too_old, row.fence) {
+        (Some(true), _) => Acquire::TooOld,
+        (_, Some(fence)) => Acquire::Taken(Acquired {
+            fence: sequencer::Fence::new(fence),
+            halted: row.halted,
+        }),
+        (_, None) => Acquire::Held,
+    })
 }
 
 /// Who may resequence.
