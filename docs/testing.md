@@ -117,8 +117,9 @@ database until the next sweep; clean them up as for tests (Isolation).
   error's text, or `Stopped`. `Fixture::on(TestDb, Kind)` builds the fixture in a database that already has
   the shared migrations (used for the private container).
 - A test of a timing-sensitive property must be able to fail: check it by breaking the code once (for
-  example, removing the `acked >= delivered` guard of the logical source's idle confirm fails the restart
-  test). A mutation run that is killed or hangs leaks its databases and slots (above); clean them up
+  example, confirming a keepalive's `wal_end` straight to the slot, as the logical source did before
+  2026-11-27, fails the idle test's restart check, and skipping the `SlotLost::Ahead` check fails all three
+  tests in `promotion.rs`). A mutation run that is killed or hangs leaks its databases and slots (above); clean them up
 afterwards.
 
 ## Suites
@@ -172,11 +173,12 @@ afterwards.
 | Store faults through the proxy: lost connections (before and after the server committed), lost responses, `Exact` racing a stream's creation, a lost COMMIT of the locked autocommit append (deduplicated on retry), `UnitOfWork::commit` keeping `Aborted` when its rollback fails | `crates/pges-postgres/tests/fault.rs` | always |
 | `append_many`: the SKIP LOCKED restart, deterministically (a new `xact_start` in `pg_stat_activity`, and the first transaction's lock released); overlapping batches creating the same new streams never deadlock (16 writers, two plan shapes) | `crates/pges-postgres/tests/append_many.rs` | always |
 | Sequencer: outbox end to end, gap-free positions, restarts, high-water marks, a failing batch retried; wake-ups: an idle source does not scan `pending` (counted through `pg_stat_user_tables`) and wakes on each commit, a terminated listener is replaced, a commit made while nobody listens is drained after listening again (proxy), a listener that stops answering is replaced (proxy), a new store is sequenced on its first notification, one notification per transaction and none for a failed append; positions past the end stop the sequencer with `RunError::PositionOverflow`, leaving the commit in `pending`, `halted` unset and the lease released | `crates/pges-sequencer/tests/outbox.rs` | always |
-| Sequencer logical source: commit order with units of work committing in reverse; restart and crash between log commit and token (dedupe); the slot confirmed up to the token and past idle WAL; takeover; a fenced leader lets go of the slot (`Source::close`); a dropped slot halts (dropped while a proxy refuses the replication connection, so the sequencer cannot take the slot back first); commits before the slot halt (`CommitsBeforeSlot`); a commit racing the slot creation halts, not skipped; bootstrap creates the slot before writers, halts on commits before the slot (and records it in `halted`) and on a lost slot with a token, and refuses an outbox database; a store created while streaming; a slow batch under `wal_sender_timeout = 1s`, with a control run that fails without status updates | `crates/pges-sequencer/tests/logical.rs` (`source-logical`, default) | always; needs `wal_level = logical` |
+| Sequencer logical source: commit order with units of work committing in reverse; restart and crash between log commit and token (dedupe); the slot confirmed up to the token and past idle WAL, never past the stored token, and a restart after idle confirms resumes; takeover; a fenced leader lets go of the slot (`Source::close`); a dropped slot halts (dropped while a proxy refuses the replication connection, so the sequencer cannot take the slot back first); commits before the slot halt (`CommitsBeforeSlot`); a commit racing the slot creation halts, not skipped; bootstrap creates the slot before writers, halts on commits before the slot (and records it in `halted`) and on a lost slot with a token, and refuses an outbox database; a store created while streaming; a slow batch under `wal_sender_timeout = 1s`, with a control run that fails without status updates | `crates/pges-sequencer/tests/logical.rs` (`source-logical`, default) | always; needs `wal_level = logical` |
 | Logical bootstrap keeps an existing slot's failover without a request, changes it both ways when asked, a new slot gets failover only when asked, opening a sequencer never changes it, and bootstrap refuses (under a timeout) while a sequencer leads | `crates/pges-sequencer/tests/logical.rs` (`source-logical`, default) | always; needs `wal_level = logical` |
 | Sequencer terms: lease renewed while the source opens, shutdown during an open that never finishes, close on lease loss, shutdown and fatal errors, `Status::Halted` (fake source); when the term's connection has died, the lease release and the halt record fall back to a fresh connection | `crates/pges-sequencer/tests/term.rs` | always |
 | Sequencer crash correctness (spike 2): a sequencer killed before the log commit, between the commit and the ack, and between the ack and the next batch, with 4 concurrent writers, the outbox and the logical source; a restart or a running standby takes over; a logical case whose token is an hour old replays and dedupes; the log is gap-free with no commit twice, every commit is sequenced once, and an append that started after another returned comes later in its category and in the store (`check_commit_order`). After a kill before the log commit with no standby, the killed batch's commits are absent from the log and (outbox) still pending. Property tests vary the point, its occurrence (1–4), restart or standby, the token interval (0, 30 ms, 1 h) and the batch size (1–7) | `crates/pges-sequencer/tests/crash.rs` | always; logical cases need `wal_level = logical` (`source-logical`, default) |
 | Slot invalidation under load (spike 7): four writers append while a live slot is invalidated by `max_slot_wal_keep_size = 1MB` (`wal_removed`), the sequencer halts (`Status::Halted`, later starts refuse), `resequence` recovers and sequencing resumes; the log is gap-free with no commit twice and versions in order per stream, every commit is sequenced once, the recovered block is in commit id order and later appends sit after it (`an_invalidated_slot_halts_sequencing_until_resequenced`) | `crates/pges-sequencer/tests/invalidation.rs` (`source-logical`), private container `pges-test-slot-loss-<uuid>` | always; skips without Docker |
+| Slot ahead of the token (`SlotLost::Ahead`): a slot advanced past the token with `pg_replication_slot_advance` halts the sequencer, records `halted`, and `resequence` sequences the skipped commit (`a_slot_confirmed_past_the_token_halts_until_resequenced`); a slot the source creates stores its consistent point as the token, and a slot without a token starts when the stores are empty and halts when they hold a commit (`a_new_slot_stores_its_consistent_point_and_a_missing_token_halts_only_with_commits`); a real promotion (`a_promoted_asynchronous_standby_halts_until_resequenced`, below) | `crates/pges-sequencer/tests/promotion.rs` (`source-logical`, default); the promotion test on a private `replica::Pair::start_failover` | always; needs `wal_level = logical` |
 | Resequence: refuses with `NotHalted` before and while a sequencer leads, and with `LeaseHeld` leaving the fence and slot untouched; once the sequencer stops, a valid slot is replaced and nothing recovered; a dropped slot's commits (made while no sequencer ran and while halted) recovered in commit id order, including a leftover slot from an interrupted run and a commit after it, then a second run refuses with `NotHalted`; commits from before the first slot; a bootstrap that found commits before the slot, then resequence, then a sequencer, with commit order checked (`resequence_recovers_after_a_bootstrap_found_commits_before_the_slot`); writer roles refused with `WriterRole` (`TransactionTimeoutNotSet`, and `TransactionTimeoutTooLong` for a role `transaction_timeout` of 2 h against the store's 1 h); `SlotInUse` while a plain replication stream holds the slot (slot, `halted`, lease and log unchanged; succeeds once the stream stops); `LeaseLost` when the fence moves while the slot is being created (nothing written, `halted` kept, the new owner's lease untouched, the next run recovers the orphan); `PositionOverflow` (nothing written, `halted` kept, lease released, new slot dropped); each success checks `halted` cleared, the lease released, the token at the consistent point and the slot valid | `crates/pges-sequencer/tests/resequence.rs` (`source-logical`, default) | always; needs `wal_level = logical` |
 | Retention with resequence: a leaf whose commits were resequenced past its stop row is dropped (`retention_drops_a_leaf_whose_commits_were_resequenced`); `prune_log` then resequence sequences no commit twice; a second resequence ignores the commit id order of the first's rows; a resequence that lands during a retention run (the run waits on a held `SHARE UPDATE EXCLUSIVE` lock on `commits_jobs`) leaves the orders scan start below the kept commit (`retention_sees_a_resequence_that_lands_during_its_run`) | `crates/pges-sequencer/tests/retention.rs` (`source-logical`) | always; needs `wal_level = logical` |
 | NOTIFY: each batch notifies its store with a decodable `Notice`; off with `Notify::Disabled`; a failing NOTIFY (a shadowing `public.pg_notify` on the database's `search_path`) keeps the log moving without `Recovering`, and notifications resume once it is dropped | `crates/pges-sequencer/tests/notify.rs` (`watch-notify`) | with `--all-features` |
@@ -207,7 +209,7 @@ afterwards.
 | Sequencer cancellation: `run` dropped at every await point up to its first batch commit; the lease is freed between runs (`UPDATE pges.sequencer SET lease_until = NULL`) | `crates/pges-sequencer/tests/cancel.rs` | always |
 | Subscription cancellation: a `run_pg` subscription and a backfill dropped at every await point, each run under a new name so every run takes the same path | `crates/pges-subscribe/tests/cancel.rs` | always |
 | `replica::Pair`: the replica follows the primary, and paused replay holds it back | `crates/pges-testing/tests/replica.rs` | always; starts a private pair |
-| Faults: promote a standby (killing the sequencer mid-batch is covered by `crash.rs` and `bin.rs`, slot invalidation by `invalidation.rs`) | containers (primary + `pg_basebackup` standby, toxiproxy); planned | CI only, nightly |
+| Faults: network partitions between the sequencer and the server (killing the sequencer mid-batch is covered by `crash.rs` and `bin.rs`, slot invalidation by `invalidation.rs`, promotion by `promotion.rs`) | containers (toxiproxy); planned | CI only, nightly |
 | README code: the workspace README and each crate's, as doctests | `README.md`, `crates/*/README.md`, included by each `lib.rs` | always; the workspace README with `pges`'s `derive`, the `pges-sequencer` README with `source-logical` |
 | Examples: each of the ten examples runs to the end, including `metadata` (a request scope, a follow-up from a handler, otel trace context through the SDK tracer provider and tracing-opentelemetry) | `examples/tests/run.rs` | always |
 | Benchmark smoke: each `pges-bench` command runs for about a second with small settings (`append_runs`, `sequencer_runs`, `outbox_notify_runs`, `read_runs`, `partitions_runs`, `wake_runs`; `scale_runs` fills 1000 streams and runs every `scale` action once, retention dropping a `jobs` leaf) | `bench/tests/smoke.rs` | always |
@@ -253,6 +255,21 @@ reply exactly at COMMIT, then drops the connection; the retry returns `Deduplica
 id. `a_failed_rollback_keeps_the_aborted_error` checks that `UnitOfWork::commit` returns `Aborted` when its
 rollback fails on a dropped connection.
 
+The promotion test (`crates/pges-sequencer/tests/promotion.rs`) starts a primary and a replica with
+`replica::Pair::start_failover`: the replica streams through the physical slot `pges_standby` as the role
+`pges_standby`, with `sync_replication_slots = on`, `hot_standby_feedback = on` and `dbname` in
+`primary_conninfo`. A sequencer with a failover slot runs on the primary until the replica holds a persistent
+synchronised copy of the slot at the stored token (`pg_log_standby_snapshot()` helps the copy become
+persistent; slot synchronisation naps up to 30 s, so the waits allow 90 s). A commit is then appended and
+replayed on the replica, and `Pair::cut_off` takes `REPLICATION` from the replica's role and ends its
+walsender. Slot synchronisation uses an ordinary connection, so it goes on while the WAL stream is cut. A
+sequencer on the primary with a one-hour `status_interval` (so no idle position moves the slot further)
+sequences the commit, stores the token and confirms it; the replica copies that position, because it has the
+WAL up to it, but not the batch. After `Pair::promote`, a sequencer on the promoted replica halts with
+`SlotLost::Ahead`, `resequence` sequences the commit, and a restarted sequencer sequences a new append. The
+whole test takes about 90 s. The local backend runs the pair on fixed ports (54401, 54402), so two runs on one
+machine collide; Docker does not.
+
 `crates/pges-postgres/tests/append_many.rs` runs the SKIP LOCKED restart deterministically: the batch waits
 on one stream's lock while another stream is created and locked elsewhere, and must roll back and start
 over. Its stress test, `batches_creating_the_same_streams_never_deadlock`, deadlocks within seconds when
@@ -287,7 +304,8 @@ before `Status::Leading` race its creation.
 `initdb`, `pg_ctl` and `pg_basebackup`, on unix sockets only. A pair takes about 3 s on Docker and 2 s
 locally; every replica test starts its own. `pause_replay` and `resume_replay` make the replica lag, so tests
 use real lag, not a simulated one. The shared server is never touched, and a pair dropped without `stop` is
-removed too. `Pair::caught_up` compares the insert LSN with the replay LSN without the page-header
+removed too. `Pair::start_failover()` starts a replica that synchronises failover slots and can be cut off
+(`Pair::cut_off`) and promoted (`Pair::promote`); the promotion test above uses it. `Pair::caught_up` compares the insert LSN with the replay LSN without the page-header
 allowance, so on a page boundary it can wait until unrelated WAL is written (up to about 15 s; its timeout is
 30 s).
 
@@ -428,8 +446,7 @@ in `write()` (the test reaches it through the lease renewal while the slot is cr
 drop; not deterministic); the drop of a new slot failing after a failed check; and that a side renewal's own
 fence check (not only the fenced checkpoint) stops the checkpoint: the outcome is the same either way; a
 renamed `pges` dependency end to end (only the lookup's unit tests cover it); a deleted stream with the
-logical source (its late log rows behave like the outbox case, which is tested); promoting a physical standby
-with failover slots.
+logical source (its late log rows behave like the outbox case, which is tested).
 
 `crates/pges-watch-proto/src/generated/` is checked in. After editing the proto, regenerate it with
 `PGES_REGENERATE=1 cargo test -p pges-watch-proto --test generated`; without the variable the test fails on

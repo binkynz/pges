@@ -86,9 +86,17 @@ async fn logical_futures_run_on_spawned_tasks() -> Result<()> {
     let pool = f.pool.clone();
     let mut logical = f.logical_source(pool.clone())?;
     let appender = f.store.clone();
-    let logical = tokio::spawn(async move {
+    let (logical, token) = tokio::spawn(async move {
         logical.bootstrap().await.unwrap();
-        source::Source::open(&mut logical, None).await.unwrap();
+        // Bootstrap stored the slot's consistent point. Only stored tokens are acked: a slot confirmed past
+        // the stored token halts the next open.
+        let stored: Vec<u8> = sqlx::query_scalar("SELECT source_token FROM pges.sequencer")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        source::Source::open(&mut logical, Some(&stored))
+            .await
+            .unwrap();
         appender
             .append(
                 pges_core::stream::StreamId::new_v7(),
@@ -104,9 +112,7 @@ async fn logical_futures_run_on_spawned_tasks() -> Result<()> {
             .unwrap();
         tx.rollback().await.unwrap();
         assert_eq!(batch.commits.len(), 1);
-        source::Source::ack(&mut logical, &batch.token)
-            .await
-            .unwrap();
+        source::Source::ack(&mut logical, &stored).await.unwrap();
         // Refused: nothing is halted. The future must still be Send.
         let refused = logical
             .resequence(&pges_sequencer::logical::ResequenceConfig::new(
@@ -114,22 +120,22 @@ async fn logical_futures_run_on_spawned_tasks() -> Result<()> {
             ))
             .await;
         assert!(refused.is_err());
-        logical
+        (logical, stored)
     })
     .await?;
 
     let pool = f.pool.clone();
     tokio::spawn(async move {
         let mut boxed: Box<dyn source::DynSource> = Box::new(logical);
-        source::Source::open(&mut boxed, None).await.unwrap();
+        source::Source::open(&mut boxed, Some(&token))
+            .await
+            .unwrap();
         let mut tx = pool.begin().await.unwrap();
-        let batch = source::Source::next(&mut boxed, &mut tx, NonZeroUsize::MIN)
+        source::Source::next(&mut boxed, &mut tx, NonZeroUsize::MIN)
             .await
             .unwrap();
         tx.rollback().await.unwrap();
-        source::DynSource::ack(&mut *boxed, &batch.token)
-            .await
-            .unwrap();
+        source::DynSource::ack(&mut *boxed, &token).await.unwrap();
         source::Source::close(&mut boxed).await;
     })
     .await?;
