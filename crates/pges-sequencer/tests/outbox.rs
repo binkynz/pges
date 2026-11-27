@@ -404,14 +404,17 @@ async fn a_commit_made_while_nobody_listens_is_drained_after_listening_again() -
         .connect_lazy(&proxy.url(&f.db)?)?;
     let mut config = common::outbox_config();
     config.store_refresh = interval!(1 h);
+    // Appended before the source listens, so it notifies no one and the drain after opening takes it. Appended
+    // after, it could commit between the `LISTEN` and that drain: the drain takes it, and its notification,
+    // still on its way, wakes the source for a second drain that may run after the append below and take that
+    // commit too, with nobody listening.
+    f.append(Target::Job(stream::StreamId::new_v7()), 1).await?;
     let pool = f.db.pool().await?;
     let running = common::Running::start(
         pool,
         outbox::OutboxSource::new(proxied, config),
         common::fast(),
     )?;
-    running.wait_leading().await?;
-    f.append(Target::Job(stream::StreamId::new_v7()), 1).await?;
     common::wait_sequenced(&f.pool, 1).await?;
 
     proxy.hold(proxy::Direction::Both);
