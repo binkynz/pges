@@ -6,9 +6,11 @@
 -- $2 the leader's name, shown to operators (`SequencerConfig::leader`), or NULL
 -- $3 the crate's newest shared (pges) schema version
 -- $4 the crate's newest store schema version
+-- $5 the crate's newest outbox schema version
 --
--- Returns one row. too_old: a migration raised the shared or some store's min_compatible above the crate's
--- version (the sequencer writes to every store; as lease/renew.sql); the lease is then neither taken nor
+-- Returns one row. too_old: a migration raised the shared scope's, some store's or some store's outbox
+-- scope's min_compatible above the crate's version for it (the sequencer writes to every store; as
+-- lease/renew.sql); the lease is then neither taken nor
 -- waited for. The other columns are NULL when the lease was not taken: another sequencer holds it, or
 -- too_old. The bumped fence makes every batch of the previous leader fail its fence check, and the update
 -- waits for a batch that already holds the row lock. The stored token and `halted` come back so the new
@@ -16,7 +18,8 @@
 WITH checked AS (
   SELECT EXISTS (SELECT FROM pges.scopes
                  WHERE (scope = 'pges' AND min_compatible > $3)
-                    OR (scope IN (SELECT schema_name FROM pges.stores) AND min_compatible > $4)) AS too_old
+                    OR (scope IN (SELECT schema_name FROM pges.stores) AND min_compatible > $4)
+                    OR (scope IN (SELECT schema_name || '.outbox' FROM pges.stores) AND min_compatible > $5)) AS too_old
 ), taken AS (
   UPDATE pges.sequencer SET fence = fence + 1, lease_until = now() + $1, leader = $2
   WHERE (lease_until IS NULL OR lease_until < now()) AND NOT (SELECT too_old FROM checked)

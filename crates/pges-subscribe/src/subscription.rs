@@ -1633,6 +1633,7 @@ impl Ctx {
                 shared_version: migrate::latest_version(migrate::SHARED).get(),
                 store: self.store.as_str(),
                 store_version: migrate::latest_version(migrate::STORE).get(),
+                outbox_version: migrate::latest_version(migrate::OUTBOX).get(),
             })
             .fetch_one(&self.pool)
             .await?;

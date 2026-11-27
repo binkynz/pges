@@ -43,6 +43,7 @@ pub(crate) async fn acquire(
             leader,
             shared_version: migrate::latest_version(migrate::SHARED).get(),
             store_version: migrate::latest_version(migrate::STORE).get(),
+            outbox_version: migrate::latest_version(migrate::OUTBOX).get(),
         })
         .fetch_one(&mut *conn)
         .await?;
