@@ -1916,3 +1916,33 @@ async fn units_of_work_refuse_to_commit_after_a_failed_caller_statement() -> Res
     assert!(!exists, "the aborted unit of work wrote nothing");
     f.finish().await
 }
+
+/// `pges.check_commit_id` refuses an id that is not a UUIDv7 with SQLSTATE 22023, even with the infinite
+/// tolerance an append gives an id at or below its stream's last one; the crate only sends v7 ids.
+#[tokio::test]
+async fn the_commit_id_check_refuses_ids_that_are_not_uuidv7() -> Result<()> {
+    let f = Fixture::new().await?;
+    let nil = "00000000-0000-0000-0000-000000000000";
+    let v1 = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+    let v4 = "6ba7b810-9dad-41d1-80b4-00c04fd430c8";
+
+    for id in [nil, v1, v4] {
+        let error = sqlx::query("SELECT pges.check_commit_id($1::uuid, 'infinity')")
+            .bind(id)
+            .execute(&f.pool)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.as_database_error().and_then(|e| e.code()).as_deref(),
+            Some("22023"),
+            "{id}: {error}"
+        );
+    }
+    let v7 = commit::CommitId::generate().as_uuid();
+    let checked: Uuid = sqlx::query_scalar("SELECT pges.check_commit_id($1, '5 seconds')")
+        .bind(v7)
+        .fetch_one(&f.pool)
+        .await?;
+    assert_eq!(checked, v7);
+    f.finish().await
+}

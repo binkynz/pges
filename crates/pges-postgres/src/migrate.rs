@@ -1,10 +1,12 @@
 //! Embedded, checksummed migrations.
 //!
-//! Two kinds of scope are versioned separately, each with its own rows in `pges.migrations` and
+//! Three kinds of scope are versioned separately, each with its own rows in `pges.migrations` and
 //! `pges.scopes`:
 //!
 //! - the shared `pges` schema, once per database ([`SHARED`], applied by [`run_shared`]);
-//! - each store schema ([`STORE`], applied by [`run_store`], which also creates the store).
+//! - each store schema ([`STORE`], applied by [`run_store`], which also creates the store);
+//! - the outbox of a store created with [`store::Outbox::Enabled`], scope `<store>.outbox` ([`OUTBOX`],
+//!   applied by [`run_store`] when it creates the store).
 //!
 //! Every migration runs in its own transaction holding `pg_advisory_xact_lock(hashtext('pges.migrate'))`,
 //! so concurrent runners apply each migration once. Store migrations run with `SET LOCAL search_path` set to
@@ -105,6 +107,22 @@ pub const STORE: &[Migration] = &[Migration {
     min_compatible: SchemaVersion(1),
 }];
 
+/// Migrations of the outbox of a store created with [`store::Outbox::Enabled`], scope `<store>.outbox`
+/// ([`outbox_scope`]), in order. The first is applied with the store, in the transaction that creates it; a
+/// store created without the outbox never gets them.
+pub const OUTBOX: &[Migration] = &[Migration {
+    version: SchemaVersion(1),
+    name: "opt_outbox",
+    sql: include_str!("../migrations/store/opt_outbox.sql"),
+    min_compatible: SchemaVersion(1),
+}];
+
+/// The scope of a store's outbox migrations: `<store>.outbox`. Store names cannot contain a `.`, so it is
+/// never a store's own scope.
+pub fn outbox_scope(store: &core_store::StoreName) -> String {
+    format!("{store}.{OUTBOX_SCOPE_SUFFIX}")
+}
+
 /// Applies every [`SHARED`] migration the database does not have yet.
 ///
 /// Fails if an applied migration was edited, or if the database requires a newer crate.
@@ -149,12 +167,15 @@ async fn run_shared_inner(conn: &mut PgConnection) -> Result<(), MigrateError> {
 }
 
 /// Creates the store `name` from `definition` if it does not exist, then applies every [`STORE`] migration it
-/// does not have yet. [`run_shared`] must have run first.
+/// does not have yet, and every [`OUTBOX`] migration of a store with the outbox. [`run_shared`] must have run
+/// first.
 ///
 /// Store creation is one transaction: the schema, its `pges.stores` row, the first migration and the
-/// options in `definition`. The definition of an existing store is never changed, and `definition` is then
+/// options in `definition` (with the outbox, the first [`OUTBOX`] migration). The definition of an existing store is never changed, and `definition` is then
 /// not read. A database holds stores of one outbox kind; a store whose [`store::StoreDefinition::outbox`]
-/// differs from the existing stores' fails with [`MigrateError::OutboxMismatch`].
+/// differs from the existing stores' fails with [`MigrateError::OutboxMismatch`]. Creating a store without the
+/// outbox fails with [`MigrateError::Failed`] (SQLSTATE 42501) when the role lacks the privileges of the
+/// `pges` publication's owner, which adding the store's `commits` to it needs.
 ///
 /// Run it on a connection outside a transaction. Each migration then runs in a transaction of its own, which a
 /// dropped future rolls back. On a connection already inside a transaction, each is a savepoint instead, and a
@@ -181,7 +202,8 @@ async fn run_store_inner(
             .await
             .map_err(MigrateError::database)?;
         if is_current(scope, STORE, &applied)? {
-            return ensure_supported(conn, scope, latest).await;
+            ensure_supported(conn, scope, latest).await?;
+            return run_outbox(conn, store_name).await;
         }
     }
 
@@ -206,6 +228,45 @@ async fn run_store_inner(
 
         set_search_path(&mut tx, store_name).await?;
         apply(&mut tx, scope, migration).await?;
+        tx.commit().await.map_err(MigrateError::database)?;
+    }
+
+    run_outbox(conn, store_name).await
+}
+
+/// Checks the applied [`OUTBOX`] migrations of a store with the outbox and applies the missing ones. A store
+/// without the outbox has none applied, and gets none.
+async fn run_outbox(
+    conn: &mut PgConnection,
+    store_name: &core_store::StoreName,
+) -> Result<(), MigrateError> {
+    let scope = outbox_scope(store_name);
+    let latest = latest_version(OUTBOX);
+    let applied = applied_migrations(conn, &scope)
+        .await
+        .map_err(MigrateError::database)?;
+    if applied.is_empty() {
+        return Ok(());
+    }
+    if is_current(&scope, OUTBOX, &applied)? {
+        return ensure_supported(conn, &scope, latest).await;
+    }
+
+    for migration in OUTBOX {
+        let mut tx = conn.begin().await.map_err(MigrateError::database)?;
+        lock(&mut tx).await?;
+
+        let applied = applied_migrations(&mut tx, &scope)
+            .await
+            .map_err(MigrateError::database)?;
+        if let Some(checksum) = applied.get(&migration.version) {
+            verify_checksum(&scope, migration, checksum)?;
+            continue;
+        }
+        ensure_supported(&mut tx, &scope, latest).await?;
+
+        set_search_path(&mut tx, store_name).await?;
+        apply(&mut tx, &scope, migration).await?;
         tx.commit().await.map_err(MigrateError::database)?;
     }
 
@@ -314,7 +375,7 @@ pub enum Scopes<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CrateTooOld {
-    /// `pges` or a store's name.
+    /// `pges`, a store's name, or a store's outbox scope (`<store>.outbox`).
     pub scope: String,
     /// The oldest schema version the scope still supports.
     pub min_compatible: SchemaVersion,
@@ -323,7 +384,8 @@ pub struct CrateTooOld {
 }
 
 /// Finds a scope that no longer supports this crate, the check [`store::Store::open`] makes at start: the
-/// shared scope first, then stores by name. `None` when every scope read supports it.
+/// shared scope first, then stores by name, each store's outbox scope right after the store. `None` when every
+/// scope read supports it.
 ///
 /// Subscriptions and the sequencer run it after a lease renewal or acquire was refused. Both carry the same
 /// check, so a process this crate's version cannot serve any more loses its lease within one renewal, a
@@ -332,7 +394,11 @@ pub async fn crate_too_old(
     conn: &mut PgConnection,
     scopes: Scopes<'_>,
 ) -> Result<Option<CrateTooOld>, error::DbError> {
-    let (shared_version, store_version) = (latest_version(SHARED), latest_version(STORE));
+    let (shared_version, store_version, outbox_version) = (
+        latest_version(SHARED),
+        latest_version(STORE),
+        latest_version(OUTBOX),
+    );
     let store = match scopes {
         Scopes::OneStore(store) => Some(store.as_str()),
         Scopes::AllStores => None,
@@ -342,6 +408,7 @@ pub async fn crate_too_old(
             shared_version: shared_version.get(),
             store_version: store_version.get(),
             store,
+            outbox_version: outbox_version.get(),
         })
         .fetch_optional(conn)
         .await?;
@@ -349,6 +416,8 @@ pub async fn crate_too_old(
     Ok(row.map(|row| CrateTooOld {
         crate_version: if row.scope == SHARED_SCOPE {
             shared_version
+        } else if row.scope.ends_with(&format!(".{OUTBOX_SCOPE_SUFFIX}")) {
+            outbox_version
         } else {
             store_version
         },
@@ -427,7 +496,7 @@ pub(crate) async fn compatibility(
 /// stores'.
 const OUTBOX_MISMATCH: &str = "PGE02";
 
-pub(crate) const OUTBOX_SQL: &str = include_str!("../migrations/store/opt_outbox.sql");
+const OUTBOX_SCOPE_SUFFIX: &str = "outbox";
 
 /// Whether every migration is applied, failing on an edited one.
 fn is_current(
@@ -577,10 +646,10 @@ async fn create_store(
 
     apply(conn, store, first).await?;
 
-    if definition.outbox == store::Outbox::Enabled {
-        conn.execute(OUTBOX_SQL)
-            .await
-            .map_err(|e| failed(store, first, e))?;
+    if definition.outbox == store::Outbox::Enabled
+        && let Some(outbox) = OUTBOX.first()
+    {
+        apply(conn, &outbox_scope(store_name), outbox).await?;
     }
 
     Ok(())
@@ -644,7 +713,7 @@ mod tests {
 
     #[test]
     fn migrations_are_numbered_from_one_without_gaps() {
-        for migrations in [SHARED, STORE] {
+        for migrations in [SHARED, STORE, OUTBOX] {
             for (i, migration) in migrations.iter().enumerate() {
                 assert_eq!(
                     migration.version.get() as usize,
@@ -663,5 +732,13 @@ mod tests {
 
         assert_eq!(checksum.len(), 32);
         assert_ne!(checksum, STORE[0].checksum());
+    }
+
+    #[test]
+    fn the_outbox_scope_is_never_a_store_scope() {
+        let scope = outbox_scope(&pges_core::store_name!("es"));
+
+        assert_eq!(scope, "es.outbox");
+        assert!(core_store::StoreName::parse(scope).is_err());
     }
 }

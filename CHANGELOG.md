@@ -60,7 +60,10 @@ The first release: `pges`, `pges-core`, `pges-derive`, `pges-postgres`, `pges-su
 
 ### Stability
 
-- Migration 0001 (shared and per store) is frozen as released: later schema changes are new migrations.
+- Migration 0001 (shared and per store) and the outbox script (version 1 of the store's `<store>.outbox`
+  scope, checksummed like a migration) are frozen as released: later schema changes are new migrations.
+  Store creation needs the `pges` publication owner's privileges for a store of the logical source, and
+  roles that read need grants on each category's partition (docs/schema.md, Roles).
 - Schema compatibility: a crate whose schema version is below a scope's `min_compatible` is refused by
   `Store::open`, and subscriptions and the sequencer can neither take nor renew a lease. They stop with
   `SubscribeError::CrateTooOld` or `RunError::CrateTooOld`, which is not retried, so during a rolling upgrade

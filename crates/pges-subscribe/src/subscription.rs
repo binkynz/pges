@@ -1730,6 +1730,7 @@ impl Ctx {
                     shared_version: migrate::latest_version(migrate::SHARED).get(),
                     store: self.store.as_str(),
                     store_version: migrate::latest_version(migrate::STORE).get(),
+                    outbox_version: migrate::latest_version(migrate::OUTBOX).get(),
                 })
                 .execute(&mut *conn)
                 .await?
@@ -1767,6 +1768,7 @@ impl Ctx {
                 shared_version: migrate::latest_version(migrate::SHARED).get(),
                 store: self.store.as_str(),
                 store_version: migrate::latest_version(migrate::STORE).get(),
+                outbox_version: migrate::latest_version(migrate::OUTBOX).get(),
             })
             .execute(&self.pool)
             .await?;

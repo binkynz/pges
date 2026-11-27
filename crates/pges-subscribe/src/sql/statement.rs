@@ -221,6 +221,7 @@ pges_postgres::typed_query! {
             shared_version: i32,
             store: &'q str,
             store_version: i32,
+            outbox_version: i32,
         },
         row {},
     }
@@ -239,6 +240,7 @@ pges_postgres::typed_query! {
             shared_version: i32,
             store: &'q str,
             store_version: i32,
+            outbox_version: i32,
         },
         row {},
     }

@@ -12,6 +12,7 @@ async fn renew(conn: &mut sqlx::PgConnection, fence: i64) -> Result<(), sqlx::Er
         fence,
         shared_version: 1,
         store_version: 1,
+        outbox_version: 1,
     });
 
     let row = statement::lease_stored_token::Query::fixed()

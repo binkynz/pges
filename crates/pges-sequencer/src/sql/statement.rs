@@ -77,6 +77,7 @@ pges_postgres::typed_query! {
             fence: i64,
             shared_version: i32,
             store_version: i32,
+            outbox_version: i32,
         },
         row {},
     }

@@ -1,7 +1,9 @@
 -- store/opt_dcb.sql
--- Optional, applied when a store uses Dynamic Consistency Boundaries. Same search_path rules as 0001.
--- Sets pges.stores.dcb; Store::open reads it and fails with OpenError::StoreRequiresFeature("dcb") when the
--- binary was built without the `dcb` feature, so no writer can skip the tag_heads bump.
+-- Optional, for a store using Dynamic Consistency Boundaries. Same search_path rules as 0001. No public path
+-- applies it (only a test does), it is not recorded in pges.migrations, and it is not frozen: DCB is not
+-- released. Sets pges.stores.dcb; Store::open refuses such a store with OpenError::StoreRequiresFeature("dcb"),
+-- because DCB appends (the tag_heads bump, commit_tags) are not implemented and a writer that skipped them
+-- would break the store's consistency boundaries.
 --
 -- Tags are hashed to int8 (xxh3 of the tag string). A collision only causes a spurious conflict on append
 -- or an extra row on read, which the client filters out by decoding, so correctness does not depend on it.

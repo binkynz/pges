@@ -204,6 +204,7 @@ fn render_append(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ident;
 
     /// The table the append of a store with `partitions` updates, when its pool's connections cache
     /// `capacity` statements.
@@ -211,7 +212,7 @@ mod tests {
         let probes = route::probes();
         let rows: Vec<statement::stream_leaves::Row> = (0..partitions)
             .map(|remainder| statement::stream_leaves::Row {
-                leaf: format!("streams_p{remainder:03}"),
+                leaf: ident::hash_partition("streams", remainder, partitions),
                 modulus: Some(i32::from(partitions)),
                 remainder: Some(i32::from(remainder)),
                 probes: Some(
@@ -243,8 +244,10 @@ mod tests {
 
     #[test]
     fn appends_name_partitions_only_while_their_statements_fit_the_statement_cache() {
-        let partition_64 = format!("streams_p{:03}", route::remainder(route::probes()[0], 64));
-        let partition_256 = format!("streams_p{:03}", route::remainder(route::probes()[0], 256));
+        let partition_64 =
+            ident::hash_partition("streams", route::remainder(route::probes()[0], 64), 64);
+        let partition_256 =
+            ident::hash_partition("streams", route::remainder(route::probes()[0], 256), 256);
 
         assert_eq!(append_target(64, 100), partition_64);
         assert_eq!(append_target(64, 99), "streams");

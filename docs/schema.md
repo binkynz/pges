@@ -18,10 +18,12 @@ order, the queries the crate runs and how partitions are maintained.
 | Small enums | `int2` with a CHECK and a comment, not Postgres enums (enums need DDL to extend) | `state`, `retention` |
 | Partitions | `<table>_<category>` for LIST, `<table>_<category>__<yyyymm[dd]>` for RANGE leaves | `commits_jobs__202611` |
 | Log partitions | `log_<first position / 10^8>` | `log_0042` |
-| Hash partitions | `<table>_p<remainder, 3 digits>` | `streams_p007` |
+| Hash partitions | `<table>_p<remainder>`, zero-padded to 3 digits, or to the digits of the highest remainder above 1000 partitions | `streams_p007`, `streams_p0007` |
 | Indexes | `<table>_<purpose>` | `log_by_category` |
 | Leaf indexes | `<leaf>_s` for the unique `(stream_id, last_version)` index | `commits_jobs__202611_s` |
 | Category partition keys | `commits_<category>__pkey`, named when the partition is created | `commits_jobs__pkey` |
+| Objects on `commits` itself | `commits__<name>`: `commits_<name>` is category `<name>`'s partition | |
+| Constraints over several columns | `<table>_<purpose>` | `categories_retain_for`, `scopes_window` |
 
 Category names are limited to `^[a-z][a-z0-9_]{0,39}$` so every generated name stays within PostgreSQL's
 63-byte limit, which it would otherwise silently truncate. For a 40-character category: `commits_<cat>` is 48
@@ -39,9 +41,16 @@ like another's leaf would take that leaf's name: `a_202611`'s partition would be
 another category's partition `commits_<cat>`, and it names its category unambiguously. The category
 partition's primary key is named `commits_<cat>__pkey` when the partition is created
 (`crates/pges-postgres/sql/category/create_partition.sql`), because the name PostgreSQL would derive,
-`commits_<cat>_pkey`, is category `<cat>_pkey`'s partition; for the same reason the primary key of `commits`
-is `commits__pkey`, not `commits_pkey` (category `pkey`). `ident::tests` checks that the names of categories
-named like each other's leaves, indexes and keys never collide.
+`commits_<cat>_pkey`, is category `<cat>_pkey`'s partition. For the same reason anything ever created on
+`commits` itself (an index, a constraint) is named `commits__<name>`, never `commits_<name>`; `commits` has
+none today. `ident::tests` checks that the names of categories named like each other's leaves, indexes and
+keys never collide.
+
+Hash partitions of `streams` and `snapshots` are named in store migration 0001. Up to 1000 partitions the
+remainder has 3 digits (`streams_p000` to `streams_p999`); above, every name takes the digits of the highest
+remainder (`streams_p0000` to `streams_p1000` for 1001), so no two collide. Before 0.1.0 they were cut to 3
+digits, and a store of 1001 partitions failed to create `streams_p100` twice. `stream_partitions` is a `u16`,
+so the longest name is `snapshots_p65534` (16 bytes).
 
 Leaves created before the `_s` suffix keep their old `_stream` index name: maintenance runs no DDL on existing
 leaves.
@@ -113,7 +122,8 @@ autovacuum after 4.7M updates, 33% of them non-HOT.
 
 ## Migrations
 
-The migrations are embedded in `pges-postgres` (`migrate::SHARED`, `migrate::STORE`) and applied by its runner
+The migrations are embedded in `pges-postgres` (`migrate::SHARED`, `migrate::STORE`, `migrate::OUTBOX`) and
+applied by its runner
 (`migrate::run_shared`, `migrate::run_store`, `migrate::run`, or `StoreConfig::migrate` with
 `AutoMigrate::CreateOrMigrate`). The migration texts are in `crates/pges-postgres/migrations/`, the runner's
 own statements in `crates/pges-postgres/sql/migrate/`.
@@ -129,18 +139,28 @@ own statements in `crates/pges-postgres/sql/migrate/`.
 - Store creation is a single transaction: `CREATE SCHEMA`, the `pges.stores` row
   (`crates/pges-postgres/sql/migrate/insert_store.sql`, with the final outbox flag and
   `StoreDefinition::max_clock_skew` and `max_txn_age`), store migration 0001, and `opt_outbox.sql` when
-  requested. `opt_dcb.sql` is applied by no public path, only by a test: DCB is not a public option. The
-  option scripts are not recorded in `pges.migrations`; the `pges.stores` flags record them. When an option
-  first needs a migration, it gets its own versioned scope (`<store>.outbox`, `<store>.dcb`).
-- `Store::open` checks the version, `min_compatible` and checksums of both scopes, and fails with
-  `SchemaBehind` unless auto-migrate is enabled.
+  requested.
+- `opt_outbox.sql` is version 1 (`opt_outbox`) of the store's outbox scope `<store>.outbox`
+  (`migrate::outbox_scope`; store names contain no `.`): it inserts its `pges.scopes` row, as 0001 does for
+  the store, and the runner records it in `pges.migrations` with its checksum. `migrate::run_store` checks
+  and completes the outbox scope of a store that has one, as it does the store's own; a store created
+  without the outbox has none and never gets one. A later outbox migration is `migrate::OUTBOX`'s next entry.
+- `opt_dcb.sql` is applied by no public path, only by a test: DCB is not a public option. It is not recorded
+  in `pges.migrations`, and it is not frozen (below); `pges.stores.dcb` records it, and `Store::open` refuses
+  such a store.
+- `Store::open` checks the version, `min_compatible` and checksums of the shared scope, the store's and,
+  for a store with the outbox, its outbox scope. A scope that is behind fails with `SchemaBehind` unless
+  auto-migrate is enabled, an edited migration with `ChecksumMismatch` (naming the scope, `<store>.outbox`
+  for an edited outbox script), and a scope whose `min_compatible` is above the crate's with `CrateTooOld`.
 - Lease renewals check `min_compatible` again (2026-11-27): `subscription/renew.sql` and
-  `subscription/checkpoint_renew.sql` in pges-subscribe (the shared scope and the subscription's store) and
-  `lease/renew.sql` in pges-sequencer (the shared scope and every store) update no row while a scope's
-  `min_compatible` is above the crate's newest migration for it, passed as parameters. The holder then reads
-  the scopes with `crates/pges-postgres/sql/migrate/too_old.sql` (`migrate::crate_too_old`) to tell this
-  from a lease another instance took, and stops with `CrateTooOld` (api.md, Rolling upgrades). A store
-  option's scope (`<store>.outbox`) has versions of its own and is not compared.
+  `subscription/checkpoint_renew.sql` in pges-subscribe (the shared scope, the subscription's store and its
+  outbox scope) and `lease/renew.sql` in pges-sequencer (the shared scope, every store and every outbox
+  scope) update no row while a scope's `min_compatible` is above the crate's newest migration for it, passed
+  as parameters. The holder then reads the scopes with `crates/pges-postgres/sql/migrate/too_old.sql`
+  (`migrate::crate_too_old`) to tell this from a lease another instance took, and stops with `CrateTooOld`
+  (api.md, Rolling upgrades). An outbox scope is compared with the crate's newest outbox migration, so a
+  later release can retire a crate that drains or fills `pending` the old way. Scopes of options this crate
+  does not know (`<store>.<option>`) are not compared.
 - Taking a lease checks the same scopes: `subscription/acquire.sql` and `lease/acquire.sql` compute the
   check once in a CTE and always return one row, whose `too_old` column says whether the check failed and
   whose other columns are NULL when no lease was taken. A failed check takes no lease and locks no lease
@@ -148,10 +168,12 @@ own statements in `crates/pges-postgres/sql/migrate/`.
   with `migrate::crate_too_old` for the error's details and stops with `CrateTooOld`, whether or not the
   lease was free. The resequence acquire (`lease/acquire_halted.sql`) is not checked; its renewals are,
   including the one just before it writes.
-- **Migration 0001 is frozen from 0.1.0 on.** The shared and store migrations `0001_init.sql`, and the option
-  scripts, are never edited again: every schema change after 0.1.0 is a new migration (`0002_...`), applied
-  by the runner on top of the existing one. An edited migration would fail every existing database with
-  `ChecksumMismatch`. Before 0.1.0, migrations were edited in place, so a database created by an unreleased
+- **Migration 0001 is frozen from 0.1.0 on.** The shared and store migrations `0001_init.sql`, and
+  `opt_outbox.sql` (outbox migration 1), are never edited again: every schema change after 0.1.0 is a new
+  migration (`0002_...`, or the next outbox migration), applied by the runner on top of the existing one. An
+  edited migration would fail every existing database with `ChecksumMismatch`. `opt_dcb.sql` is not frozen:
+  no release applies it, and DCB will get its own versioned scope (`<store>.dcb`) when it ships.
+  Before 0.1.0, migrations were edited in place, so a database created by an unreleased
   build fails with `ChecksumMismatch` and must be recreated. Test templates are keyed by the checksums, so
   they rebuild on their own.
 
@@ -278,8 +300,10 @@ returned a row.
   stream has not stored is then `CommitIdOutOfOrder` instead of `CommitIdSkew`; a new id (above
   `last_commit_id`, or for a new stream) is still checked. `append_many` keeps the plain check: its ids are
   always crate-generated and fresh.
-- `uuid_extract_timestamp` returns NULL for ids that are not uuidv7, so `pges.check_commit_id` accepts any
-  non-v7 id. The client only sends v7 `CommitId`s, but the SQL guard alone is weaker than it looks.
+- `pges.check_commit_id` refuses an id that is not a UUIDv7 with SQLSTATE `22023`, before the skew check and
+  whatever the tolerance: `uuid_extract_timestamp` returns NULL for most other versions, which the skew check
+  alone would let through, and a v1 id's timestamp is not a v7 one's. The crate only sends v7 `CommitId`s
+  (`CommitId::from_uuid` refuses others), so it maps the code to no error of its own.
 - `i.commit_id > s.last_commit_id` keeps commit ids increasing within a stream, so `first_commit_id` is a
   true minimum and `snapshots.commit_id` is a safe lower bound for reads. `least()` keeps the minimum even
   if the check is ever relaxed; `first_commit_id` is not indexed, so the update stays HOT.
@@ -344,8 +368,10 @@ Why the new id stays just above `last_commit_id` (design.md, Decided, Crate-gene
   still force retries. On the durable dev box, 16 writers went from 133 to 247 appends/s over 10 minutes
   (design.md, Durable dev-box run, 2026-11-26).
 
-A unique violation (23505) on the `commits` primary key means two different appends used the same commit
-id. Only a 23505 on a constraint named `*_pkey` (the leaf's commits key) counts; one on the per-leaf
+A unique violation (23505) on the commits key means two different appends used the same commit id in one
+category. `commits` itself has no key: each category partition has `PRIMARY KEY (commit_id)`, which each leaf
+copies as `<leaf>_pkey`, so a commit id is unique within a category and may repeat in another. Only a 23505
+on a constraint named `*_pkey` (the leaf's copy) counts; one on the per-leaf
 `(stream_id, last_version)` index is returned as a database error. Outside a transaction, after either
 `PGE01` or that 23505, the crate runs the classification query: if `done` is set it returns the original
 result as deduplicated, otherwise `CommitIdSkew` or `DuplicateCommit`. Inside a transaction it returns the
@@ -1167,7 +1193,8 @@ on the parent, and a request queued behind a long catch-up read would block ever
 matching CHECK constraint lets it skip the validation scan. Each attach still invalidates cached plans.
 
 - **Category registration** attaches an empty partitioned `commits_<cat>`: created detached and partitioned by
-  commit id, with its primary key named `commits_<cat>__pkey`
+  commit id, with its primary key `(commit_id)` named `commits_<cat>__pkey` (the category's: `commits` has no
+  key, and `category_id` is constant in the partition; each leaf gets a copy when it is attached)
   (`crates/pges-postgres/sql/category/create_partition.sql`), then attached under the category's id
   (`crates/pges-postgres/sql/category/attach_partition.sql`).
 - **Time leaves**, from the later of the newest leaf's upper bound and the bucket holding `now() - 1 hour`, up
@@ -1380,12 +1407,40 @@ matching CHECK constraint lets it skip the validation scan. Each attach still in
 
 ## Roles
 
-Role names are up to the deployment; the crate needs these capabilities. Integration tests run every
-statement under these roles, not as the owner.
+Role names are up to the deployment; the crate needs these capabilities. Integration tests run as a
+superuser; only a few run statements under a narrower role (a writer denied one `streams` partition, a store
+creator that does not own the publication), so these lists are not checked statement by statement.
+
+**Category partitions need their own grants.** Stream reads (`crates/pges-postgres/sql/read/stream.sql`) and
+subscription reads (`crates/pges-subscribe/sql/read/commits.sql`, `commits_sharded.sql`) name
+`<store>.commits_<cat>` directly, and PostgreSQL checks the privileges of the table a statement names, not
+of its parent. A grant on `commits` does not cover them, and `Admin::register_category` creates a new
+partition, as the owner, every time a category is registered. Grant `SELECT` on every table the owner creates
+in the store schema, before the first category is registered, and on the tables that already exist:
+
+```sql
+ALTER DEFAULT PRIVILEGES FOR ROLE <owner> IN SCHEMA <store> GRANT SELECT ON TABLES TO <writer>, <reader>;
+GRANT SELECT ON ALL TABLES IN SCHEMA <store> TO <writer>, <reader>;
+```
+
+The writer's other privileges go through `commits` (inserts route to the leaf; `delete_stream` deletes
+through `commits`), which PostgreSQL checks on `commits` alone. A writer that appends straight into its
+stream's `streams_p<n>` (`AppendRouting::Auto`) needs `INSERT` and `UPDATE` on every `streams` partition;
+without them appends go through `streams` (Append (one stream)).
+
+**The publication.** Store creation adds the store's `commits` to the publication `pges`
+(`crates/pges-postgres/migrations/store/0001_init.sql`, last statement), which needs the privileges of the
+publication's owner: the owner, a role that inherits from it, or a superuser. The publication is created by
+the shared migration, so its owner is the role that first migrated the database. Without those privileges,
+an outbox store is created outside the publication (the logical source never reads it), and a store for the
+logical source fails with SQLSTATE `42501`: added later, its commits made before then would never reach a
+slot that already exists. Without the publication (dropped, or a restore with `--no-publications`), store
+creation skips it, and the logical source creates it and adds every store before it streams (Logical
+source).
 
 | Role | Needs |
 |---|---|
-| owner | owns `pges` and store schemas; runs migrations, maintenance, `apply_retention`, `prune_log` and `set_writer_limits` (DDL, `VACUUM`, `UPDATE` on `pges.stores`; `pg_db_role_setting` is readable by PUBLIC). The one-source-kind trigger needs nothing more: it runs as the inserting role, and `pg_advisory_xact_lock` is executable by PUBLIC |
+| owner | owns `pges` and store schemas and, for the logical source, the publication `pges` (or inherits from its owner); runs migrations, maintenance, `apply_retention`, `prune_log` and `set_writer_limits` (DDL, `VACUUM`, `UPDATE` on `pges.stores`; `pg_db_role_setting` is readable by PUBLIC). The one-source-kind trigger needs nothing more: it runs as the inserting role, and `pg_advisory_xact_lock` is executable by PUBLIC |
 | writer | `INSERT`, `UPDATE` on `streams` (`UPDATE` also covers the `SELECT … FOR UPDATE` taken before a rerun with a new commit id); `INSERT` on `commits`, `pending`, `event_types`, `commit_tags`, `tag_heads`; `UPDATE` on `tag_heads`, `snapshots`; `INSERT` on `snapshots`; `DELETE` on `commits` and `snapshots` and `INSERT` on `deleted_commits` (`delete_stream`); `SELECT` on all, including `pges.stores` (`Store::open` reads the writer limits); `EXECUTE` on `pges.check_commit_id`. The outbox trigger's `pg_notify` needs nothing extra (PUBLIC). Set `transaction_timeout` and `idle_in_transaction_session_timeout` on the role, at most the store's `max_txn_age` |
 | reader | `SELECT` on store tables and `pges.scopes` (taking and renewing leases checks `min_compatible`); `SELECT`, `INSERT`, `UPDATE` on `subscriptions` and `backfills`; `SELECT`, `INSERT`, `UPDATE`, `DELETE` on `subscription_members` (the heartbeat deletes lapsed members, and leaving deletes the instance's own row). Replica reads need nothing more: `pg_current_wal_insert_lsn()`, `pg_last_wal_replay_lsn()`, `pg_is_in_recovery()`, `current_setting` and `pg_settings` are available to PUBLIC; the replica pool's role needs `SELECT` on the store tables |
 | sequencer | `REPLICATION` (logical source only); `SELECT` on `pges.sequencer`, `pges.scopes` (taking and renewing the lease checks `min_compatible`), `pges.stores`, `categories`, `pending`, `log`; `INSERT` on `log`; `UPDATE` on `categories`, `pges.stores`, `pges.sequencer`; `DELETE` on `pending`; `EXECUTE` on the `pg_replication_origin_*` functions for token option (a). `pg_current_wal_insert_lsn()` is executable by PUBLIC. Terminating the previous leader's walsender needs no extra grant when every sequencer instance uses the same role; otherwise grant `pg_signal_backend`. With the logical source and a missing publication: `CREATE` on the database (`CREATE PUBLICATION`) and ownership of the publication (`ALTER PUBLICATION … ADD TABLE`); `SELECT` on `commits` for the commits check before a new slot. With `watch-notify`: nothing extra (`pg_notify` is PUBLIC). `resequence`: `SELECT` on `pges.stores`, `commits` and `categories` (in the exported snapshot), `INSERT` on `log`, `UPDATE` on `categories` (the resequenced range) and `pges.sequencer`, `REPLICATION`; the writer-role check reads `pg_db_role_setting`, `pg_database` and `pg_roles` (PUBLIC) |
