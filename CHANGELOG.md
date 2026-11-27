@@ -58,6 +58,12 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crates
   also checks a partition's parent: a name taken by another relation fails with `NameTaken` (on
   `RegisterCategoryError`, `ChangeBucketError` and `MaintainError`) instead of being skipped or dropped.
   Store migration 0001 changed in place (nothing is published yet).
+- **Late retries in a transaction are deduplicated** (`pges-postgres`). A caller-supplied commit id that
+  already committed on the stream returns `Outcome::Deduplicated` in a unit of work and in `append_in`
+  inside a transaction too, even when the retry comes later than `max_clock_skew`. Before, the skew check
+  ran first and the retry failed with `CommitIdSkew`, aborting the caller's transaction; only appends
+  outside a transaction looked the id up. Only ids above the stream's last commit id are checked against
+  the skew now, so a late id the stream has not stored is `CommitIdOutOfOrder`.
 - **The logical source ends only walsenders** (`pges-sequencer`). Before `START_REPLICATION` it ended
   whichever process held the slot, including a session running `pg_drop_replication_slot` or another slot
   function. A drop ended mid-call could remove the slot while its client saw an error. Now only a walsender

@@ -136,6 +136,135 @@ async fn retries_past_the_skew_window_are_deduplicated() -> Result<()> {
     f.finish().await
 }
 
+/// A commit id past the skew window that is already stored is deduplicated in every mode: a unit of work, an
+/// `append_in` inside a transaction and a snapshot append, which raise no error to classify, as well as
+/// autocommit. The unit of work still commits. Without the stream's last commit id in the skew check, the
+/// transaction modes failed with `CommitIdSkew` and aborted the transaction.
+#[tokio::test]
+async fn late_retries_are_deduplicated_in_every_mode() -> Result<()> {
+    let f = Fixture::new().await?;
+    let mut config = store::StoreConfig::new(common::STORE_NAME);
+    config.max_clock_skew = Some(Duration::from_millis(500));
+    let tight = store::Store::open(f.pool.clone(), config).await?;
+    let events = [JobEvent::created("a")];
+    let late = || commit_id_at(Duration::from_secs(3), false);
+
+    let first = late();
+    let id = stream::StreamId::new_v7();
+    f.store
+        .append(id, version::ExpectedVersion::NoStream, &events)
+        .commit_id(first)
+        .await?;
+    let second = late();
+    f.store
+        .append(id, version::ExpectedVersion::Exact(v(1)), &events)
+        .commit_id(second)
+        .await?;
+
+    let retry = tight
+        .append(id, version::ExpectedVersion::NoStream, &events)
+        .commit_id(first)
+        .await?;
+    assert_eq!(retry.outcome, append::Outcome::Deduplicated, "autocommit");
+    assert_eq!(retry.versions, v(1)..=v(1));
+
+    let retry = tight
+        .append(id, version::ExpectedVersion::Exact(v(1)), &events)
+        .commit_id(second)
+        .snapshot_after(&common::Job::default())
+        .await?;
+    assert_eq!(retry.outcome, append::Outcome::Deduplicated, "snapshot");
+    assert_eq!(retry.versions, v(2)..=v(2));
+
+    let other = stream::StreamId::new_v7();
+    let mut uow = tight.begin().await?;
+    let retry = uow
+        .append(id, version::ExpectedVersion::NoStream, &events)
+        .commit_id(first)
+        .await?;
+    assert_eq!(retry.outcome, append::Outcome::Deduplicated, "unit of work");
+    assert_eq!(retry.versions, v(1)..=v(1));
+    let retry = uow
+        .append(id, version::ExpectedVersion::Any, &events)
+        .commit_id(second)
+        .await?;
+    assert_eq!(retry.outcome, append::Outcome::Deduplicated, "unit of work");
+    assert_eq!(retry.versions, v(2)..=v(2));
+    uow.append(other, version::ExpectedVersion::NoStream, &events)
+        .await?;
+    uow.commit().await?;
+
+    let mut conn = f.pool.acquire().await?;
+    let mut tx = conn.begin().await?;
+    let retry = tight
+        .append_in(&mut tx, id, version::ExpectedVersion::Exact(v(1)), &events)
+        .commit_id(second)
+        .await?;
+    assert_eq!(retry.outcome, append::Outcome::Deduplicated, "append_in");
+    tx.commit().await?;
+    drop(conn);
+
+    let versions: Vec<i64> = sqlx::query_scalar(
+        "SELECT version FROM es.streams WHERE stream_id = ANY($1) ORDER BY stream_id = $2",
+    )
+    .bind(vec![id.as_uuid(), other.as_uuid()])
+    .bind(id.as_uuid())
+    .fetch_all(&f.pool)
+    .await?;
+    assert_eq!(
+        versions,
+        [1, 2],
+        "the unit of work committed its new stream"
+    );
+    f.finish().await
+}
+
+/// A late commit id the stream has not stored is still refused: below the stream's last commit id it is out
+/// of order, and a new id outside the skew window is `CommitIdSkew`, in a unit of work too.
+#[tokio::test]
+async fn late_commit_ids_that_were_not_stored_are_refused() -> Result<()> {
+    let f = Fixture::new().await?;
+    let mut config = store::StoreConfig::new(common::STORE_NAME);
+    config.max_clock_skew = Some(Duration::from_millis(500));
+    let tight = store::Store::open(f.pool.clone(), config).await?;
+    let events = [JobEvent::created("a")];
+    let behind = commit_id_at(Duration::from_secs(3), false);
+    let id = stream_with(&f, &events).await?;
+
+    let error = tight
+        .append(id, version::ExpectedVersion::Any, &events)
+        .commit_id(behind)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, append::AppendError::CommitIdOutOfOrder { commit_id, .. } if commit_id == behind),
+        "{error}"
+    );
+
+    let mut uow = tight.begin().await?;
+    let error = uow
+        .append(id, version::ExpectedVersion::Any, &events)
+        .commit_id(behind)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, append::AppendError::CommitIdOutOfOrder { .. }),
+        "{error}"
+    );
+    let ahead = commit_id_at(Duration::from_secs(60), true);
+    let error = uow
+        .append(id, version::ExpectedVersion::Any, &events)
+        .commit_id(ahead)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, append::AppendError::CommitIdSkew(c) if c == ahead),
+        "{error}"
+    );
+    uow.rollback().await?;
+    f.finish().await
+}
+
 /// Row "no stream, expected = Any": the update's snapshot cannot see a concurrent creation; one retry wins.
 #[tokio::test]
 async fn any_racing_the_stream_creation_is_retried() -> Result<()> {
@@ -1063,12 +1192,13 @@ async fn an_append_locks_only_the_streams_partition_it_writes() -> Result<()> {
 }
 
 /// Most relation locks held after an append to an existing stream, counted before any other query in the
-/// transaction: the stream's partition of `streams` and its key, and the category's partition of `commits`,
-/// its leaf and their indexes.
-const APPEND_RELATION_LOCKS: i64 = 7;
+/// transaction: the stream's partition of `streams` and its key, each in two modes (the skew check reads the
+/// stream's `last_commit_id` before the update), and the category's partition of `commits`, its leaf and their
+/// indexes.
+const APPEND_RELATION_LOCKS: i64 = 9;
 
 /// [`APPEND_RELATION_LOCKS`] in a store with the outbox, which also inserts into `pending`.
-const APPEND_OUTBOX_RELATION_LOCKS: i64 = 9;
+const APPEND_OUTBOX_RELATION_LOCKS: i64 = 11;
 
 /// A store whose `streams` partitions the client cannot name exactly (here one needs quoting) appends
 /// through `streams` itself, to every partition.

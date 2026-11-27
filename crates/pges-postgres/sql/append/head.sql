@@ -7,7 +7,11 @@
 --
 -- The client always generates the commit id, so an append whose response was lost can be retried.
 -- pges.check_commit_id raises SQLSTATE PGE01 when the id's timestamp is more than $9 from
--- statement_timestamp(); it accepts ids that are not UUIDv7, whose timestamp is NULL.
+-- statement_timestamp(); it accepts ids that are not UUIDv7, whose timestamp is NULL. An id at or below the
+-- stream's last_commit_id is not checked (infinite tolerance): the append cannot apply, so it returns no row
+-- and append/classify.sql reports a retry of a stored commit as deduplicated however late it comes, in a
+-- transaction too, where an error would abort it. last_commit_id only grows, so the statement's snapshot is
+-- enough to decide. The function still runs once per statement.
 --
 -- `i.commit_id > s.last_commit_id` keeps commit ids increasing within a stream, so first_commit_id is a true
 -- minimum and a snapshot's commit id is a safe lower bound for reads. It also makes every retry of an append
@@ -20,7 +24,7 @@
 -- with PostgreSQL's partition hash, so no plan has partitions to prune. A plan through streams prunes only
 -- when it is custom: PostgreSQL 18 locks every partition of a generic plan before run-time pruning, and the
 -- plan cache keeps a generic plan when the partitions were analyzed nearly empty or under
--- `force_generic_plan` (70 locks at 64 partitions, against 7 here). On the partition, the cached generic plan
+-- `force_generic_plan` (70 locks at 64 partitions, against 9 here). On the partition, the cached generic plan
 -- is as good as a custom one, so an append is not planned again after its sixth run on a connection. A store
 -- whose partitions it cannot name exactly renders streams here instead.
 --
@@ -33,7 +37,9 @@ WITH input AS MATERIALIZED (
          $3::int8  AS expected,
          $4::int2  AS event_count, $5::int2 AS format,
          $6::bytea AS payload,     $7::text AS stream_key,
-         pges.check_commit_id($8::uuid, $9::interval) AS commit_id
+         pges.check_commit_id($8::uuid,
+           CASE WHEN $8::uuid <= (SELECT s.last_commit_id FROM {store}.{stream_table} s WHERE s.stream_id = $1)
+                THEN 'infinity' ELSE $9::interval END) AS commit_id
 ),
 created AS (
   INSERT INTO {store}.{stream_table} (version, stream_id, first_commit_id, last_commit_id, category_id, stream_key)
