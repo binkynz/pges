@@ -134,6 +134,56 @@ async fn a_partition_name_taken_by_another_relation_is_refused() -> Result<()> {
     f.finish().await
 }
 
+/// The name of an index the crate creates, a category partition's primary key or a leaf's `_s` index, taken
+/// by a relation of the store's schema fails registration with `NameTaken` naming it, not with SQLSTATE
+/// 42P07; the relation stays, no leaf is left detached, and registration works once the name is free.
+#[tokio::test]
+async fn an_index_name_taken_by_another_relation_is_refused() -> Result<()> {
+    let f = Fixture::new().await?;
+    let admin = f.store.admin();
+    let month = this_month(&f.pool).await?;
+    let leaf = format!("commits_parts__{month}");
+
+    for taken in ["commits_parts__pkey".to_owned(), format!("{leaf}_s")] {
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SEQUENCE es.{taken}")))
+            .execute(&f.pool)
+            .await?;
+
+        let error = admin
+            .register_category(category!("parts"), admin::CategoryConfig::default())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, admin::RegisterCategoryError::NameTaken { name } if name.as_str() == taken),
+            "{error}"
+        );
+        let kind: String =
+            sqlx::query_scalar("SELECT relkind::text FROM pg_class WHERE oid = to_regclass($1)")
+                .bind(format!("es.{taken}"))
+                .fetch_one(&f.pool)
+                .await?;
+        assert_eq!(kind, "S", "the sequence is left alone");
+        let leaf_exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(format!("es.{leaf}"))
+            .fetch_one(&f.pool)
+            .await?;
+        assert!(!leaf_exists, "no leaf is left detached");
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SEQUENCE es.{taken}")))
+            .execute(&f.pool)
+            .await?;
+    }
+
+    admin
+        .register_category(category!("parts"), admin::CategoryConfig::default())
+        .await?;
+    assert_eq!(
+        parent(&f.pool, &leaf).await?,
+        Some("commits_parts".to_owned())
+    );
+    f.finish().await
+}
+
 /// An append whose category has no leaf for its commit id fails with `NoPartition`, in every append path,
 /// and works again once maintenance has created the leaves.
 #[tokio::test]
@@ -226,6 +276,77 @@ async fn an_append_without_its_category_partition_fails_with_no_partition() -> R
         matches!(error, append::AppendError::NoPartition { category, .. } if category == ORDERS),
         "{error}"
     );
+    f.finish().await
+}
+
+/// A batch over several categories, one of which has lost its partition of `commits`, fails with
+/// `NoPartition` naming that category, wherever its entry is in the batch, through `append_many` and a unit
+/// of work.
+#[tokio::test]
+async fn a_batch_over_categories_without_one_category_partition_fails_with_no_partition()
+-> Result<()> {
+    let f = Fixture::new().await?;
+    sqlx::query("ALTER TABLE es.commits DETACH PARTITION es.commits_orders")
+        .execute(&f.pool)
+        .await?;
+    let created = [JobEvent::created("a")];
+    let placed = [OrderEvent::Placed(Placed { total: 1 })];
+    let is_orders = |error: &append::AppendError| matches!(error, append::AppendError::NoPartition { category, .. } if *category == ORDERS);
+
+    let orders_last = f
+        .store
+        .append_many([
+            append::AppendEntry::new(
+                stream::StreamId::new_v7(),
+                version::ExpectedVersion::NoStream,
+                &created,
+            ),
+            append::AppendEntry::new(
+                stream::StreamId::new_v7(),
+                version::ExpectedVersion::NoStream,
+                &placed,
+            ),
+        ])
+        .await
+        .unwrap_err();
+    assert!(is_orders(&orders_last), "{orders_last}");
+
+    let orders_first = f
+        .store
+        .append_many([
+            append::AppendEntry::new(
+                stream::StreamId::new_v7(),
+                version::ExpectedVersion::NoStream,
+                &placed,
+            ),
+            append::AppendEntry::new(
+                stream::StreamId::new_v7(),
+                version::ExpectedVersion::NoStream,
+                &created,
+            ),
+        ])
+        .await
+        .unwrap_err();
+    assert!(is_orders(&orders_first), "{orders_first}");
+
+    let mut uow = f.store.begin().await?;
+    let in_work = uow
+        .append_many([
+            append::AppendEntry::new(
+                stream::StreamId::new_v7(),
+                version::ExpectedVersion::NoStream,
+                &created,
+            ),
+            append::AppendEntry::new(
+                stream::StreamId::new_v7(),
+                version::ExpectedVersion::NoStream,
+                &placed,
+            ),
+        ])
+        .await
+        .unwrap_err();
+    assert!(is_orders(&in_work), "{in_work}");
+    drop(uow);
     f.finish().await
 }
 

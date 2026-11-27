@@ -51,6 +51,24 @@ impl DbError {
         .then(|| error.table())
         .flatten()
     }
+
+    /// The value of the one-column partition key `column` that no partition took, from the detail of the
+    /// routing error: `Partition key of the failing row contains (category_id) = (3).` The sentence is
+    /// translated with `lc_messages` and the key text is not, so only `(<column>) = (<value>)` is read.
+    /// PostgreSQL leaves the detail out when the role may not read the key column or the table has row-level
+    /// security.
+    pub(crate) fn unrouted_key(&self, column: &str) -> Option<&str> {
+        let detail = self
+            .source
+            .as_database_error()?
+            .try_downcast_ref::<PgDatabaseError>()?
+            .detail()?;
+        let marker = format!("({column}) = (");
+        let start = detail.find(&marker)? + marker.len();
+        let value = &detail[start..];
+
+        value.find(')').map(|end| &value[..end])
+    }
 }
 
 /// SQLSTATE 23514: a row fails a CHECK constraint, or no partition takes it.

@@ -295,6 +295,11 @@ pub enum AppendError {
     /// transaction is aborted. Run `maintain`, then retry. [`Admin::partition_headroom`](crate::admin::Admin::partition_headroom)
     /// tells how far ahead the leaves reach, so this can be alerted on before it happens. In an
     /// [`store::Store::append_many`], `commit_id` is that of the batch's first commit in the category.
+    ///
+    /// It is also returned when the category's partition of `commits` itself is missing (detached or dropped
+    /// by hand). For a batch over several categories, the category is then read from PostgreSQL's error
+    /// detail, which PostgreSQL leaves out when the role may not read `commits.category_id` or `commits` has
+    /// row-level security; without it the error stays [`AppendError::Database`].
     #[error("no partition of category {category} takes commit id {commit_id}: run Admin::maintain")]
     NoPartition {
         /// The category.
@@ -533,8 +538,9 @@ impl AppendError {
 /// Turns a database error from routing a commit to its partition into [`AppendError::NoPartition`].
 ///
 /// Only an error that names `commits` or the category partition of one of the commits counts. `commits`
-/// itself finds no partition only when a category's partition is missing; it then names the category when
-/// the commits are all in one.
+/// itself finds no partition only when a category's partition is missing. The category is then the commits'
+/// one when they are all in one, and otherwise the one whose id the error's detail names; a detail that is
+/// missing or names no category of the commits leaves the error as it is.
 pub(crate) fn no_partition(
     error: AppendError,
     store: &store::Store,
@@ -552,8 +558,15 @@ pub(crate) fn no_partition(
         .find(|p| table == ident::category_partition(p.category.name.as_str()));
     let in_commits = || {
         let first = prepared.first()?;
-        (table == "commits" && prepared.iter().all(|p| p.category.id == first.category.id))
-            .then_some(first)
+        if table != "commits" {
+            return None;
+        }
+        if prepared.iter().all(|p| p.category.id == first.category.id) {
+            return Some(first);
+        }
+
+        let id = database.unrouted_key("category_id")?.parse::<i32>().ok()?;
+        prepared.iter().find(|p| p.category.id.get() == id)
     };
     match in_partition.or_else(in_commits) {
         Some(unrouted) => AppendError::NoPartition {

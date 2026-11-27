@@ -56,7 +56,14 @@ The first release: `pges`, `pges-core`, `pges-derive`, `pges-postgres`, `pges-su
   `Admin::maintain` before appends fail.
 - **`AppendError::NoPartition`** (`pges-postgres`). An append whose commit id no leaf of its category takes
   (maintenance stopped for about `LEAVES_AHEAD` buckets) fails with `NoPartition { category, commit_id }`
-  instead of a raw database error (SQLSTATE 23514). `delete_stream` reports it as `Write(NoPartition)`.
+  instead of a raw database error (SQLSTATE 23514), and so does one whose category partition of `commits`
+  is missing, also in an `append_many` over several categories (named from PostgreSQL's error detail;
+  without the detail, which PostgreSQL omits when the role may not read `commits.category_id`, it stays a
+  database error). `delete_stream` reports it as `Write(NoPartition)`.
+- **`NameTaken`** (`pges-postgres`). `register_category`, `change_bucket` and `maintain` fail with
+  `NameTaken { name }` when a partition's name, or the name of an index the crate creates for one (a category
+  partition's primary key `commits_<cat>__pkey`, a leaf's `<leaf>_s`), is taken by another relation of the
+  store's schema, instead of a raw database error (SQLSTATE 42P07). Nothing is dropped or attached under it.
 
 ### Stability
 
