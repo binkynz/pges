@@ -9,16 +9,18 @@ mod common;
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use anyhow::Result;
-use sqlx::{Connection, Executor};
+use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
+use sqlx::{Connection, Executor, PgConnection};
 
-use pges_core::{category, high_water, non_empty, stream};
+use pges_core::{category, high_water, interval, non_empty, stream};
 use pges_subscribe::{
+    batch, handler, replica,
     subscription::StoreExt,
     subscription_name,
     waker::{self, notify},
@@ -185,88 +187,267 @@ async fn a_forged_notice_neither_spins_nor_silences_a_sharded_subscription() -> 
 /// it, so without a fallback the subscription stops delivering.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_forged_lsn_does_not_stall_a_replica_subscription() -> Result<()> {
-    let pair = pges_testing::replica::Pair::start().await?;
-    let db = pair.create_database("t_forged_lsn").await?;
-    let mut conn = db.connect().await?;
-    pges_testing::create_store(
-        &mut conn,
-        &common::STORE_NAME,
-        &pges_testing::definition(pges_postgres::store::Outbox::Enabled),
-    )
-    .await?;
-    conn.execute(
-        "CREATE TABLE public.delivered (
-           seq int8 GENERATED ALWAYS AS IDENTITY PRIMARY KEY, position int8 NOT NULL,
-           commit_id uuid NOT NULL, category_id int4 NOT NULL, subscriber text NOT NULL DEFAULT '')",
-    )
-    .await?;
-    let pool = db.pool().await?;
-    let admin = pges_postgres::admin::Admin::new(pool.clone(), common::STORE_NAME);
-    admin
-        .register_category(
-            <common::JobEvent as pges_core::event::Event>::CATEGORY,
-            pges_postgres::admin::CategoryConfig::default(),
-        )
-        .await?;
-    admin.maintain().await?;
-    let store = pges_postgres::store::Store::open(
-        pool.clone(),
-        pges_postgres::store::StoreConfig::new(common::STORE_NAME),
-    )
-    .await?;
-    store.register::<common::JobEvent>().await?;
-    pair.caught_up().await?;
-    let replica_pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&pair.replica_url(db.name())?)
-        .await?;
-    let sequencer = common::Sequencer::start_on(db.pool().await?, common::Sequencer::config())?;
-    sequencer.wait_leading().await?;
+    let on = OnReplica::start("t_forged_lsn").await?;
 
     let running = common::Running::spawn(
-        store
+        on.store
             .subscription(subscription_name!("replica"))
             .categories(non_empty![category!("jobs")])
-            .waker(notify::NotifyWaker::new(&store))
-            .replica(replica_pool.clone())
+            .waker(notify::NotifyWaker::new(&on.store))
+            .replica(on.replica_pool.clone())
             .run_pg(Recorder::new("replica")),
     );
     let job = stream::StreamId::new_v7();
-    store
-        .append(
-            job,
-            pges_core::version::ExpectedVersion::Any,
-            &[common::JobEvent::Noted { n: 0 }],
-        )
-        .await?;
+    on.append(job, 0).await?;
     running.wait_position(1).await?;
     // Listening by now.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    pool.execute("NOTIFY pges_es, '1;2;FFFFFFFF/FFFFFFFF;*'")
+    on.pool
+        .execute("NOTIFY pges_es, '1;2;FFFFFFFF/FFFFFFFF;*'")
         .await?;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    store
-        .append(
-            job,
-            pges_core::version::ExpectedVersion::Any,
-            &[common::JobEvent::Noted { n: 1 }],
-        )
-        .await?;
+    on.append(job, 1).await?;
     let reached = running.wait_position(2).await;
     let position = running.handle.status().position;
 
     running.handle.shutdown().await?;
-    sequencer.stop().await?;
-    replica_pool.close().await;
-    pool.close().await;
-    drop(conn);
-    db.cleanup().await?;
-    pair.stop().await?;
+    on.finish().await?;
 
     assert!(
         reached.is_ok(),
         "the subscription stayed at {position:?} for 20 s after a forged LSN"
     );
     Ok(())
+}
+
+/// A shard busy through two wakes sees only the second. Here the first was for the shard's own event, at an
+/// LSN the lagging replica has not replayed, and the second is a forged notice with an LSN the replica passed
+/// long ago. The waker does not wake for a notice twice, so a shard that took the second wake's LSN as the
+/// WAL position to wait for would read the stale replica, find nothing, and wait out `max_idle`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forged_lsn_does_not_hide_a_wake_a_busy_shard_missed() -> Result<()> {
+    let on = OnReplica::start("t_forged_missed").await?;
+    let (calm, busy) = one_stream_per_shard();
+    let (entered, mut entering) = tokio::sync::mpsc::unbounded_channel();
+    let (delivered, mut delivering) = tokio::sync::mpsc::unbounded_channel();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+
+    let running = common::Running::spawn(
+        on.store
+            .subscription(subscription_name!("missed"))
+            .categories(non_empty![category!("jobs")])
+            .sharded(pges_subscribe::shards!(2))
+            // Longer than the test waits: only a wake can deliver in time.
+            .max_idle(interval!(15 s))
+            .waker(notify::NotifyWaker::new(&on.store))
+            .replica(
+                replica::Replica::new(on.replica_pool.clone())
+                    .fallback(interval!(200 ms), replica::FallbackLimit::new(2)),
+            )
+            .run_pg(Gated {
+                recorder: Recorder::new("missed"),
+                held: busy,
+                holding: Arc::new(AtomicBool::new(false)),
+                entered,
+                gate: gate.clone(),
+                delivered,
+            }),
+    );
+
+    on.append(calm, 0).await?;
+    wait_delivered(&mut delivering, 1, Duration::from_secs(20)).await?;
+    // Both shards wait, and the waker listens.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // The busy shard's handler holds its event; the calm shard reads after the same wake and waits again.
+    on.append(busy, 0).await?;
+    tokio::time::timeout(Duration::from_secs(20), entering.recv())
+        .await
+        .context("the busy shard's handler was not called")?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The replica stops replaying. The next event's notice wakes only the calm shard: the busy one is still
+    // in its handler.
+    on.pair.pause_replay().await?;
+    on.append(busy, 1).await?;
+    common::wait_sequenced(&on.pool, 3).await?;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    // A forged notice with a low LSN makes the latest wake.
+    on.pool
+        .execute("NOTIFY pges_es, '1;9223372036854775807;0/1;*'")
+        .await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let released = Instant::now();
+    gate.add_permits(1);
+    let reached = wait_delivered(&mut delivering, 3, Duration::from_secs(10)).await;
+    let took = released.elapsed();
+
+    on.pair.resume_replay().await?;
+    running.stop().await?;
+    on.finish().await?;
+
+    assert!(
+        reached.is_ok(),
+        "the busy shard's second event was not delivered within 10 s of its handler returning \
+         ({took:?}, max_idle 15 s): {reached:?}"
+    );
+    Ok(())
+}
+
+/// A store on the primary of a replica pair, with a sequencer and a pool on the replica.
+struct OnReplica {
+    pair: pges_testing::replica::Pair,
+    db: pges_testing::TestDb,
+    conn: PgConnection,
+    pool: sqlx::PgPool,
+    store: pges_postgres::store::Store,
+    replica_pool: sqlx::PgPool,
+    sequencer: common::Sequencer,
+}
+
+impl OnReplica {
+    async fn start(database: &str) -> Result<Self> {
+        let pair = pges_testing::replica::Pair::start().await?;
+        let db = pair.create_database(database).await?;
+        let mut conn = db.connect().await?;
+        pges_testing::create_store(
+            &mut conn,
+            &common::STORE_NAME,
+            &pges_testing::definition(pges_postgres::store::Outbox::Enabled),
+        )
+        .await?;
+        conn.execute(
+            "CREATE TABLE public.delivered (
+               seq int8 GENERATED ALWAYS AS IDENTITY PRIMARY KEY, position int8 NOT NULL,
+               commit_id uuid NOT NULL, category_id int4 NOT NULL, subscriber text NOT NULL DEFAULT '')",
+        )
+        .await?;
+        let pool = db.pool().await?;
+        let admin = pges_postgres::admin::Admin::new(pool.clone(), common::STORE_NAME);
+        admin
+            .register_category(
+                <common::JobEvent as pges_core::event::Event>::CATEGORY,
+                pges_postgres::admin::CategoryConfig::default(),
+            )
+            .await?;
+        admin.maintain().await?;
+        let store = pges_postgres::store::Store::open(
+            pool.clone(),
+            pges_postgres::store::StoreConfig::new(common::STORE_NAME),
+        )
+        .await?;
+        store.register::<common::JobEvent>().await?;
+        pair.caught_up().await?;
+        let replica_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&pair.replica_url(db.name())?)
+            .await?;
+        let sequencer = common::Sequencer::start_on(db.pool().await?, common::Sequencer::config())?;
+        sequencer.wait_leading().await?;
+
+        Ok(Self {
+            pair,
+            db,
+            conn,
+            pool,
+            store,
+            replica_pool,
+            sequencer,
+        })
+    }
+
+    async fn append(&self, job: stream::StreamId, n: u32) -> Result<()> {
+        self.store
+            .append(
+                job,
+                pges_core::version::ExpectedVersion::Any,
+                &[common::JobEvent::Noted { n }],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn finish(self) -> Result<()> {
+        self.sequencer.stop().await?;
+        self.replica_pool.close().await;
+        self.pool.close().await;
+        drop(self.conn);
+        self.db.cleanup().await?;
+        self.pair.stop().await
+    }
+}
+
+/// Records each batch, and holds the first one with an event of `held` until the gate opens. Sends every
+/// position it delivered on `delivered`.
+#[derive(Clone)]
+struct Gated {
+    recorder: Recorder,
+    held: stream::StreamId,
+    holding: Arc<AtomicBool>,
+    entered: tokio::sync::mpsc::UnboundedSender<()>,
+    gate: Arc<tokio::sync::Semaphore>,
+    delivered: tokio::sync::mpsc::UnboundedSender<u64>,
+}
+
+impl handler::PgHandler for Gated {
+    async fn handle(
+        &mut self,
+        tx: &mut PgConnection,
+        batch: &batch::Batch,
+    ) -> Result<(), handler::HandlerError> {
+        self.recorder.record(tx, batch).await?;
+        let events: Vec<&batch::RawEvent> = batch
+            .iter()
+            .filter_map(|record| match record {
+                batch::RawRecorded::Event(raw) => Some(raw),
+                _ => None,
+            })
+            .collect();
+
+        let holds = events.iter().any(|raw| raw.stream_id == self.held);
+        if holds && !self.holding.swap(true, Ordering::SeqCst) {
+            let _ = self.entered.send(());
+            let _permit = self.gate.acquire().await;
+        }
+        for raw in events {
+            let _ = self.delivered.send(raw.position.get());
+        }
+        Ok(())
+    }
+}
+
+async fn wait_delivered(
+    delivering: &mut tokio::sync::mpsc::UnboundedReceiver<u64>,
+    position: u64,
+    within: Duration,
+) -> Result<()> {
+    tokio::time::timeout(within, async {
+        while let Some(delivered) = delivering.recv().await {
+            if delivered >= position {
+                return Ok(());
+            }
+        }
+        anyhow::bail!("the subscription stopped")
+    })
+    .await
+    .with_context(|| format!("position {position} was not delivered within {within:?}"))?
+}
+
+/// A stream in shard 0 and one in shard 1 of 2, as `Builder::sharded` documents the shard of a stream.
+fn one_stream_per_shard() -> (stream::StreamId, stream::StreamId) {
+    let shard = |id: stream::StreamId| {
+        let digest = Sha256::digest(id.as_uuid().as_bytes());
+        let first: [u8; 8] = digest[..8].try_into().unwrap();
+        (u64::from_be_bytes(first) & i64::MAX as u64) % 2
+    };
+    let mut streams = [None, None];
+    while streams.iter().any(Option::is_none) {
+        let id = stream::StreamId::new_v7();
+        streams[usize::try_from(shard(id)).unwrap()].get_or_insert(id);
+    }
+
+    (streams[0].unwrap(), streams[1].unwrap())
 }
