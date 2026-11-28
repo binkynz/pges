@@ -8,9 +8,16 @@
 -- shape takes effect on the next save. One of a lower state version never does: during a rolling deploy the
 -- old code cannot overwrite the new code's snapshot. The stored version never goes down, so a snapshot that
 -- retention relied on before raising the stream's floor stays at or above that floor.
+--
+-- Nothing is saved for a stream that was deleted (state 2) or does not exist: a save from a load made before
+-- delete_stream would otherwise store the deleted state again. The stream's row is locked FOR KEY SHARE, which
+-- conflicts with the FOR UPDATE lock delete_stream takes first: a deletion in progress makes the save wait and
+-- then see the stream deleted, and a save in progress makes the deletion wait, then delete its snapshot.
+-- Appends take a weaker lock and do not wait for it.
 INSERT INTO {store}.snapshots
   (version, stream_id, commit_id, category_id, state_version, format, state)
 SELECT $1, $2, $3, $4, $5, $6, $7 WHERE $1 >= $8
+  AND EXISTS (SELECT FROM {store}.streams s WHERE s.stream_id = $2 AND s.state <> 2 FOR KEY SHARE)
 ON CONFLICT (stream_id) DO UPDATE SET
   version = EXCLUDED.version, commit_id = EXCLUDED.commit_id,
   category_id = EXCLUDED.category_id, state_version = EXCLUDED.state_version,

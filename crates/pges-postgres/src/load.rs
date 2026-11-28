@@ -76,7 +76,7 @@ impl store::Store {
     }
 
     /// Saves a snapshot of a loaded aggregate, unless the stored one is as new. Does nothing for a stream
-    /// that does not exist.
+    /// that does not exist or was deleted, also when it was deleted after the load.
     ///
     /// A stored snapshot of a lower [`aggregate::Snapshotted::SNAPSHOT_VERSION`] is replaced when this one is
     /// at its version or newer; one of a higher state version is never replaced, so code that still has an

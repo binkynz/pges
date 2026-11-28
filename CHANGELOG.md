@@ -20,7 +20,8 @@ The first release: `pges`, `pges-core`, `pges-derive`, `pges-postgres`, `pges-su
   whose `append_many` failed or was dropped before it completed (it may have written part of its batch),
   or whose `append` was dropped before it completed, refuses to commit, with `TransactionError::Aborted`.
 - **Reads and aggregates.** Stream reads, `load` of an `Aggregate`, snapshots (`load_snapshotted`,
-  `save_snapshot`), stream deletion.
+  `save_snapshot`), stream deletion. A snapshot save for a deleted stream stores nothing, also one from a
+  load made before the deletion.
 - **Events** (`pges-core`, `pges-derive`). `#[derive(Event)]` gives each variant a stable type name and a
   schema version, with upcasting from older versions. JSON codec by default. A versioned payload frame.
 - **Metadata.** Correlation id, causation id, actor, W3C trace context and string pairs on each commit; an
