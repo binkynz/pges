@@ -539,12 +539,20 @@ impl<'a> AppendMany<'a> {
         let result = match target {
             Target::Pool(store) => append_many_pooled(store, &mut prepared).await,
             Target::Connection {
-                store, conn, state, ..
+                store,
+                conn,
+                mut state,
+                ..
             } => {
-                let result = append_many_with_custom_plans(store, conn, &mut prepared).await;
-                // A failed batch may have written some of its streams; only a rollback undoes that.
-                if let (Err(_), Some(state)) = (&result, state) {
+                // A batch that fails, or is dropped before it finishes, may have written some of its streams;
+                // only a rollback undoes that. So the unit of work counts as failed until the batch succeeds.
+                let before = state.as_deref().copied();
+                if let Some(state) = state.as_deref_mut() {
                     *state = unit_of_work::State::Failed;
+                }
+                let result = append_many_with_custom_plans(store, conn, &mut prepared).await;
+                if let (Ok(_), Some(state), Some(before)) = (&result, state, before) {
+                    *state = before;
                 }
 
                 result

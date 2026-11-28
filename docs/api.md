@@ -563,8 +563,9 @@ set `append_routing` to `AppendRouting::Streams`.
   stream it must retry is locked by another one. Inside a unit of work it sets `force_custom_plan` before
   the statement and the transaction's previous mode after it (two more round trips) (schema.md, Several
   streams).
-- `UnitOfWork`: after a `DuplicateCommit`, a `CommitIdSkew`, a database error or any `append_many` failure,
-  the transaction is unusable. `commit()` then rolls back and returns `TransactionError::Aborted` (also when
+- `UnitOfWork`: after a `DuplicateCommit`, a `CommitIdSkew`, a database error, or an `append_many` that
+  fails or is dropped before it completes (it may have written part of its batch), the transaction is
+  unusable. `commit()` then rolls back and returns `TransactionError::Aborted` (also when
   that rollback fails, for example on a lost connection; `Aborted` carries no source), because
   PostgreSQL would silently turn the COMMIT into a ROLLBACK. Conflicts from a single append write nothing
   and leave the unit of work usable. A failed statement of the caller's through `uow.conn()` also makes
