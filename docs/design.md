@@ -1074,6 +1074,13 @@ the halt, 43 recovered, 335 after.
     `HandlerError::Fatal`.
   - A handler that leaves its transaction aborted is `Transient`: the failed statement may have been a
     serialization failure.
+  - In `run_pg`, an ERROR the server returns for the checkpoint or the COMMIT (a deferred constraint, a
+    serialization failure) is the handler's failure, classified like `HandlerError::from(sqlx::Error)`. It
+    certainly rolled the batch back, so it follows the `RetryPolicy` instead of being retried for good as a
+    database error. A FATAL error or a lost connection may hide a commit and stays a database error, so the
+    stored cursor is read again. Handlers stay at READ COMMITTED: a side renewal updates the subscription's
+    row, so a REPEATABLE READ or SERIALIZABLE snapshot taken before it fails the checkpoint with 40001.
+    (2026-11-28)
   - Fatal errors release the lease, so a standby takes over at once (and probably meets the same error).
   - `Start` applies only when the row is created and on redefine. Empty advances (a cut with no events) are
     checkpointed in autocommit without calling the handler.

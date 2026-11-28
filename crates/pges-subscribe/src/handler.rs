@@ -20,7 +20,13 @@ pub type BoxError = Box<dyn error::Error + Send + Sync + 'static>;
 ///
 /// If the handler returns an error, or leaves the transaction aborted (a failed statement whose error it
 /// ignored), the transaction is rolled back and the batch is retried according to the subscription's
-/// [`RetryPolicy`](crate::subscription::RetryPolicy).
+/// [`RetryPolicy`](crate::subscription::RetryPolicy). So is an error the server reports for the checkpoint
+/// or the COMMIT, such as a deferred constraint or a serialization failure: it is transient when retrying
+/// may help ([`pges_postgres::error::DbError::is_retryable`]), otherwise fatal.
+///
+/// Keep the transaction at READ COMMITTED, the default. Under REPEATABLE READ or SERIALIZABLE, a lease
+/// renewal during a batch slower than half the lease changes the subscription's row after the handler's
+/// snapshot, and the checkpoint fails with a serialization failure on every attempt.
 ///
 /// Savepoints (`tx.begin()`) are allowed, but a savepoint begin that fails (on an aborted transaction) or is
 /// dropped before it completes makes sqlx roll back the whole transaction; the handler's statements after it

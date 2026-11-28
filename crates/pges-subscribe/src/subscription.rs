@@ -7,7 +7,10 @@ use std::{
 };
 
 use futures_util::FutureExt;
-use sqlx::{Connection, PgConnection, PgPool, postgres::types::PgInterval};
+use sqlx::{
+    Connection, PgConnection, PgPool,
+    postgres::{PgDatabaseError, PgSeverity, types::PgInterval},
+};
 use tokio::{
     sync::{oneshot, watch},
     task::JoinHandle,
@@ -1936,9 +1939,21 @@ async fn deliver_pg(
                 Box::new(AbortedTransaction),
             )));
         }
+        Err(error) if is_refused(&error) => {
+            let _ = tx.rollback().await;
+            return Err(Failure::Handler(error.into()));
+        }
         Err(error) => return Err(database(error)),
     };
-    tx.commit().await.map_err(database)?;
+    // A refused COMMIT (a deferred constraint, a serialization failure) rolled the batch back for sure:
+    // it is the handler's failure and follows the retry policy. Any other error may hide a commit.
+    if let Err(error) = tx.commit().await {
+        return Err(if is_refused(&error) {
+            Failure::Handler(error.into())
+        } else {
+            database(error)
+        });
+    }
     renew(term, renewed);
 
     Ok(Delivered::Checkpointed)
@@ -2033,6 +2048,16 @@ pub(crate) fn is_aborted_transaction(error: &sqlx::Error) -> bool {
         .as_database_error()
         .and_then(|error| error.code())
         .is_some_and(|code| code == "25P02")
+}
+
+/// Whether the server answered the statement with an ERROR: it failed, and in a transaction block the
+/// transaction can only roll back, while the session goes on. A FATAL error or a lost connection is not
+/// refused: a COMMIT may have taken effect before it.
+fn is_refused(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|error| error.try_downcast_ref::<PgDatabaseError>())
+        .is_some_and(|error| matches!(error.severity(), PgSeverity::Error))
 }
 
 fn renew(term: &mut Term, renewed: Option<Instant>) {
