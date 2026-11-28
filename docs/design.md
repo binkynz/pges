@@ -2181,8 +2181,21 @@ the halt, 43 recovered, 335 after.
     its generic plan and its cost stay as they were.
   - API: `Start::Retained` (new variant; `Start` is `#[non_exhaustive]`), `DroppedLeaf::start`. Unchanged:
     `CursorBeforeHorizon { category, cursor, horizon }`; its advice is now "rebuild from
-    `Start::Retained`", since no position is a correct strict start. `Start::Beginning` keeps the strict
-    check; whether it should mean `Retained` is open.
+    `Start::Retained`", since no position is a correct strict start. Names: `start_position`,
+    `skip_through`, `Start::Retained`.
+  - `Start::Beginning` stays strict: on a category whose retention dropped commits it fails with
+    `CursorBeforeHorizon`, whose advice points to `Start::Retained`. Skipping is a choice the caller makes
+    when it creates the subscription, never a default.
+  - Accepted: a store-wide subscription at `Start::Retained` still reads and skips log rows of dropped
+    commits below each category's start page by page (one statement cannot start each category at its own
+    position). `read/log_retained.sql` leaves them out of the page, and `Admin::prune_log` deletes them.
+  - Accepted limit: for a store-wide read whose cursor is below `skip_through`, a missing commit at or below
+    its category's horizon (a category whose horizon is at or below `skip_through`) is taken as dropped and
+    skipped without consulting `deleted_commits`. A commit missing there for another reason, such as one
+    deleted by hand, is skipped, not reported as `Corrupt`. Telling the two apart would need a record of
+    every commit retention dropped. Listed-category reads never consult `deleted_commits` (schema.md), and
+    past `skip_through`, and for every subscription not created at `Start::Retained`, the store-wide read
+    reports such a commit as `Corrupt` as before.
   - Migration 0001 is edited (`categories.start_position`, `subscriptions.skip_through`), not extended by a
     0002: 0.1.0 is not published, and AGENTS.md freezes 0001 from the release on.
   - Rejected: lowering the horizon to the start (running subscriptions would skip dropped commits);
