@@ -11,6 +11,12 @@ use crate::waker;
 ///
 /// Combine it with a push waker through [`Wakers`](waker::Wakers) to bound how long a missed wake-up delays
 /// the subscriber.
+///
+/// The interval runs from the first call that waits, not from each call: a call dropped before it fires
+/// (when the subscriber renews its lease, or another waker in [`Wakers`](waker::Wakers) fires first) leaves
+/// the deadline for the next call. So within `Wakers` it still fires about once per interval while a push
+/// waker fires more often: at most one extra log read per interval. A call made after the deadline passed,
+/// such as the first one after the subscriber spent longer than the interval on a batch, returns at once.
 #[derive(Debug, Clone, Copy)]
 pub struct Recheck {
     every: interval::Interval,
