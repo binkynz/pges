@@ -966,15 +966,21 @@ impl handler::PgHandler for Overtaking {
 /// A backfill reads `H` once, when it starts: its end is at or below it, so every page reads up to the end
 /// without reading `H` again. Counted as scans of the log partitions' primary keys, which `read/head.sql`
 /// reads backwards; the page statements read `log_by_category`.
+///
+/// Once the log partitions have statistics, planning a page statement with its bounds also scans the primary
+/// key: the planner reads the actual end of a range whose bound falls in an end bucket of the histogram. So
+/// autovacuum is off on the log partitions before anything is written, and the count is taken only while they
+/// have no statistics; with them it was 7 to 11, depending on when autoanalyze ran.
 #[tokio::test]
 async fn a_backfill_reads_the_head_once() -> Result<()> {
     const JOBS: usize = 100;
     const BATCH: u32 = 10;
 
     let mut f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    without_autovacuum_on_the_log(&f).await?;
     // Write and sequence on a pool of their own, closed before counting, so their scans are reported.
     let setup = f.db.pool().await?;
-    f.pool = setup.clone();
+    std::mem::replace(&mut f.pool, setup.clone()).close().await;
     f.store = pges_postgres::store::Store::open(
         setup.clone(),
         pges_postgres::store::StoreConfig::new(common::STORE_NAME),
@@ -1005,6 +1011,14 @@ async fn a_backfill_reads_the_head_once() -> Result<()> {
         .await?;
     reading.close().await;
     let scans = scans_of_log_keys(&f).await? - before;
+    let analyzed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_statistic s JOIN pg_class c ON c.oid = s.starelid
+           JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = 'es' AND c.relname LIKE 'log\\_%'",
+    )
+    .fetch_one(&f.pool)
+    .await?;
+    assert_eq!(analyzed, 0, "the log partitions were analyzed");
 
     assert_eq!(finished.events, JOBS as u64);
     check(&f, "head-once", &expected).await?;
@@ -1012,6 +1026,28 @@ async fn a_backfill_reads_the_head_once() -> Result<()> {
     assert_eq!(scans, 1, "{scans} reads of H over {pages} pages");
 
     f.finish().await
+}
+
+/// Turns autovacuum, and so autoanalyze, off on the log partitions.
+async fn without_autovacuum_on_the_log(f: &Fixture) -> Result<()> {
+    let mut conn = f.db.connect().await?;
+    let leaves: Vec<String> = sqlx::query_scalar(
+        "SELECT c.oid::regclass::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = 'es' AND c.relname LIKE 'log\\_%' AND c.relkind = 'r'",
+    )
+    .fetch_all(&mut conn)
+    .await?;
+    ensure!(!leaves.is_empty(), "no log partitions");
+    for leaf in leaves {
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "ALTER TABLE {leaf} SET (autovacuum_enabled = false)"
+        )))
+        .execute(&mut conn)
+        .await?;
+    }
+    conn.close().await?;
+
+    Ok(())
 }
 
 /// The index scans of the log partitions' primary keys, once the backends that ran them have exited and
