@@ -1,0 +1,39 @@
+name: release
+
+# Publishes every workspace crate to crates.io when a version tag is pushed. Authenticates with crates.io
+# Trusted Publishing: GitHub's OIDC token is exchanged for a short-lived publish token, so the repository
+# holds no crates.io secret. Each crate's Trusted Publishing settings on crates.io name this repository and
+# this workflow file.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      - name: the tag matches the workspace version
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "pges") | .version')
+          test "${GITHUB_REF_NAME}" = "v${version}" || { echo "tag ${GITHUB_REF_NAME} is not v${version}"; exit 1; }
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - run: cargo publish --workspace
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
