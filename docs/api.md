@@ -1049,7 +1049,8 @@ The first `.categories(..)` takes a `NonEmpty<CategoryName>`, later ones any ite
   one shard at a time; run more instances for parallel handlers. `Status.position` of a sharded instance is
   the lowest cursor of its held shards, and can step back when it takes a shard that is behind.
 - `.replica(pool)`: pages are read from a streaming replica after it has replayed the waker's LSN, or the
-  primary's insert LSN when the waker gives none (schema.md, Replica reads). Checkpoints, leases, `run_pg`
+  primary's insert LSN when the waker gives none (schema.md, Replica reads). The waker's LSN is untrusted:
+  one the replica has not replayed is lowered to the primary's insert LSN before the wait. Checkpoints, leases, `run_pg`
   transactions, horizon checks and event-type loads stay on the store's pool. It waits however long the
   replica lags, and a pool whose server is not in recovery is read without waiting. With
   `Replica::fallback(after, limit)` it reads one page at a time from the primary once the replica has lagged
@@ -1750,6 +1751,12 @@ configuration of their own. An empty list means the whole store, compared throug
 `H`, for the store and every watched category: a cursor can be ahead of `H` (`Start::Position` past the log),
 and a level-triggered waker given `H` would fire again at once.
 
+The high-water mark a waker resolves with is a hint, not a fact. A subscription never carries it forward as
+a position to compare later wakes with: `known` always comes from what it read (for a sharded subscription,
+from what its waiting shards read). It uses only the LSN, as the WAL position to wait for on a replica, and
+lowers that to the primary's WAL insert position when the replica has not replayed it. A custom waker that
+forwards untrusted input should do the same: wake on it, and never let it raise `known`.
+
 - `Wakers::any` resolves with the first waker that fires, not the highest value seen (the subscription does
   not use the value). A failing waker is left out until the next call; the call fails only when all failed,
   with the last error. `Wakers` cannot be empty: build it with `Wakers::new(w).or(w2)` or from a
@@ -1767,9 +1774,16 @@ and a level-triggered waker given `H` would fire again at once.
 - `NotifyWaker` (`wake-notify`) listens on `pges_<store schema name>` through sqlx's `PgListener` on one
   connection, opened on the first call, of the store's pool (or of the pool given to `with_separate_pool`, for
   example when the store's pool sits behind a pooler in transaction mode, where LISTEN does not work). It
-  decodes with `Notice::decode` and keeps the newest positions seen (store, per category, LSN), so it is
-  level-triggered like the other wakers. `NoticeCategories::Omitted` (`*`) counts as every category having
-  reached that notice's store position; it wakes only a `known` below that position.
+  decodes with `Notice::decode`.
+- Notices are untrusted: `NOTIFY` needs no privilege, so any role that can connect can send one on the
+  store's channel, with any payload. The waker keeps the newest positions (store, per category, LSN) of the
+  notices received since its last call resolved, resolves the next call whose `known` they have passed, and
+  then forgets them. So each notice wakes at most one call: a notice that arrived while the subscriber was
+  busy still wakes the next call it has passed, one the subscriber already read past wakes nothing, and a
+  forged one costs one log read, never a loop of them, and hides no notice after it. It is not
+  level-triggered across calls: a notice that woke a call does not wake the next one, even if it is still
+  ahead of `known`. `NoticeCategories::Omitted` (`*`) counts as every category having reached that
+  notice's store position; it wakes only a `known` below that position.
 - It resolves once, whatever `known` says, after the LISTEN connection opens (the first time and after a
   lost connection, because notices sent while nobody listened are gone) and after a payload it cannot read
   (`UnsupportedVersion`, `Malformed`). Any receive error counts as a lost connection, and so does a closed

@@ -732,9 +732,11 @@ the number of shards. It needs PostgreSQL 18's `bytea` to `int8` cast.
 **Replica reads** (`.replica(pool)`). Before each page read from the replica, the subscriber waits until the
 replica has replayed a target WAL position: the LSN the waker reported, or, when the waker gave none (a poll
 waker, the recheck timer), at start and after a retried error, the primary's insert position
-(`crates/pges-subscribe/sql/replica/insert_lsn.sql`). It polls the replica's replay position
-(`crates/pges-subscribe/sql/replica/replay_lsn.sql`) until it reaches the target, and reads the replica's WAL
-page and segment sizes once (`crates/pges-subscribe/sql/replica/wal_layout.sql`).
+(`crates/pges-subscribe/sql/replica/insert_lsn.sql`). A waker's LSN is a hint (any role can send a
+`NOTIFY`): if the replica has not replayed it at the first check, the subscriber reads the primary's insert
+position once and lowers the target to it, so a forged LSN cannot hold it back. It polls the replica's
+replay position (`crates/pges-subscribe/sql/replica/replay_lsn.sql`) until it reaches the target, and reads
+the replica's WAL page and segment sizes once (`crates/pges-subscribe/sql/replica/wal_layout.sql`).
 
 - On the replica: `H`, the category read (with the sharded filter `$5`/`$6`), and for all categories the log
   page and the per-category commits fetch (with the sharded `CASE … payload`). A replica replays commits in

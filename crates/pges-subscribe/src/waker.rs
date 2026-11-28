@@ -72,6 +72,12 @@ pub mod recheck;
 /// passed `known` ([`has_passed`]), with the newest high-water mark the waker knows. It may resolve early;
 /// the subscriber then reads nothing new and waits again.
 ///
+/// The high-water mark it resolves with is a hint, and may be false: a `NOTIFY` can come from any role that
+/// can connect. A subscription never compares a later call with it. `known` is always what the subscription
+/// read, and of the high-water mark it uses only the LSN, lowered to the primary's WAL insert position when
+/// a replica has not replayed it. A waker whose input is untrusted should let each input wake at most one
+/// call, so a false position ahead of every `known` cannot resolve every call at once.
+///
 /// The future must be cancel safe: the subscriber drops it to renew its lease or to shut down, and calls
 /// again.
 ///
