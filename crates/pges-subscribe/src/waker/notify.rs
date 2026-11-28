@@ -14,9 +14,14 @@ use crate::waker;
 /// Listens on the store's channel, `pges_<store schema name>`, where the sequencer (with its `watch-notify`
 /// feature) sends a [`Notice`](high_water::Notice) after each batch that wrote to the store's log.
 ///
-/// The waker keeps the newest positions the notices carried, so it is level-triggered like the other
-/// wakers: a notice that arrived while the subscriber was busy still wakes the next
-/// [`Waker::changed`](waker::Waker::changed) whose `known` it has passed. Notices only ever raise positions.
+/// Notices are untrusted. `NOTIFY` needs no privilege, so any role that can connect to the database can send
+/// one on the store's channel, with any payload. A notice is only a hint that the log may have changed, and
+/// each one wakes at most one call: the waker keeps the newest positions of the notices received since its
+/// last call resolved, resolves the next [`Waker::changed`](waker::Waker::changed) whose `known` they have
+/// passed, and then forgets them. A notice that arrived while the subscriber was busy still wakes the next
+/// call it has passed; one the subscriber already read past wakes nothing. So a forged notice costs at most
+/// one extra read of the log, and the notices after it are compared with what the subscriber read, not with
+/// what the forged one claimed.
 ///
 /// It resolves at once, whatever `known` says:
 ///
@@ -90,8 +95,9 @@ impl NotifyWaker {
 }
 
 impl waker::Waker for NotifyWaker {
-    /// Resolves with the newest positions the notices carried. Categories not named by any notice are at
-    /// [`position::Position::BEGINNING`], unless a notice left the categories out.
+    /// Resolves with the newest positions of the notices received since the last call resolved, and forgets
+    /// them. Categories not named by any of those notices are at [`position::Position::BEGINNING`], unless a
+    /// notice left the categories out. The positions and the LSN are what the notices claimed: a hint.
     async fn changed(
         &mut self,
         known: &high_water::HighWater,
@@ -123,11 +129,11 @@ impl waker::Waker for NotifyWaker {
             };
 
             let high = self.seen.high_water(known);
-            if self.recheck == Recheck::Due {
+            if self.recheck == Recheck::Due || waker::has_passed(&high, known) {
+                // Forgotten once they woke a call: a forged position that stays ahead of every `known` would
+                // otherwise wake each call at once, forever.
                 self.recheck = Recheck::NotDue;
-                return Ok(high);
-            }
-            if waker::has_passed(&high, known) {
+                self.seen = Seen::default();
                 return Ok(high);
             }
 
@@ -228,7 +234,7 @@ impl Backoff {
     }
 }
 
-/// The newest positions the notices carried.
+/// The newest positions of the notices received since the last call resolved.
 #[derive(Debug, Default)]
 struct Seen {
     store: position::Position,
