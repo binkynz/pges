@@ -12,22 +12,30 @@
 -- before `bumped` (`head` is created UNION ALL bumped), so a batch that already moved a stream on never waits
 -- on another batch: ON CONFLICT ignores a lock-only row lock.
 --
+-- An id at or below its stream's last_commit_id, as `locked` read it, gets an infinite tolerance, as in
+-- append/head.sql: the batch's ids are crate-generated, but the retry after a lost connection sends them again,
+-- possibly long after the first attempt committed, and it must find that commit and report it deduplicated.
+-- `locked` holds the row, so the id it read is the stream's latest. The left join runs after `locked`: the
+-- one-time filter gates it.
+--
 -- `bumped` repeats the `stream_id = ANY($1)` of `locked`: the join alone does not prune the hash partitions of
 -- streams, so without it every custom plan expands the update over all of them. Every i.stream_id comes from
 -- unnest($1), so the filter changes nothing else. The statement always runs with custom plans
 -- (append/begin_many.sql, append/plan_mode.sql): a generic plan locks every partition.
 WITH locked AS MATERIALIZED (
-  SELECT s.stream_id FROM {store}.streams s
+  SELECT s.stream_id, s.last_commit_id FROM {store}.streams s
   WHERE s.stream_id = ANY($1::uuid[])
   ORDER BY s.stream_id
   FOR UPDATE
 ),
 input AS MATERIALIZED (
   SELECT u.stream_id, u.category_id, u.expected, u.event_count, u.format, u.payload, u.stream_key,
-         pges.check_commit_id(u.commit_id, $9::interval) AS commit_id
+         pges.check_commit_id(u.commit_id,
+           CASE WHEN u.commit_id <= l.last_commit_id THEN 'infinity' ELSE $9::interval END) AS commit_id
   FROM unnest($1::uuid[], $2::int4[], $3::int8[], $4::int2[], $5::int2[], $6::bytea[], $7::text[],
               $8::uuid[])
        AS u(stream_id, category_id, expected, event_count, format, payload, stream_key, commit_id)
+  LEFT JOIN locked l ON l.stream_id = u.stream_id
   WHERE (SELECT count(*) FROM locked) >= 0
   ORDER BY u.stream_id
 ),

@@ -298,8 +298,10 @@ returned a row.
   autocommit looked the id up after the error. `last_commit_id` only grows, so reading it in the
   statement's snapshot is safe: an id the snapshot sees at or below it stays at or below it. A late id the
   stream has not stored is then `CommitIdOutOfOrder` instead of `CommitIdSkew`; a new id (above
-  `last_commit_id`, or for a new stream) is still checked. `append_many` keeps the plain check: its ids are
-  always crate-generated and fresh.
+  `last_commit_id`, or for a new stream) is still checked. `append_many` does the same with the
+  `last_commit_id` its `locked` step read under the row lock: its ids are crate-generated, but the retry
+  after a lost connection sends them again, possibly more than the skew after the first attempt committed
+  (before 2026-11-28 that retry failed with `CommitIdSkew` for a batch that was written).
 - `pges.check_commit_id` refuses an id that is not a UUIDv7 with SQLSTATE `22023`, before the skew check and
   whatever the tolerance: `uuid_extract_timestamp` returns NULL for most other versions, which the skew check
   alone would let through, and a v1 id's timestamp is not a v7 one's. The crate only sends v7 `CommitId`s
