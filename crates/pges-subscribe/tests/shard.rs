@@ -323,6 +323,165 @@ async fn changing_the_number_of_shards_needs_a_redefine() -> Result<()> {
     f.finish().await
 }
 
+/// A [`Recorder`] that takes a while per batch, so a second instance joins while the first still reads.
+struct Slow(Recorder);
+
+impl handler::PgHandler for Slow {
+    async fn handle(
+        &mut self,
+        tx: &mut sqlx::PgConnection,
+        batch: &batch::Batch,
+    ) -> Result<(), handler::HandlerError> {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        handler::PgHandler::handle(&mut self.0, tx, batch).await
+    }
+}
+
+/// A sharded subscription started at `Start::Retained`, run by two instances over 4 shards, listed and
+/// store-wide: together they deliver every commit retention kept, also those below the horizon in each
+/// shard, skip the dropped ones, deliver nothing twice and keep each stream in order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sharded_retained_subscription_reads_every_kept_commit_once() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(90), sharded_retained())
+        .await
+        .context("the test timed out")?
+}
+
+async fn sharded_retained() -> Result<()> {
+    let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    // Two jobs streams in each of the 4 shards, whatever the random ids, in shard order.
+    let mut per_shard = [0usize; 4];
+    let mut jobs: Vec<Uuid> = (0..400)
+        .map(|_| stream::StreamId::new_v7().as_uuid())
+        .filter(|id| {
+            let count = &mut per_shard[documented_shard(*id, SHARDS) as usize];
+            *count += 1;
+            *count <= 2
+        })
+        .collect();
+    jobs.sort_by_key(|id| documented_shard(*id, SHARDS));
+    let jobs: Vec<stream::StreamId> = jobs.into_iter().map(stream::StreamId::from_uuid).collect();
+    assert_eq!(jobs.len(), 8, "400 random ids cover every shard twice");
+    let orders: Vec<stream::StreamId> = (0..4).map(|_| stream::StreamId::new_v7()).collect();
+    for _ in 0..3 {
+        for (i, job) in jobs.iter().enumerate() {
+            f.append(Cat::Jobs, *job, 1).await?;
+            if i % 2 == 0 {
+                f.append(Cat::Orders, orders[i / 2], 1).await?;
+            }
+        }
+    }
+    f.sequence_all().await?;
+
+    // As apply_retention records it. Of the 16 jobs commits of the first two rounds, the first round is
+    // dropped, at or below the start; of the second round, the fourth and the last are dropped, between the
+    // start and the horizon (the last one's position), one in shard 1 and one in shard 3. The other six of the
+    // second round are kept below the horizon, in every shard.
+    let job_positions: Vec<i64> = sqlx::query_scalar(
+        "SELECT last_position FROM es.log WHERE category_id = $1 ORDER BY last_position",
+    )
+    .bind(f.id(Cat::Jobs).get())
+    .fetch_all(&f.pool)
+    .await?;
+    assert_eq!(job_positions.len(), 24);
+    let mut dropped: Vec<i64> = job_positions[..8].to_vec();
+    dropped.extend([job_positions[11], job_positions[15]]);
+    let (start, horizon) = (job_positions[8] - 1, job_positions[15]);
+    sqlx::query(
+        "UPDATE es.categories SET horizon_position = $2, start_position = $3 WHERE category_id = $1",
+    )
+    .bind(f.id(Cat::Jobs).get())
+    .bind(horizon)
+    .bind(start)
+    .execute(&f.pool)
+    .await?;
+    sqlx::query(
+        "DELETE FROM es.commits_jobs
+         WHERE commit_id IN (SELECT commit_id FROM es.log WHERE last_position = ANY($1))",
+    )
+    .bind(&dropped)
+    .execute(&f.pool)
+    .await?;
+    let kept: Vec<(i64, Uuid)> = sqlx::query_as(
+        "SELECT l.last_position, c.stream_id FROM es.log l
+         JOIN es.commits c ON c.category_id = l.category_id AND c.commit_id = l.commit_id
+         ORDER BY l.last_position",
+    )
+    .fetch_all(&f.pool)
+    .await?;
+    let mut shards_below: Vec<u64> = kept
+        .iter()
+        .filter(|(p, _)| *p <= horizon && job_positions.contains(p))
+        .map(|(_, stream_id)| documented_shard(*stream_id, SHARDS))
+        .collect();
+    assert_eq!(shards_below.len(), 6);
+    shards_below.sort_unstable();
+    shards_below.dedup();
+    assert_eq!(
+        shards_below,
+        [0, 1, 2, 3],
+        "kept commits below the horizon in every shard"
+    );
+    let head = common::head(&f.pool).await?;
+
+    for (name, scope) in [("retained_listed", "listed"), ("retained_all", "all")] {
+        let mut instances = Vec::new();
+        for instance in ["a", "b"] {
+            let subscriber = format!("{name}_{instance}");
+            let handler = Slow(Recorder::new(&subscriber));
+            let subscription = if scope == "all" {
+                f.store
+                    .subscription(subscription::SubscriptionName::parse(name)?)
+                    .all_categories()
+                    .sharded(subscription::Shards::new(SHARDS).unwrap())
+                    .lease(interval!(600 ms))
+                    .acquire_interval(interval!(20 ms))
+                    .retry_interval(interval!(20 ms))
+                    .waker(recheck::Recheck::every(interval!(5 ms)))
+                    .start(subscription::Start::Retained)
+                    .batch_size(NonZeroU32::new(1).unwrap())
+                    .run_pg(handler)
+            } else {
+                builder(&f, name, SHARDS)
+                    .start(subscription::Start::Retained)
+                    .batch_size(NonZeroU32::new(1).unwrap())
+                    .run_pg(handler)
+            };
+            instances.push((common::Running::spawn(subscription), subscriber));
+        }
+        wait_shards(&f, name, head).await?;
+
+        let mut delivered: Vec<(i64, Uuid)> = Vec::new();
+        for (running, subscriber) in instances {
+            running.stop().await?;
+            let mine: Vec<(i64, Uuid)> = sqlx::query_as(
+                "SELECT d.position, c.stream_id FROM public.delivered d
+                 JOIN es.commits c ON c.commit_id = d.commit_id
+                 WHERE d.subscriber = $1 ORDER BY d.seq",
+            )
+            .bind(&subscriber)
+            .fetch_all(&f.pool)
+            .await?;
+            ensure!(!mine.is_empty(), "{subscriber} delivered nothing");
+            let mut by_stream: BTreeMap<Uuid, Vec<i64>> = BTreeMap::new();
+            for (position, stream_id) in &mine {
+                by_stream.entry(*stream_id).or_default().push(*position);
+            }
+            for (stream_id, positions) in &by_stream {
+                ensure!(
+                    positions.windows(2).all(|pair| pair[0] < pair[1]),
+                    "{subscriber}: stream {stream_id} out of order: {positions:?}"
+                );
+            }
+            delivered.extend(mine);
+        }
+        delivered.sort_unstable();
+        assert_eq!(delivered, kept, "{name}: every kept commit once");
+    }
+
+    f.finish().await
+}
+
 /// The shard of a stream as `Builder::sharded` documents it, computed apart from the SQL that filters.
 fn documented_shard(stream_id: Uuid, shards: u16) -> u64 {
     let digest = Sha256::digest(stream_id.as_bytes());
