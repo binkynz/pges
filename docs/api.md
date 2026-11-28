@@ -1011,9 +1011,12 @@ The first `.categories(..)` takes a `NonEmpty<CategoryName>`, later ones any ite
   counted as a transient failure, because the failed statement may have been a serialization failure.
 - An error the server reports (severity ERROR) for the checkpoint or the COMMIT, such as a deferred
   constraint or a serialization failure, rolled the batch back for sure. It counts as the handler's
-  failure, as `HandlerError::from(sqlx::Error)` classifies it (transient when retryable, else fatal), so it
-  follows the `RetryPolicy` and can stop the run with `HandlerFailed`. A lost connection or a FATAL error may hide a commit, and stays a
-  database error. Handlers keep READ COMMITTED: under REPEATABLE READ or SERIALIZABLE a side renewal
+  failure and follows the `RetryPolicy`, so a batch that can never commit stops the run with
+  `HandlerFailed` once its attempts run out. It is transient, since most such errors are not the batch's
+  fault and pass (a lock or statement timeout, say behind a lost COMMIT's row lock, a serialization failure,
+  a read-only transaction during a failover), except an integrity constraint violation or a data exception
+  (SQLSTATE class 23 or 22, such as a deferred unique constraint), which fails every attempt the same way
+  and is fatal. A lost connection or a FATAL error may hide a commit, and stays a database error. Handlers keep READ COMMITTED: under REPEATABLE READ or SERIALIZABLE a side renewal
   during a slow batch updates the subscription's row after the handler's snapshot, and every checkpoint
   attempt fails with 40001.
 - Category names are checked against `categories` at start (`UnknownCategory`). The requested categories are
