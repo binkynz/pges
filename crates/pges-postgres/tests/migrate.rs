@@ -26,7 +26,7 @@ async fn run(
         conn,
         &name,
         &definition(store::Outbox::Disabled),
-        &migrate::MigrateConfig::default(),
+        migrate::MigrateConfig::default(),
     )
     .await
 }
@@ -40,7 +40,7 @@ async fn run_with_outbox(
         conn,
         &name,
         &definition(outbox),
-        &migrate::MigrateConfig::default(),
+        migrate::MigrateConfig::default(),
     )
     .await
 }
@@ -119,9 +119,7 @@ async fn concurrent_runners_create_the_store_once() -> Result<()> {
 }
 
 fn waiting(lock_wait: pges_core::interval::Interval) -> migrate::MigrateConfig {
-    let mut config = migrate::MigrateConfig::default();
-    config.lock_wait = lock_wait;
-    config
+    migrate::MigrateConfig::default().with_lock_wait(lock_wait)
 }
 
 /// The migration lock is a row only roles with `UPDATE` on `pges.scopes` can lock. A role that can only
@@ -190,7 +188,7 @@ async fn a_runner_gives_up_waiting_for_the_migration_lock_and_names_the_holder()
         &mut conn,
         &store_name!("late"),
         &definition(store::Outbox::Disabled),
-        &waiting(pges_core::interval!(300 ms)),
+        waiting(pges_core::interval!(300 ms)),
     )
     .await
     .unwrap_err();
@@ -198,18 +196,36 @@ async fn a_runner_gives_up_waiting_for_the_migration_lock_and_names_the_holder()
         panic!("{error}");
     };
     assert!(started.elapsed() >= std::time::Duration::from_millis(300));
+    assert!(timeout.waited >= std::time::Duration::from_millis(300));
+    assert!(timeout.waited < std::time::Duration::from_secs(5));
     assert_eq!(timeout.lock, pges_postgres::lock::Lock::Migration);
     let found = timeout.holder.as_ref().expect("the holder is visible");
     assert_eq!(found.pid.get(), pid);
     assert_eq!(found.role.as_deref(), Some(role.as_str()));
     assert!(store_names(&mut conn).await?.is_empty());
 
+    // An auto-migrating Store::open waits as long as its StoreConfig::migrate_config says.
+    let pool = db.pool().await?;
+    let mut config = store::StoreConfig::new(store_name!("late"));
+    config.migrate = store::AutoMigrate::CreateOrMigrate(definition(store::Outbox::Disabled));
+    config.migrate_config = waiting(pges_core::interval!(300 ms));
+    let error = store::Store::open(pool.clone(), config).await.unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            store::OpenError::Migrate(migrate::MigrateError::LockTimeout(timeout))
+                if timeout.holder.as_ref().map(|h| h.pid.get()) == Some(pid)
+        ),
+        "{error}"
+    );
+    pool.close().await;
+
     let patient = tokio::spawn(async move {
         let result = migrate::run(
             &mut conn,
             &store_name!("late"),
             &definition(store::Outbox::Disabled),
-            &waiting(pges_core::interval!(30 s)),
+            waiting(pges_core::interval!(30 s)),
         )
         .await;
         (result, conn)
@@ -242,7 +258,7 @@ async fn the_first_shared_migration_is_serialised_by_the_bootstrap_lock() -> Res
     .fetch_one(&mut holder)
     .await?;
 
-    let error = migrate::run_shared(&mut conn, &waiting(pges_core::interval!(300 ms)))
+    let error = migrate::run_shared(&mut conn, waiting(pges_core::interval!(300 ms)))
         .await
         .unwrap_err();
     let migrate::MigrateError::LockTimeout(timeout) = &error else {
@@ -255,7 +271,7 @@ async fn the_first_shared_migration_is_serialised_by_the_bootstrap_lock() -> Res
     for _ in 0..4 {
         let mut conn = db.connect().await?;
         runners.push(tokio::spawn(async move {
-            migrate::run_shared(&mut conn, &migrate::MigrateConfig::default()).await
+            migrate::run_shared(&mut conn, migrate::MigrateConfig::default()).await
         }));
     }
     for runner in runners {
@@ -577,14 +593,14 @@ async fn a_store_with_over_1000_stream_partitions_names_them_by_the_widest_remai
         &mut conn,
         &store_name!("wide"),
         &wide,
-        &migrate::MigrateConfig::default(),
+        migrate::MigrateConfig::default(),
     )
     .await?;
     migrate::run(
         &mut conn,
         &store_name!("narrow"),
         &definition(store::Outbox::Disabled),
-        &migrate::MigrateConfig::default(),
+        migrate::MigrateConfig::default(),
     )
     .await?;
 
@@ -769,10 +785,10 @@ async fn a_role_that_does_not_own_the_publication_creates_only_outbox_stores() -
             &mut conn,
             &store_name!("n1"),
             &definition(outbox),
-            &migrate::MigrateConfig::default(),
+            migrate::MigrateConfig::default(),
         )
         .await;
-        let shared = migrate::run_shared(&mut conn, &migrate::MigrateConfig::default()).await;
+        let shared = migrate::run_shared(&mut conn, migrate::MigrateConfig::default()).await;
         assert!(
             matches!(
                 shared,
@@ -883,7 +899,7 @@ async fn a_schema_of_another_role_is_refused_with_its_migrations_applied() -> Re
     .await?;
     conn.execute(sqlx::AssertSqlSafe(format!("SET ROLE {squatter}")))
         .await?;
-    migrate::run_shared(&mut conn, &migrate::MigrateConfig::default()).await?;
+    migrate::run_shared(&mut conn, migrate::MigrateConfig::default()).await?;
     conn.execute("RESET ROLE").await?;
 
     let error = run(&mut conn, store_name!("q1")).await.unwrap_err();
@@ -891,7 +907,7 @@ async fn a_schema_of_another_role_is_refused_with_its_migrations_applied() -> Re
         matches!(&error, migrate::MigrateError::SharedSchemaNotOwned { owner } if *owner == squatter),
         "{error}"
     );
-    let error = migrate::run_shared(&mut conn, &migrate::MigrateConfig::default())
+    let error = migrate::run_shared(&mut conn, migrate::MigrateConfig::default())
         .await
         .unwrap_err();
     assert!(
@@ -908,7 +924,7 @@ async fn a_schema_of_another_role_is_refused_with_its_migrations_applied() -> Re
     // A member of the owner is refused as itself, and migrates after SET ROLE to the owner.
     conn.execute(sqlx::AssertSqlSafe(format!("SET ROLE {member}")))
         .await?;
-    let error = migrate::run_shared(&mut conn, &migrate::MigrateConfig::default())
+    let error = migrate::run_shared(&mut conn, migrate::MigrateConfig::default())
         .await
         .unwrap_err();
     assert!(

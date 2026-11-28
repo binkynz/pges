@@ -288,7 +288,8 @@ async fn maintenance_gives_up_waiting_and_names_the_holder() -> Result<()> {
         timeout.lock,
         pges_postgres::lock::Lock::Maintenance(common::STORE_NAME)
     );
-    assert_eq!(timeout.waited, std::time::Duration::from_millis(300));
+    assert!(timeout.waited >= std::time::Duration::from_millis(300));
+    assert!(timeout.waited < std::time::Duration::from_secs(5));
     let found = timeout.holder.as_ref().expect("the holder is visible");
     assert_eq!(found.pid.get(), pid);
     assert_eq!(found.role.as_deref(), Some(role.as_str()));

@@ -25,10 +25,9 @@ impl Store {
     /// Opens the store named in `config`.
     ///
     /// With [`AutoMigrate::CreateOrMigrate`] it first applies the migrations, creating the store from the
-    /// [`StoreDefinition`] if it does not exist, with the default [`migrate::MigrateConfig`]: it fails with
-    /// [`migrate::MigrateError::LockTimeout`] when another session holds the migration lock for longer than
-    /// [`lock::DEFAULT_WAIT`](crate::lock::DEFAULT_WAIT); run [`migrate::run`] first to wait longer. Then it
-    /// checks that the shared `pges` schema and the store schema (and, for a store with the outbox, its
+    /// [`StoreDefinition`] if it does not exist, with [`StoreConfig::migrate_config`]: it fails with
+    /// [`migrate::MigrateError::LockTimeout`] when other sessions hold the migration lock for longer than its
+    /// [`lock_wait`](migrate::MigrateConfig::lock_wait). Then it checks that the shared `pges` schema and the store schema (and, for a store with the outbox, its
     /// outbox scope `<store>.outbox`) are at the version this crate needs and that their applied migrations
     /// match the embedded ones, reads the store's `outbox` and `dcb` flags, lists the partitions of
     /// `streams` so each append can name its stream's partition (with [`AppendRouting::Auto`], the
@@ -43,13 +42,7 @@ impl Store {
 
         let mut conn = pool.acquire().await.map_err(OpenError::database)?;
         if let Some(definition) = config.definition() {
-            migrate::run(
-                &mut conn,
-                &store_name,
-                definition,
-                &migrate::MigrateConfig::default(),
-            )
-            .await?;
+            migrate::run(&mut conn, &store_name, definition, config.migrate_config).await?;
         }
 
         let shared_exists = sql::statement::shared_schema_exists::Query::fixed()
@@ -406,6 +399,9 @@ pub struct StoreConfig {
     pub write_format: frame::Format,
     /// Whether [`Store::open`] applies migrations first, and what it creates a missing store with.
     pub migrate: AutoMigrate,
+    /// How [`Store::open`] applies migrations with [`AutoMigrate::CreateOrMigrate`]: how long it waits for
+    /// the migration lock. Default [`migrate::MigrateConfig::default`] (60 s).
+    pub migrate_config: migrate::MigrateConfig,
     /// Whether a single append names its stream's partition of `streams` or goes through `streams`. Default
     /// [`AppendRouting::Auto`].
     pub append_routing: AppendRouting,
@@ -420,6 +416,7 @@ impl StoreConfig {
             max_clock_skew: None,
             write_format: frame::Format::LATEST,
             migrate: AutoMigrate::Disabled,
+            migrate_config: migrate::MigrateConfig::default(),
             append_routing: AppendRouting::Auto,
         }
     }

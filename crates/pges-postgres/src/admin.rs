@@ -170,8 +170,20 @@ impl Admin {
     /// The lock is tried until the lock wait runs out, on a pooled connection that goes back to the pool
     /// between tries, so operations waiting for another maintainer do not drain the pool.
     pub(crate) async fn session(&self) -> Result<PoolConnection<sqlx::Postgres>, SessionError> {
-        let deadline = lock::Deadline::after(self.lock_wait);
-        let mut pause = lock::FIRST_PAUSE;
+        self.session_within(&mut self.lock_wait()).await
+    }
+
+    /// The lock wait of one operation, which [`Admin::session_within`] spends across its sessions.
+    pub(crate) fn lock_wait(&self) -> lock::LockWait {
+        lock::LockWait::new(self.lock_wait)
+    }
+
+    /// [`Admin::session`] for an operation that takes the lock more than once: `wait` is what is left of its
+    /// lock wait.
+    pub(crate) async fn session_within(
+        &self,
+        wait: &mut lock::LockWait,
+    ) -> Result<PoolConnection<sqlx::Postgres>, SessionError> {
         loop {
             let mut trying = LockTry(Some(self.pool.acquire().await?));
             let locked = match trying.0.as_mut() {
@@ -183,22 +195,24 @@ impl Admin {
             };
 
             if locked {
+                wait.taken();
                 // The session settings must not reach other users of the pool, nor the lock.
                 conn.close_on_drop();
                 conn.execute(statement::MAINTAIN_SESSION.sql()).await?;
                 return Ok(conn);
             }
-            if deadline.passed() {
+            wait.busy();
+            if wait.exhausted() {
                 let holder = maintain_lock_holder(&mut conn, self.store()).await?;
                 return Err(SessionError::LockTimeout(lock::LockTimeout {
                     lock: lock::Lock::Maintenance(self.store.clone()),
-                    waited: deadline.wait(),
+                    waited: wait.waited(),
                     holder,
                 }));
             }
 
             drop(conn);
-            deadline.pause(&mut pause).await;
+            wait.pause().await;
         }
     }
 

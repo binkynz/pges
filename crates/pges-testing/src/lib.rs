@@ -499,7 +499,7 @@ async fn ensure_template(server: &Server) -> Result<String> {
 }
 
 async fn apply_pges(conn: &mut PgConnection) -> Result<()> {
-    migrate::run_shared(conn, &migrate::MigrateConfig::default())
+    migrate::run_shared(conn, migrate::MigrateConfig::default())
         .await
         .context("shared pges migrations")
 }
@@ -524,7 +524,7 @@ pub async fn create_store(
     store: &core_store::StoreName,
     definition: &store::StoreDefinition,
 ) -> Result<()> {
-    migrate::run_store(conn, store, definition, &migrate::MigrateConfig::default())
+    migrate::run_store(conn, store, definition, migrate::MigrateConfig::default())
         .await
         .with_context(|| format!("creating store {store}"))
 }

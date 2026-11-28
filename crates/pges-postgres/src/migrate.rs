@@ -41,10 +41,19 @@ pub const SHARED_SCOPE: &str = "pges";
 #[non_exhaustive]
 pub struct MigrateConfig {
     /// How long one run ([`run_shared`], [`run_store`] or [`run`]) waits in all for the migration lock
-    /// while another session holds it, before it fails with [`MigrateError::LockTimeout`]. Default
-    /// [`lock::DEFAULT_WAIT`] (60 s). A run that finds every migration applied takes no lock and never
-    /// waits.
+    /// while other sessions hold it, before it fails with [`MigrateError::LockTimeout`]. Only time spent
+    /// waiting counts, not time spent applying migrations. Default [`lock::DEFAULT_WAIT`] (60 s). A run
+    /// that finds every migration applied takes no lock and never waits.
     pub lock_wait: interval::Interval,
+}
+
+impl MigrateConfig {
+    /// The same configuration, waiting at most `wait` for the migration lock.
+    #[must_use]
+    pub fn with_lock_wait(mut self, wait: interval::Interval) -> Self {
+        self.lock_wait = wait;
+        self
+    }
 }
 
 impl Default for MigrateConfig {
@@ -157,17 +166,17 @@ pub(crate) fn outbox_scope(store: &core_store::StoreName) -> String {
 /// knowing, so its commit does nothing.
 pub fn run_shared<'a>(
     conn: &'a mut PgConnection,
-    config: &MigrateConfig,
+    config: MigrateConfig,
 ) -> BoxFuture<'a, Result<(), MigrateError>> {
-    Box::pin(run_shared_inner(
-        conn,
-        lock::Deadline::after(config.lock_wait),
-    ))
+    Box::pin(async move {
+        let mut wait = lock::LockWait::new(config.lock_wait);
+        run_shared_inner(conn, &mut wait).await
+    })
 }
 
 async fn run_shared_inner(
     conn: &mut PgConnection,
-    deadline: lock::Deadline,
+    wait: &mut lock::LockWait,
 ) -> Result<(), MigrateError> {
     ensure_shared_schema_owned(conn).await?;
     let latest = latest_version(SHARED);
@@ -180,7 +189,7 @@ async fn run_shared_inner(
 
     for migration in SHARED {
         let mut tx = conn.begin().await.map_err(MigrateError::database)?;
-        lock(&mut tx, &deadline).await?;
+        lock(&mut tx, wait).await?;
 
         let applied = applied_migrations(&mut tx, SHARED_SCOPE)
             .await
@@ -226,21 +235,19 @@ pub fn run_store<'a>(
     conn: &'a mut PgConnection,
     name: &'a core_store::StoreName,
     definition: &'a store::StoreDefinition,
-    config: &MigrateConfig,
+    config: MigrateConfig,
 ) -> BoxFuture<'a, Result<(), MigrateError>> {
-    Box::pin(run_store_inner(
-        conn,
-        name,
-        definition,
-        lock::Deadline::after(config.lock_wait),
-    ))
+    Box::pin(async move {
+        let mut wait = lock::LockWait::new(config.lock_wait);
+        run_store_inner(conn, name, definition, &mut wait).await
+    })
 }
 
 async fn run_store_inner(
     conn: &mut PgConnection,
     store_name: &core_store::StoreName,
     definition: &store::StoreDefinition,
-    deadline: lock::Deadline,
+    wait: &mut lock::LockWait,
 ) -> Result<(), MigrateError> {
     let scope = store_name.as_str();
 
@@ -251,13 +258,13 @@ async fn run_store_inner(
             .map_err(MigrateError::database)?;
         if is_current(scope, STORE, &applied)? {
             ensure_supported(conn, scope, latest).await?;
-            return run_outbox(conn, store_name, &deadline).await;
+            return run_outbox(conn, store_name, wait).await;
         }
     }
 
     for migration in STORE {
         let mut tx = conn.begin().await.map_err(MigrateError::database)?;
-        lock(&mut tx, &deadline).await?;
+        lock(&mut tx, wait).await?;
 
         if !store_exists(&mut tx, scope).await? {
             create_store(&mut tx, store_name, definition, migration).await?;
@@ -279,7 +286,7 @@ async fn run_store_inner(
         tx.commit().await.map_err(MigrateError::database)?;
     }
 
-    run_outbox(conn, store_name, &deadline).await
+    run_outbox(conn, store_name, wait).await
 }
 
 /// Checks the applied [`OUTBOX`] migrations of a store with the outbox and applies the missing ones. A store
@@ -287,7 +294,7 @@ async fn run_store_inner(
 async fn run_outbox(
     conn: &mut PgConnection,
     store_name: &core_store::StoreName,
-    deadline: &lock::Deadline,
+    wait: &mut lock::LockWait,
 ) -> Result<(), MigrateError> {
     let scope = outbox_scope(store_name);
     let latest = latest_version(OUTBOX);
@@ -303,7 +310,7 @@ async fn run_outbox(
 
     for migration in OUTBOX {
         let mut tx = conn.begin().await.map_err(MigrateError::database)?;
-        lock(&mut tx, deadline).await?;
+        lock(&mut tx, wait).await?;
 
         let applied = applied_migrations(&mut tx, &scope)
             .await
@@ -332,12 +339,12 @@ pub fn run<'a>(
     conn: &'a mut PgConnection,
     name: &'a core_store::StoreName,
     definition: &'a store::StoreDefinition,
-    config: &MigrateConfig,
+    config: MigrateConfig,
 ) -> BoxFuture<'a, Result<(), MigrateError>> {
-    let deadline = lock::Deadline::after(config.lock_wait);
     Box::pin(async move {
-        run_shared_inner(conn, deadline).await?;
-        run_store_inner(conn, name, definition, deadline).await
+        let mut wait = lock::LockWait::new(config.lock_wait);
+        run_shared_inner(conn, &mut wait).await?;
+        run_store_inner(conn, name, definition, &mut wait).await
     })
 }
 
@@ -638,23 +645,24 @@ async fn ensure_shared_schema_owned(conn: &mut PgConnection) -> Result<(), Migra
     }
 }
 
-/// Takes the migration lock for the rest of the transaction, trying until `deadline`.
-async fn lock(conn: &mut PgConnection, deadline: &lock::Deadline) -> Result<(), MigrateError> {
-    let mut pause = lock::FIRST_PAUSE;
+/// Takes the migration lock for the rest of the transaction, trying until `wait` runs out.
+async fn lock(conn: &mut PgConnection, wait: &mut lock::LockWait) -> Result<(), MigrateError> {
     loop {
         if try_lock(conn).await.map_err(MigrateError::database)? {
+            wait.taken();
             return Ok(());
         }
-        if deadline.passed() {
+        wait.busy();
+        if wait.exhausted() {
             let holder = lock_holder(conn).await.map_err(MigrateError::database)?;
             return Err(MigrateError::LockTimeout(lock::LockTimeout {
                 lock: lock::Lock::Migration,
-                waited: deadline.wait(),
+                waited: wait.waited(),
                 holder,
             }));
         }
 
-        deadline.pause(&mut pause).await;
+        wait.pause().await;
     }
 }
 

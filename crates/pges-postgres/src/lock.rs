@@ -3,8 +3,9 @@
 //! Migrations take the migration lock, and every administration operation a store's maintenance lock.
 //! Neither waits for longer than its lock wait
 //! ([`migrate::MigrateConfig::lock_wait`](crate::migrate::MigrateConfig::lock_wait),
-//! [`admin::Admin::with_lock_wait`](crate::admin::Admin::with_lock_wait), [`DEFAULT_WAIT`] by default): it
-//! fails with [`LockTimeout`], naming the session that held the lock when PostgreSQL shows it.
+//! [`admin::Admin::with_lock_wait`](crate::admin::Admin::with_lock_wait), [`DEFAULT_WAIT`] by default) in
+//! all: it fails with [`LockTimeout`], naming the session that held the lock when PostgreSQL shows it. Only
+//! time spent waiting for a lock counts, not the work done while holding one.
 
 use std::{fmt, time::Duration};
 
@@ -51,6 +52,14 @@ impl fmt::Display for BackendPid {
 }
 
 /// The session that held a lock when the wait for it ran out.
+///
+/// A session that took the migration lock in a savepoint it has since released cannot be identified: the row
+/// names the savepoint's subtransaction as its locker, and `pg_locks` no longer lists that id once the
+/// savepoint is released, though the lock lasts until the outer transaction ends. [`migrate::run`] on a
+/// connection already in a transaction leaves the lock that way after each migration, and so does a
+/// hand-written `SELECT … FOR UPDATE` in a released savepoint. [`LockTimeout::holder`] is then `None`.
+///
+/// [`migrate::run`]: crate::migrate::run
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct LockHolder {
@@ -60,7 +69,8 @@ pub struct LockHolder {
     pub role: Option<String>,
 }
 
-/// A lock stayed taken by another session for longer than the operation's lock wait. Nothing was done.
+/// A lock stayed taken by other sessions for longer than the operation's lock wait. The try that found it
+/// taken changed nothing; what the operation did under earlier locks stays done.
 ///
 /// The holder may be a legitimate migration or maintenance run that takes longer than the wait, or any
 /// session that holds the lock and does not let go: running the operation again retries.
@@ -69,7 +79,8 @@ pub struct LockHolder {
 pub struct LockTimeout {
     /// The lock.
     pub lock: Lock,
-    /// How long the operation waited.
+    /// How long the operation waited for its locks in all: the lock wait it was given, or slightly more,
+    /// since the last try comes as the wait runs out. Time spent holding a lock is not counted.
     pub waited: Duration,
     /// The session that held the lock as the wait ran out, if PostgreSQL showed one: it may have let go by
     /// the time it was looked up.
@@ -101,39 +112,85 @@ impl LockHolder {
     }
 }
 
-/// When a lock wait runs out. Locks are tried, not waited for in the server, so a waiting operation holds no
-/// lock queue entry and, between tries, no pooled connection.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Deadline {
-    wait: Duration,
-    until: tokio::time::Instant,
+/// How long an operation has waited for its locks, against its budget. Only the time between a failed try and
+/// the try that takes the lock counts, so the work an operation does while holding a lock does not use up its
+/// wait. Locks are tried, not waited for in the server, so a waiting operation holds no lock queue entry and,
+/// between tries, no pooled connection.
+#[derive(Debug)]
+pub(crate) struct LockWait {
+    budget: Duration,
+    spent: Duration,
+    since: Option<tokio::time::Instant>,
+    pause: Duration,
 }
 
-impl Deadline {
-    pub(crate) fn after(wait: interval::Interval) -> Self {
+impl LockWait {
+    pub(crate) fn new(budget: interval::Interval) -> Self {
         Self {
-            wait: wait.get(),
-            until: tokio::time::Instant::now() + wait.get(),
+            budget: budget.get(),
+            spent: Duration::ZERO,
+            since: None,
+            pause: FIRST_PAUSE,
         }
     }
 
-    pub(crate) fn wait(&self) -> Duration {
-        self.wait
+    /// A try found the lock taken: the wait runs from now, unless it already runs.
+    pub(crate) fn busy(&mut self) {
+        self.since.get_or_insert_with(tokio::time::Instant::now);
     }
 
-    pub(crate) fn passed(&self) -> bool {
-        tokio::time::Instant::now() >= self.until
+    /// A try took the lock: the wait stops counting.
+    pub(crate) fn taken(&mut self) {
+        if let Some(since) = self.since.take() {
+            self.spent += since.elapsed();
+        }
+        self.pause = FIRST_PAUSE;
     }
 
-    /// Sleeps before the next try: `pause`, cut at the deadline, which then doubles up to [`MAX_PAUSE`].
-    pub(crate) async fn pause(&self, pause: &mut Duration) {
-        tokio::time::sleep_until(self.until.min(tokio::time::Instant::now() + *pause)).await;
-        *pause = (*pause * 2).min(MAX_PAUSE);
+    /// The time spent waiting so far.
+    pub(crate) fn waited(&self) -> Duration {
+        self.spent + self.since.map_or(Duration::ZERO, |since| since.elapsed())
+    }
+
+    pub(crate) fn exhausted(&self) -> bool {
+        self.waited() >= self.budget
+    }
+
+    /// Sleeps before the next try, at most until the budget runs out. The pause doubles from [`FIRST_PAUSE`]
+    /// up to [`MAX_PAUSE`].
+    pub(crate) async fn pause(&mut self) {
+        let left = self.budget.saturating_sub(self.waited());
+        tokio::time::sleep(self.pause.min(left)).await;
+        self.pause = (self.pause * 2).min(MAX_PAUSE);
     }
 }
 
 /// The first pause between two tries of a lock.
-pub(crate) const FIRST_PAUSE: Duration = Duration::from_millis(10);
+const FIRST_PAUSE: Duration = Duration::from_millis(10);
 
 /// The longest pause between two tries: how long a lock may stay free before a waiting operation notices.
 const MAX_PAUSE: Duration = Duration::from_millis(250);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Time spent holding a lock between two waits does not count against the budget.
+    #[tokio::test]
+    async fn only_time_spent_waiting_counts() {
+        let mut wait = LockWait::new(pges_core::interval!(1 s));
+
+        wait.busy();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        wait.taken();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(wait.waited() >= Duration::from_millis(50));
+        assert!(wait.waited() < Duration::from_millis(300));
+
+        wait.busy();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(wait.waited() >= Duration::from_millis(100));
+        assert!(wait.waited() < Duration::from_millis(350));
+        assert!(!wait.exhausted());
+    }
+}

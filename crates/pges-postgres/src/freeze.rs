@@ -32,15 +32,18 @@ impl admin::Admin {
     /// for the whole run. A partition whose lock stays taken (by an anti-wraparound autovacuum) is reported
     /// in [`FreezeReport::busy`] and tried again on the next run.
     ///
-    /// Fails with [`FreezeError::StoreNotFound`] if the store does not exist.
+    /// Fails with [`FreezeError::StoreNotFound`] if the store does not exist. The lock wait
+    /// ([`admin::Admin::with_lock_wait`]) covers the whole run, not each partition: a run that waits that long
+    /// in all for the maintenance lock fails with [`FreezeError::LockTimeout`].
     pub async fn freeze_closed_partitions(&self) -> Result<FreezeReport, FreezeError> {
-        let mut conn = self.session().await?;
+        let mut wait = self.lock_wait();
+        let mut conn = self.session_within(&mut wait).await?;
         let candidates = closed_unfrozen(&mut conn, self).await;
         self.end_session(conn).await;
 
         let mut report = FreezeReport::default();
         for candidate in candidates? {
-            let mut conn = self.session().await?;
+            let mut conn = self.session_within(&mut wait).await?;
             let vacuumed = freeze(&mut conn, self, &candidate).await;
             self.end_session(conn).await;
 
@@ -130,7 +133,8 @@ pub enum FreezeError {
     #[error(transparent)]
     Database(#[from] error::DbError),
     /// The store's maintenance lock stayed taken by another session for longer than the lock wait
-    /// ([`admin::Admin::with_lock_wait`]). Partitions frozen before stay frozen; the next run continues.
+    /// ([`admin::Admin::with_lock_wait`]), counted over the whole run. The partitions frozen before it stay
+    /// frozen, but the error does not list them; the next run skips them.
     #[error(transparent)]
     LockTimeout(lock::LockTimeout),
 }
