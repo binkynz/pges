@@ -125,7 +125,9 @@ pub(crate) fn outbox_scope(store: &core_store::StoreName) -> String {
 
 /// Applies every [`SHARED`] migration the database does not have yet.
 ///
-/// Fails if an applied migration was edited, or if the database requires a newer crate.
+/// Fails if an applied migration was edited, or if the database requires a newer crate. Fails with
+/// [`MigrateError::SharedSchemaNotOwned`] when a schema `pges` exists before the first migration and the
+/// current role is not its owner.
 ///
 /// Run it on a connection outside a transaction. Each migration then runs in a transaction of its own, which a
 /// dropped future rolls back. On a connection already inside a transaction, each is a savepoint instead, and a
@@ -155,7 +157,9 @@ async fn run_shared_inner(conn: &mut PgConnection) -> Result<(), MigrateError> {
             verify_checksum(SHARED_SCOPE, migration, checksum)?;
             continue;
         }
-        if !applied.is_empty() {
+        if applied.is_empty() {
+            ensure_shared_schema_owned(&mut tx).await?;
+        } else {
             ensure_supported(&mut tx, SHARED_SCOPE, latest).await?;
         }
 
@@ -299,6 +303,18 @@ pub enum MigrateError {
     /// The shared `pges` schema is missing; run [`run_shared`] first.
     #[error("the shared pges schema is missing; run the shared migrations first")]
     SharedSchemaMissing,
+    /// The schema `pges` exists before the first shared migration and belongs to another role. A schema's
+    /// owner may drop any table in it and put its own in its place, whose triggers then run as each role
+    /// that writes to it, so the runner does not create the shared tables there. Nothing was created.
+    /// Migrate as `owner`, or drop the schema. Being a superuser or a member of `owner` is not enough.
+    #[error(
+        "schema pges already exists and belongs to {owner}, not to the migrating role; migrate as {owner} or \
+         drop the schema"
+    )]
+    SharedSchemaNotOwned {
+        /// The schema's owner.
+        owner: String,
+    },
     /// An applied migration differs from the embedded one.
     #[error("migration {version} ({name}) of scope {scope} was applied with a different text")]
     ChecksumMismatch {
@@ -549,6 +565,22 @@ async fn ensure_supported(
             scope: scope.to_owned(),
             min_compatible,
             crate_version,
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// Refuses to create the shared tables in a `pges` schema that already exists and belongs to another role.
+async fn ensure_shared_schema_owned(conn: &mut PgConnection) -> Result<(), MigrateError> {
+    let row = statement::shared_schema_owner::Query::fixed()
+        .bind(statement::shared_schema_owner::Params {})
+        .fetch_optional(conn)
+        .await
+        .map_err(MigrateError::database)?;
+
+    match row {
+        Some(row) if row.owned != Some(true) => Err(MigrateError::SharedSchemaNotOwned {
+            owner: row.owner.unwrap_or_default(),
         }),
         _ => Ok(()),
     }

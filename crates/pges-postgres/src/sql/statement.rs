@@ -475,6 +475,19 @@ crate::typed_query! {
 }
 
 crate::typed_query! {
+    /// The owner of an existing `pges` schema, and whether it is the current role.
+    pub SHARED_SCHEMA_OWNER, mod shared_schema_owner {
+        name: "migrate/shared_schema_owner",
+        files: [sql_file!("migrate/shared_schema_owner.sql")],
+        params {},
+        row {
+            owner: Option<String>,
+            owned: Option<bool>,
+        },
+    }
+}
+
+crate::typed_query! {
     /// Reads the migrations applied to a scope.
     pub APPLIED_MIGRATIONS, mod applied_migrations {
         name: "migrate/applied",
@@ -1409,6 +1422,7 @@ pub const ALL: &[&template::Statement] = &[
     &MIN_COMPATIBLE,
     &TOO_OLD,
     &MIGRATIONS_TABLE_EXISTS,
+    &SHARED_SCHEMA_OWNER,
     &APPLIED_MIGRATIONS,
     &STORES_TABLE_EXISTS,
     &STORE_EXISTS,
@@ -1511,6 +1525,7 @@ pub const TYPED: &[typed::Shape] = &[
     typed::Shape::of::<min_compatible::Query>(),
     typed::Shape::of::<too_old::Query>(),
     typed::Shape::of::<migrations_table_exists::Query>(),
+    typed::Shape::of::<shared_schema_owner::Query>(),
     typed::Shape::of::<applied_migrations::Query>(),
     typed::Shape::of::<stores_table_exists::Query>(),
     typed::Shape::of::<store_exists::Query>(),

@@ -132,6 +132,11 @@ own statements in `crates/pges-postgres/sql/migrate/`.
 - Each migration runs in its own transaction holding `pg_advisory_xact_lock(hashtext('pges.migrate'))`, so
   concurrent runners apply it once. Store migrations run with `SET LOCAL search_path` set to the store, so
   their SQL uses unqualified names.
+- The first shared migration refuses a schema `pges` that already exists and belongs to another role
+  (`crates/pges-postgres/sql/migrate/shared_schema_owner.sql`, `MigrateError::SharedSchemaNotOwned`), a
+  superuser or a member of the owner's role included: a schema's owner may drop any table in it and put its
+  own in its place, whose triggers then run as each role that writes to it. A schema created ahead by its
+  future owner (`CREATE SCHEMA pges AUTHORIZATION <owner>`) is used when that owner migrates.
 - An applied migration is compared with the embedded text by its SHA-256 checksum; an edited one fails with
   `ChecksumMismatch`. A runner whose newest migration is below the scope's `min_compatible` fails with
   `CrateTooOld`.
