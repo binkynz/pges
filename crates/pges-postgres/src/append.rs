@@ -8,6 +8,7 @@
 use std::{
     any::TypeId,
     collections::HashSet,
+    fmt,
     future::{Future, IntoFuture},
     ops::RangeInclusive,
     pin::Pin,
@@ -207,6 +208,38 @@ impl AppendMany<'_> {
     pub fn metadata(mut self, metadata: metadata::Metadata) -> Self {
         self.metadata = metadata;
         self
+    }
+}
+
+impl<E> fmt::Debug for Append<'_, E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Append")
+            .field("stream", &self.stream)
+            .field("expected", &self.expected)
+            .field("events", &self.events.len())
+            .field("metadata", &self.metadata)
+            .field("commit_id", &self.commit_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for AppendEntry<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AppendEntry")
+            .field("stream", &self.stream)
+            .field("expected", &self.expected)
+            .field("category", &self.events.category())
+            .field("events", &self.events.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for AppendMany<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AppendMany")
+            .field("entries", &self.entries)
+            .field("metadata", &self.metadata)
+            .finish_non_exhaustive()
     }
 }
 
