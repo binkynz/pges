@@ -555,3 +555,38 @@ async fn bucket_changes_apply_after_the_newest_leaf() -> Result<()> {
     );
     f.finish().await
 }
+
+/// Store names go into SQL unquoted, so `StoreName` refuses exactly the keywords that cannot name a schema:
+/// the server's reserved ones and those that cannot name a type or function (`pg_get_keywords()` with
+/// `catcode` `R` or `T`). A PostgreSQL release that adds, removes or recategorizes such a keyword fails this
+/// test, and the list in `pges_core::store` must follow.
+#[tokio::test]
+async fn store_names_refuse_the_servers_reserved_keywords() -> Result<()> {
+    let db = pges_testing::TestDb::new().await?;
+    let mut conn = db.connect().await?;
+    let keywords: Vec<(String, String)> =
+        sqlx::query_as("SELECT word, catcode::text FROM pg_get_keywords() ORDER BY word")
+            .fetch_all(&mut conn)
+            .await?;
+
+    let mut mismatched = Vec::new();
+    let mut reserved = 0;
+    for (word, catcode) in &keywords {
+        let cannot_name_a_schema = matches!(catcode.as_str(), "R" | "T");
+        reserved += usize::from(cannot_name_a_schema);
+        let refused = pges_core::store::StoreName::parse(word.as_str())
+            == Err(pges_core::store::StoreNameError::Keyword);
+        if refused != cannot_name_a_schema {
+            mismatched.push(format!("{word} ({catcode})"));
+        }
+    }
+    assert!(
+        mismatched.is_empty(),
+        "StoreName and the server disagree on: {mismatched:?}"
+    );
+    // The length of pges_core::store's keyword list: a keyword the server dropped would still be refused.
+    assert_eq!(reserved, 101, "the server has {reserved} R and T keywords");
+
+    conn.close().await?;
+    db.cleanup().await
+}
