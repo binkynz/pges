@@ -38,7 +38,8 @@ The first release: `pges`, `pges-core`, `pges-derive`, `pges-postgres`, `pges-su
   freeze, writer limits.
 - **The sequencer** (`pges-sequencer`). One leader per database, with a lease and standbys, writes a
   gap-free log of positions per store in commit order. Two sources: a logical replication slot (default) or
-  an outbox woken by `LISTEN/NOTIFY`. Slot bootstrap and resequence after a lost slot. In-process watch,
+  an outbox woken by `LISTEN/NOTIFY`. The resume token is stored at a `TokenInterval`: `Every(1 s)` by
+  default, or `EveryBatch`. Slot bootstrap and resequence after a lost slot. In-process watch,
   `NOTIFY` after each batch, and a gRPC watch server with optional TLS. A `pges-sequencer` binary (feature
   `bin`). A run that stops on an error ends in `Status::Halted` holding that error, which `run` also
   returns as an `Arc<RunError>`.

@@ -1207,14 +1207,19 @@ pub struct SequencerConfig {                 // Default; no builder
     pub batch_size: NonZeroUsize,            // 1000 commits per batch transaction
     pub lease: Lease,                        // Lease::DEFAULT: 10 s, renewed every 5 s
     pub acquire_interval: Interval,          // 1 s; a standby's acquire attempts
-    pub token_interval: Duration,            // 1 s; coarse token and high-water marks; zero: every batch;
-                                             // a value too long for an Instant never comes due
+    pub token_interval: TokenInterval,       // Every(1 s); coarse token and high-water marks
     pub retry_interval: Interval,            // 1 s; pause after an error
     pub dedupe_tail: usize,                  // 1024 older commit ids per store in the dedupe window
     pub leader: Option<String>,              // announced in pges.sequencer.leader; default none
     #[cfg(feature = "watch-notify")]
     pub notify: Notify,                      // Notify::Enabled; NOTIFY pges_<store> after each batch that
                                              // wrote rows
+}
+
+#[non_exhaustive]
+pub enum TokenInterval {                     // sequencer::TokenInterval; Copy, Eq, Default Every(1 s)
+    EveryBatch,                              // store the token with every batch
+    Every(Interval),                         // once this long has passed, in a batch or alone when idle
 }
 
 #[cfg(feature = "watch-notify")]

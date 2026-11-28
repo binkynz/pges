@@ -524,7 +524,7 @@ impl Sequencer {
     /// A fast sequencer: a token every 50 ms.
     pub fn config() -> sequencer::SequencerConfig {
         let mut config = sequencer::SequencerConfig::default();
-        config.token_interval = Duration::from_millis(50);
+        config.token_interval = sequencer::TokenInterval::Every(pges_core::interval!(50 ms));
         config
     }
 

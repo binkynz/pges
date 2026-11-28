@@ -12,6 +12,7 @@ use anyhow::Result;
 use proptest::prelude::*;
 
 use pges_core::stream;
+use pges_sequencer::sequencer;
 
 use common::{Fixture, Kind, Target};
 
@@ -45,7 +46,7 @@ fn config(batch_size: usize) -> pges_sequencer::sequencer::SequencerConfig {
     )
     .unwrap();
     config.acquire_interval = pges_core::interval!(20 ms);
-    config.token_interval = Duration::from_millis(30);
+    config.token_interval = sequencer::TokenInterval::Every(pges_core::interval!(30 ms));
     config.retry_interval = pges_core::interval!(30 ms);
     config.batch_size = NonZeroUsize::new(batch_size).unwrap();
     config

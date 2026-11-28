@@ -223,7 +223,7 @@ async fn every_configuration_is_valid() -> Result<()> {
     config.lease = sequencer::Lease::new(interval::Interval::MIN);
     config.acquire_interval = interval::Interval::MAX;
     config.retry_interval = interval::Interval::MIN;
-    config.token_interval = Duration::ZERO;
+    config.token_interval = sequencer::TokenInterval::EveryBatch;
     let _sequencer = sequencer::Sequencer::new(pool, source, config);
 
     Ok(())

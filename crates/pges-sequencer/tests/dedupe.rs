@@ -15,9 +15,9 @@ use std::{
 use anyhow::{Result, bail};
 use sqlx::{PgConnection, PgPool};
 
-use pges_core::{commit, stream};
-use pges_sequencer::source;
+use pges_core::{commit, interval, stream};
 use pges_sequencer::source_kind;
+use pges_sequencer::{sequencer, source};
 
 use common::{Fixture, Running, Target};
 
@@ -120,7 +120,7 @@ impl Harness {
 /// How a sequencer of [`Harness::start_with`] runs.
 struct Replay {
     batch_size: usize,
-    token_interval: Duration,
+    token_interval: sequencer::TokenInterval,
     visible: usize,
 }
 
@@ -128,7 +128,7 @@ impl Default for Replay {
     fn default() -> Self {
         Self {
             batch_size: 2,
-            token_interval: Duration::from_secs(3600),
+            token_interval: sequencer::TokenInterval::Every(interval!(1 h)),
             visible: usize::MAX,
         }
     }
@@ -228,7 +228,7 @@ async fn a_token_stored_while_replaying_keeps_the_rest_of_the_replay_deduplicate
     // A token after every batch of one commit.
     let eager = |visible| Replay {
         batch_size: 1,
-        token_interval: Duration::ZERO,
+        token_interval: sequencer::TokenInterval::EveryBatch,
         visible,
     };
 

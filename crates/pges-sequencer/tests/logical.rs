@@ -129,7 +129,7 @@ async fn restarts_resume_from_the_token_without_gaps_or_duplicates() -> Result<(
 
     // This one never stores a token while it runs, and crashes after its log rows committed.
     let mut lazy = common::fast();
-    lazy.token_interval = Duration::from_secs(3600);
+    lazy.token_interval = sequencer::TokenInterval::Every(pges_core::interval!(1 h));
     let running = f.start(lazy).await?;
     running.wait_leading().await?;
     let mut first_committed = None;

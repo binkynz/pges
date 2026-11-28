@@ -20,7 +20,7 @@ use anyhow::Result;
 use sqlx::Executor;
 use uuid::Uuid;
 
-use pges_core::{commit, event::Event as _, stream, version};
+use pges_core::{commit, event::Event as _, interval, stream, version};
 use pges_postgres::{admin, limit, retention};
 use pges_sequencer::{logical, sequencer, source};
 
@@ -288,7 +288,7 @@ async fn positions_continue_after_a_crash_before_the_mark_and_prune_log() -> Res
 
         // The token, and so the mark, would be stored only after an hour: the crash comes first.
         let mut slow = common::fast();
-        slow.token_interval = Duration::from_secs(3600);
+        slow.token_interval = sequencer::TokenInterval::Every(interval!(1 h));
         let running = f.start(slow).await?;
         running.wait_leading().await?;
         let late = append(&f, id_at(&f, 3, 2, 2).await?).await?;

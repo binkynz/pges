@@ -1714,8 +1714,9 @@ the halt, 43 recovered, 335 after.
   - Durations given to timers, leases and retries are `Interval`: 1 ms to 30 days.
     30 days is far above any timer the crates run, and keeps `Instant + d` and `i64` microseconds from
     overflowing. This includes `RetryPolicy::backoff` and `GrpcConfig`'s timeouts and keepalives. Fields where
-    zero means something stay `Duration`: `token_interval` (every batch), `unreachable_after` (report at the
-    first failed round), `Lease::renew` (half of a 1 ms TTL is below `Interval::MIN`).
+    zero means something stay `Duration`: `unreachable_after` (report at the first failed round),
+    `Lease::renew` (half of a 1 ms TTL is below `Interval::MIN`). `token_interval` is a `TokenInterval`:
+    `EveryBatch` or `Every(Interval)`, so "every batch" is named rather than spelled zero.
   - The sequencer's lease is a `Lease` value whose constructors keep the renew period shorter than the TTL;
     `ResequenceConfig` uses the same type. A source's kind is a `SourceKind`; a commit's event count is an
     `EventCount`, parsed where a source reads it, so the log writer does not check it again.
