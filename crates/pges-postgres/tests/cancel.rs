@@ -66,10 +66,13 @@ async fn the_harness_catches_a_transaction_left_open() -> Result<()> {
     let db = pges_testing::TestDb::new().await?;
     let pool = cancel::pool(db.url(), 1).await?;
 
+    // The statement inside the transaction waits on the server, so its reply cannot arrive while the harness
+    // yields after a poll and be taken for the future waking itself; a fast reply to `SELECT 1` was, and the
+    // whole run then counted as one poll, completing with no drop inside the transaction.
     let untracked = || async {
         let mut conn = pool.acquire().await?;
         conn.execute("BEGIN").await?;
-        conn.execute("SELECT 1").await?;
+        conn.execute("SELECT pg_sleep(0.05)").await?;
         conn.execute("COMMIT").await?;
         Ok::<_, sqlx::Error>(())
     };
