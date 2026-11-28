@@ -1172,6 +1172,14 @@ the halt, 43 recovered, 335 after.
       reads the primary's WAL insert position and lowers the target to it. A real notice's LSN is never
       above that position, so this changes nothing for it, and when the replica has kept up it costs
       nothing.
+    - A shard that missed wakes gets no LSN. A shard busy through several wakes sees only the latest, and
+      that wake's LSN says nothing of the others: an earlier one may be for the shard's own event at an
+      LSN the replica has not replayed, and since `NotifyWaker` forgets a notice once it woke a call,
+      nothing wakes the shard for it again. Before this, a forged low LSN in the latest wake made the shard
+      read the stale replica, find nothing, and wait out `max_idle`. Without an LSN the shard reads the
+      primary's insert position, one round trip, only when it missed a wake. Rejected: a running highest
+      LSN per shard, which needs state on every wake and keeps a forged high LSN, which then costs the same
+      round trip on every wake after it.
     Rejected: re-reading the head for every notice before trusting it (a round trip per wake on the
     normal path); a sharded fan-out that clamps each wake to the head it reads before waking the shards
     (one more round trip per wake); checking the notifying backend's PID against the sequencer's

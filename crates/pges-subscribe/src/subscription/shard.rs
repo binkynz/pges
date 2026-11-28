@@ -439,7 +439,8 @@ fn lowered(known: &high_water::HighWater, other: &high_water::HighWater) -> high
 struct Wake {
     /// Counts the calls that resolved.
     generation: u64,
-    /// What the waker resolved with: a hint, passed to the shards for its LSN.
+    /// What the waker resolved with: a hint, passed to the shards for its LSN (only to those that saw the
+    /// wake before it).
     high: high_water::HighWater,
     error: Option<Arc<waker::WakeError>>,
 }
@@ -496,6 +497,15 @@ impl waker::Waker for Fanned {
 
         match wake.error {
             Some(error) => Err(waker::WakeError::Other(Box::new(FannedError(error)))),
+            // The shard was busy through more than one wake and sees only the latest. Its LSN says nothing of
+            // the ones it missed: an earlier wake's LSN can be higher (the replica may not have replayed what
+            // it woke for, and the waker will not wake for it again), and the latest may be forged low. So
+            // the LSN is dropped and a replica reads from the primary's position instead.
+            None if wake.generation > seen + 1 => Ok(high_water::HighWater::new(
+                wake.high.store(),
+                wake.high.categories().to_vec(),
+                None,
+            )),
             None => Ok(wake.high),
         }
     }
@@ -724,6 +734,61 @@ mod tests {
         )
         .await;
         assert!(pending.is_err(), "{pending:?}");
+    }
+
+    #[tokio::test]
+    async fn fanned_wakers_drop_the_lsn_of_a_wake_when_they_missed_earlier_ones() {
+        let (wakes, woken) = watch::channel(Wake::default());
+        let (waiting, _waiters) = watch::channel(Waiting::new());
+        let mut fanned = Fanned {
+            woken,
+            seen: 0,
+            waiting,
+            term: (1, 1),
+        };
+        let known = high(5, &[(1, 5)]);
+        let with_lsn = |store: u64, lsn: u64| {
+            high_water::HighWater::new(
+                at(store),
+                vec![(category::CategoryId::new(1), at(store))],
+                Some(pges_core::lsn::Lsn::from(lsn)),
+            )
+        };
+
+        // One wake since the last: its LSN is what the shard was woken for.
+        wakes.send_modify(|wake| {
+            wake.generation += 1;
+            wake.high = with_lsn(6, 200);
+        });
+        let woke = waker::Waker::changed(&mut fanned, &known).await.unwrap();
+        assert_eq!(woke.lsn(), Some(pges_core::lsn::Lsn::from(200)));
+
+        // Busy through two wakes: the first was for a real event at a high LSN, the latest is forged with a
+        // low one. Only the latest is seen, so neither LSN can stand for both: the shard gets none, and a
+        // replica falls back to the primary's position.
+        wakes.send_modify(|wake| {
+            wake.generation += 1;
+            wake.high = with_lsn(7, 300);
+        });
+        wakes.send_modify(|wake| {
+            wake.generation += 1;
+            wake.high = with_lsn(u64::MAX >> 1, 1);
+        });
+        let woke = waker::Waker::changed(&mut fanned, &known).await.unwrap();
+        assert_eq!(woke.lsn(), None, "a missed wake's LSN is not known");
+        assert_eq!(woke.store(), at(u64::MAX >> 1), "positions are passed on");
+        assert_eq!(
+            woke.category(category::CategoryId::new(1)),
+            at(u64::MAX >> 1)
+        );
+
+        // Back in step: the next single wake keeps its LSN.
+        wakes.send_modify(|wake| {
+            wake.generation += 1;
+            wake.high = with_lsn(8, 400);
+        });
+        let woke = waker::Waker::changed(&mut fanned, &known).await.unwrap();
+        assert_eq!(woke.lsn(), Some(pges_core::lsn::Lsn::from(400)));
     }
 
     /// Resolves each call with a forged high-water mark, and reports the `known` it was called with.
