@@ -254,8 +254,9 @@ pub(crate) struct Pager<E> {
     /// From the stream's lowest commit id, or the snapshot's commit, to its last commit id when the read
     /// began; lets the planner skip the leaves outside.
     commits: RangeInclusive<Uuid>,
-    /// The stream's version when the read began: the pages must reach it.
-    through: i64,
+    /// The stream's version when the read began, the version of `commits.end()`: the pages must reach
+    /// it, and no page holds a commit above it.
+    last_version: i64,
     on_unknown: event::OnUnknown,
     finished: Finished,
     events: PhantomData<fn() -> E>,
@@ -274,19 +275,21 @@ impl<E: event::Event> Pager<E> {
         stream_id: stream::StreamId,
         from: version::Version,
         commits: RangeInclusive<Uuid>,
-        through: i64,
+        last_version: i64,
         on_unknown: event::OnUnknown,
     ) -> Self {
+        let next_last_version = append::to_i64(from);
+
         Self {
             store,
             category,
             stream_id,
             from,
-            next_last_version: append::to_i64(from),
+            next_last_version,
             commits,
-            through,
+            last_version,
             on_unknown,
-            finished: Finished::No,
+            finished: finished_after(next_last_version, last_version),
             events: PhantomData,
         }
     }
@@ -295,7 +298,8 @@ impl<E: event::Event> Pager<E> {
         self.finished == Finished::Yes
     }
 
-    /// Appends the next page's events to `out`; marks the pager finished after the last page.
+    /// Appends the next page's events to `out`; marks the pager finished after the last page: a short page,
+    /// or one that reached the stream's version when the read began.
     pub(crate) async fn next_page(
         &mut self,
         out: &mut VecDeque<stream::StreamEvent<E>>,
@@ -319,8 +323,11 @@ impl<E: event::Event> Pager<E> {
         for row in &rows {
             self.decode_commit(row.row()?, out).await?;
         }
-        if self.is_finished() && self.next_last_version <= self.through {
+        if self.is_finished() && self.next_last_version <= self.last_version {
             return Err(self.missing_versions().await);
+        }
+        if finished_after(self.next_last_version, self.last_version) == Finished::Yes {
+            self.finished = Finished::Yes;
         }
 
         Ok(())
@@ -413,6 +420,16 @@ impl<E: event::Event> Pager<E> {
         }
 
         Ok(())
+    }
+}
+
+/// Whether a pager whose next page starts at `next_last_version` is done: the commits it reads end at the
+/// commit of `last_version`, so no page above it holds a row.
+fn finished_after(next_last_version: i64, last_version: i64) -> Finished {
+    if next_last_version > last_version {
+        Finished::Yes
+    } else {
+        Finished::No
     }
 }
 

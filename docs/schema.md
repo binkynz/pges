@@ -484,7 +484,9 @@ leaves to 1 (planning 0.93 → 0.12 ms, execution 0.30 → 0.015 ms, 125 → 6 l
 stream still probes every leaf of its lifetime (an `orders` stream of 19 months, 24 → 20); snapshots are the
 lever there. The upper bound also ends the read at the head's version: commits appended during a read are not
 returned, consistent with the snapshot's `version <= streams.version` check. The first commit returned can
-start below `$2`; the client skips those events. The next page uses `$2 = previous last_version + 1`.
+start below `$2`; the client skips those events. The next page uses `$2 = previous last_version + 1`. The
+read ends once that is above `streams.version` from the head read, which belongs to the commit `$4` names, so
+a stream whose length is a multiple of the page size, or a snapshot at the head, asks for no empty page.
 
 Retention can raise the floor and drop the oldest commits, or `delete_stream` delete them, after the head
 read. So the client checks that the pages are contiguous: each commit starts at or below the next version it

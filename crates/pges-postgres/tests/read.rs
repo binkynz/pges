@@ -8,7 +8,7 @@ use anyhow::Result;
 use futures_util::TryStreamExt;
 
 use pges_core::{event, metadata, stream, version};
-use pges_postgres::{append, load, read};
+use pges_postgres::{append, load, read, store};
 
 use common::{
     BusyJob, BusyJobV2, Closed, Fixture, Job, JobEvent, NewerJobEvent, OrderEvent, Placed, v,
@@ -501,4 +501,79 @@ async fn orders_round_trip_through_their_own_partition() -> Result<()> {
     assert_eq!(events[0].event, OrderEvent::Placed(Placed { total: 12 }));
     assert_eq!(events[0].category, common::ORDERS);
     f.finish().await
+}
+
+/// A read stops at the stream's version when it began without asking for another page: a stream of exactly
+/// one page (256 commits) is one page query for `load` and `read_stream`, and a load from a snapshot at the
+/// head runs none. Counted as scans of the jobs partition's leaves, once the reading pool has closed.
+#[tokio::test]
+async fn a_read_that_reaches_the_head_asks_for_no_more_pages() -> Result<()> {
+    const COMMITS: usize = 256;
+
+    let f = Fixture::new().await?;
+    let id = stream::StreamId::new_v7();
+    let mut expected = version::ExpectedVersion::NoStream;
+    for i in 0..COMMITS {
+        let result = f
+            .store
+            .append(id, expected, &[JobEvent::created(&i.to_string())])
+            .await?;
+        expected = result.expected();
+    }
+    // The appends' pool closes before counting, so whatever it scanned is reported first.
+    f.pool.close().await;
+    let before = scans_of_jobs(&f).await?;
+
+    let reading = f.db.pool().await?;
+    let store =
+        store::Store::open(reading.clone(), store::StoreConfig::new(common::STORE_NAME)).await?;
+    let loaded = store.load::<Job>(id).await?;
+    let events: Vec<stream::StreamEvent<JobEvent>> = store
+        .read_stream(id, version::Version::FIRST)
+        .try_collect()
+        .await?;
+    store.save_snapshot(&loaded).await?;
+    let from_snapshot = store.load_snapshotted::<Job>(id).await?;
+    reading.close().await;
+    let scans = scans_of_jobs(&f).await? - before;
+
+    assert_eq!(loaded.version(), Some(v(COMMITS as u64)));
+    assert_eq!(loaded.state().titles.len(), COMMITS);
+    assert_eq!(events.len(), COMMITS);
+    assert_eq!(from_snapshot.version(), loaded.version());
+    assert_eq!(from_snapshot.commit_id(), loaded.commit_id());
+    assert_eq!(from_snapshot.state(), loaded.state());
+    assert_eq!(
+        scans, 2,
+        "one page each for load and read_stream, none from the snapshot"
+    );
+    f.finish().await
+}
+
+/// The scans (sequential and index) of the leaves of `es.commits_jobs`, once the backends that ran them
+/// have exited and reported them: the same in three reads in a row.
+async fn scans_of_jobs(f: &Fixture) -> Result<i64> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let (mut previous, mut same) = (-1, 0);
+    loop {
+        let mut conn = f.db.connect().await?;
+        let scans: i64 = sqlx::query_scalar(
+            "SELECT coalesce(sum(coalesce(seq_scan, 0) + coalesce(idx_scan, 0)), 0)::int8
+             FROM pg_stat_user_tables WHERE schemaname = 'es' AND relname LIKE 'commits\\_jobs\\_\\_%'",
+        )
+        .fetch_one(&mut conn)
+        .await?;
+        sqlx::Connection::close(conn).await?;
+        same = if scans == previous { same + 1 } else { 0 };
+        if same == 2 {
+            return Ok(scans);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the scans of commits_jobs kept changing"
+        );
+
+        previous = scans;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
 }
