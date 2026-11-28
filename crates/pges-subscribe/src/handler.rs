@@ -4,9 +4,9 @@
 use std::{error, future::Future};
 
 use futures_util::future::BoxFuture;
-use sqlx::PgConnection;
+use sqlx::{Connection, PgConnection, Postgres, Transaction};
 
-use crate::batch;
+use crate::{batch, sql::statement};
 
 /// A boxed error from a handler.
 pub type BoxError = Box<dyn error::Error + Send + Sync + 'static>;
@@ -26,9 +26,8 @@ pub type BoxError = Box<dyn error::Error + Send + Sync + 'static>;
 /// its attempts run out, except an integrity constraint violation or a data exception (SQLSTATE class 23 or
 /// 22, such as a deferred unique constraint), which is fatal.
 ///
-/// Keep the transaction at READ COMMITTED, the default. Under REPEATABLE READ or SERIALIZABLE, a lease
-/// renewal during a batch slower than half the lease changes the subscription's row after the handler's
-/// snapshot, and the checkpoint fails with a serialization failure on every attempt.
+/// The transaction runs at the level [`PgHandler::isolation`] asks for. It is already under way when
+/// `handle` is called, so `SET TRANSACTION ISOLATION LEVEL` fails there.
 ///
 /// Savepoints (`tx.begin()`) are allowed, but a savepoint begin that fails (on an aborted transaction) or is
 /// dropped before it completes makes sqlx roll back the whole transaction; the handler's statements after it
@@ -41,6 +40,30 @@ pub trait PgHandler: Send {
         tx: &mut PgConnection,
         batch: &batch::Batch,
     ) -> impl Future<Output = Result<(), HandlerError>> + Send;
+
+    /// The isolation level of the batch's transaction. Default: [`Isolation::Default`].
+    fn isolation(&self) -> Isolation {
+        Isolation::Default
+    }
+}
+
+/// The isolation level of a [`PgHandler`]'s transaction.
+///
+/// Any level keeps the batch exactly once. The subscription locks its own row in the transaction before
+/// the handler runs, so a serialization failure comes only from the handler's own tables (or from the
+/// COMMIT), and follows the subscription's [`RetryPolicy`](crate::subscription::RetryPolicy) like any
+/// retryable error.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Isolation {
+    /// The session's `default_transaction_isolation`: READ COMMITTED unless the role or the server says
+    /// otherwise.
+    #[default]
+    Default,
+    /// REPEATABLE READ: one snapshot for the whole batch.
+    RepeatableRead,
+    /// SERIALIZABLE.
+    Serializable,
 }
 
 /// A subscriber that writes somewhere else: a search index, a broker, another service.
@@ -94,6 +117,8 @@ pub(crate) trait DynPgHandler: Send {
         tx: &'a mut PgConnection,
         batch: &'a batch::Batch,
     ) -> BoxFuture<'a, Result<(), HandlerError>>;
+
+    fn isolation(&self) -> Isolation;
 }
 
 impl<T: PgHandler> DynPgHandler for T {
@@ -103,6 +128,25 @@ impl<T: PgHandler> DynPgHandler for T {
         batch: &'a batch::Batch,
     ) -> BoxFuture<'a, Result<(), HandlerError>> {
         Box::pin(PgHandler::handle(self, tx, batch))
+    }
+
+    fn isolation(&self) -> Isolation {
+        PgHandler::isolation(self)
+    }
+}
+
+/// Begins a batch's transaction at `isolation`.
+pub(crate) async fn begin(
+    conn: &mut PgConnection,
+    isolation: Isolation,
+) -> Result<Transaction<'_, Postgres>, sqlx::Error> {
+    match isolation {
+        Isolation::Default => conn.begin().await,
+        Isolation::RepeatableRead => {
+            conn.begin_with(statement::BEGIN_REPEATABLE_READ.sql())
+                .await
+        }
+        Isolation::Serializable => conn.begin_with(statement::BEGIN_SERIALIZABLE.sql()).await,
     }
 }
 

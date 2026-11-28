@@ -954,7 +954,11 @@ impl FallbackLimit {
 pub trait PgHandler: Send {                // run_pg: writes only through tx; never commits it
     fn handle(&mut self, tx: &mut PgConnection, batch: &batch::Batch)
         -> impl Future<Output = Result<(), HandlerError>> + Send;
+    fn isolation(&self) -> Isolation { Isolation::Default }   // tx's level; also for backfills
 }
+#[non_exhaustive]
+#[derive(Default)]
+pub enum Isolation { #[default] Default, RepeatableRead, Serializable }
 // Savepoints on tx are allowed; one whose begin fails or is dropped ends tx (sqlx 0.9.1), and the batch is
 // retried as transient like an aborted one: no checkpoint moves.
 
@@ -1026,10 +1030,14 @@ The first `.categories(..)` takes a `NonEmpty<CategoryName>`, later ones any ite
   handler.
 - Frames decode through `pges_core::frame`. Type ids come from the store's `event_types`, reloaded once when
   an id is unknown (`SubscribeError::UnknownEventType` if it stays unknown).
-- `run_pg`: the handler runs in a transaction, then the fenced checkpoint runs in the same transaction, then
-  it commits. The read model must live in the store's database. After any retried error the subscriber
-  re-reads its stored cursor, and the checkpoint moves the cursor only from where the subscriber holds it,
-  so a COMMIT whose reply was lost does not deliver the batch twice, also when it lands after the re-read.
+- `run_pg`: the transaction begins at `PgHandler::isolation()` (`handler::Isolation::{Default,
+  RepeatableRead, Serializable}`, `#[non_exhaustive]`; `Default` is the session's
+  `default_transaction_isolation`) and locks the subscription's row, fenced, before the handler runs. Then
+  the handler runs, the checkpoint runs in the same transaction, and it commits. The read model must live in
+  the store's database. After any retried error the subscriber re-reads its stored cursor, and the checkpoint
+  moves the cursor only from where the subscriber holds it, so a COMMIT whose reply was lost does not deliver
+  the batch twice, also when it lands after the re-read. A handler cannot set the level itself:
+  `SET TRANSACTION ISOLATION LEVEL` fails after the lock, and the run stops with `HandlerFailed`.
 - `run`: the handler runs first, then an autocommit checkpoint. A crash or lost lease in between delivers the
   batch again; make the effect idempotent.
 - A handler that leaves its transaction aborted is detected (25P02 at the checkpoint), rolled back, and
@@ -1041,9 +1049,9 @@ The first `.categories(..)` takes a `NonEmpty<CategoryName>`, later ones any ite
   fault and pass (a lock or statement timeout, say behind a lost COMMIT's row lock, a serialization failure,
   a read-only transaction during a failover), except an integrity constraint violation or a data exception
   (SQLSTATE class 23 or 22, such as a deferred unique constraint), which fails every attempt the same way
-  and is fatal. A lost connection or a FATAL error may hide a commit, and stays a database error. Handlers keep READ COMMITTED: under REPEATABLE READ or SERIALIZABLE a side renewal
-  during a slow batch updates the subscription's row after the handler's snapshot, and every checkpoint
-  attempt fails with 40001.
+  and is fatal. A lost connection or a FATAL error may hide a commit, and stays a database error. Any
+  isolation level works: nothing updates the subscription's row during the handler, so a serialization
+  failure comes only from the handler's own tables or the COMMIT.
 - Category names are checked against `categories` at start (`UnknownCategory`). The requested categories are
   compared with `subscriptions.category_ids`; a mismatch fails with
   `SubscribeError::DefinitionChanged { stored, requested }` unless `.redefine(Start::…)` is given. A changed
@@ -1077,17 +1085,21 @@ The first `.categories(..)` takes a `NonEmpty<CategoryName>`, later ones any ite
   permits per instance.
 - Leases: takeover with a fence bump, renewal only when less than half the lease is left: piggybacked on a
   checkpoint where possible, otherwise in autocommit on another connection of the store's pool, including
-  while a handler runs and while a failed batch waits for its retry. A batch slower than the lease keeps it,
-  provided the pool has a connection to spare. A side renewal that finds the fence moved stops the batch
-  from being checkpointed (`run_pg` rolls back, `run` skips the checkpoint) once the handler's call returns;
-  the handler is not cancelled, and the instance goes back to standby. If the handler also failed in that
-  call, the lost lease wins over its error, fatal or transient. A failed side renewal is retried after a
-  lease/8 and is not shown as `Recovering`; the fenced checkpoint keeps a lapsed lease safe. A backoff
-  whose renewal found the fence moved still runs to its end before the instance stands by. Release on
-  shutdown and on a fatal error, so a standby takes over at once.
-- Pool size: `run_pg` holds one connection for the handler's transaction and needs another for side
-  renewal; `run` needs one; a waker adds `Waker::store_connections()` (1 for a `NotifyWaker` on the store's
-  pool). A subscription whose store's pool allows fewer fails at start with
+  while a `run` handler runs and while a failed batch waits for its retry. A `run_pg` batch holds the
+  subscription's row locked from before its handler to its COMMIT; acquire skips locked rows, so the lock
+  is the lease meanwhile, however long the batch takes, and the checkpoint renews the stored lease. A `run`
+  batch slower than the lease keeps it, provided the pool has a connection to spare. A side renewal that
+  finds the fence moved stops a `run` batch from being checkpointed once the handler's call returns; the
+  handler is not cancelled, and the instance goes back to standby. If the handler also failed in that call,
+  the lost lease wins over its error, fatal or transient. A `run_pg` batch whose lock finds the fence moved
+  runs no handler and stands by. A failed side renewal is retried after a lease/8 and is not shown as
+  `Recovering`; the fenced checkpoint keeps a lapsed lease safe. A backoff whose renewal found the fence
+  moved still runs to its end before the instance stands by. Release on shutdown and on a fatal error, so a
+  standby takes over at once. A `run_pg` holder that dies releases its lock with its connection: at once
+  when the process exits, after the server's TCP keepalives notice a vanished host. A holder that hangs in
+  its handler keeps the shard, as a side renewal would have kept it.
+- Pool size: `run_pg` holds one connection for the handler's transaction, which is all it needs; `run`
+  needs one; a waker adds `Waker::store_connections()` (1 for a `NotifyWaker` on the store's pool). A subscription whose store's pool allows fewer fails at start with
   `SubscribeError::PoolTooSmall { max_connections, needed }`. Other users of the pool need their own
   connections on top. Size the pool for the sum: appends' and reads' concurrency plus each subscription's
   share (documented on `Builder`, Pool size). A sharded instance reads its shards at the same time: add one

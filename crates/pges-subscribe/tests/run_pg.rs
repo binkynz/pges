@@ -408,23 +408,25 @@ async fn a_refused_commit_is_a_handler_failure() -> Result<()> {
     f.finish().await
 }
 
-/// Takes its snapshot in REPEATABLE READ, then records after a pause longer than half the lease, so a side
-/// renewal updates the subscription's row after the snapshot.
-struct RepeatableRead {
+/// Takes its snapshot at the isolation level it asks for, then records after a pause longer than the lease.
+/// It notes the level its transaction ran at.
+struct Isolated {
     recorder: Recorder,
+    isolation: handler::Isolation,
     pause: Duration,
+    levels: Arc<Mutex<Vec<String>>>,
 }
 
-impl handler::PgHandler for RepeatableRead {
+impl handler::PgHandler for Isolated {
     async fn handle(
         &mut self,
         tx: &mut PgConnection,
         batch: &batch::Batch,
     ) -> Result<(), handler::HandlerError> {
-        *self.recorder.calls.lock().unwrap() += 1;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-            .execute(&mut *tx)
+        let level: String = sqlx::query_scalar("SELECT current_setting('transaction_isolation')")
+            .fetch_one(&mut *tx)
             .await?;
+        self.levels.lock().unwrap().push(level);
         sqlx::query("SELECT count(*) FROM public.delivered")
             .execute(&mut *tx)
             .await?;
@@ -432,38 +434,113 @@ impl handler::PgHandler for RepeatableRead {
         self.recorder.record(tx, batch).await?;
         Ok(())
     }
+
+    fn isolation(&self) -> handler::Isolation {
+        self.isolation
+    }
 }
 
-/// The checkpoint's serialization failure follows the retry policy: the run stops once it runs out of
-/// attempts, instead of retrying the batch for good as a database error.
+/// A handler at REPEATABLE READ or SERIALIZABLE whose batches outlast the lease keeps its lease and is
+/// checkpointed: nothing renews the subscription's row after the handler's snapshot, and a standby does not
+/// take over.
 #[tokio::test]
-async fn a_checkpoint_serialization_failure_follows_the_retry_policy() -> Result<()> {
+async fn a_repeatable_read_or_serializable_batch_slower_than_the_lease_is_checkpointed()
+-> Result<()> {
+    let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    jobs(&f, 2).await?;
+
+    for (name, isolation, level) in [
+        (
+            "repeatable",
+            handler::Isolation::RepeatableRead,
+            "repeatable read",
+        ),
+        (
+            "serializable",
+            handler::Isolation::Serializable,
+            "serializable",
+        ),
+    ] {
+        let levels = Arc::new(Mutex::new(Vec::new()));
+        let subscription = |f: &Fixture, levels: &Arc<Mutex<Vec<String>>>| {
+            f.store
+                .subscription(subscription::SubscriptionName::new(name).unwrap())
+                .categories(non_empty![category!("jobs")])
+                .batch_size(NonZeroU32::new(1).unwrap())
+                .lease(interval!(400 ms))
+                .acquire_interval(interval!(10 ms))
+                .on_error(retry(1))
+                .run_pg(Isolated {
+                    recorder: Recorder::new(name),
+                    isolation,
+                    pause: Duration::from_millis(600),
+                    levels: levels.clone(),
+                })
+        };
+        let first = common::Running::spawn(subscription(&f, &levels));
+        common::wait_state(first.handle.status_changes(), |s| {
+            matches!(s, subscription::State::Running)
+        })
+        .await?;
+        let second = common::Running::spawn(subscription(&f, &Arc::new(Mutex::new(Vec::new()))));
+        let took_over = runs(second.handle.status_changes());
+
+        first.wait_position(2).await?;
+        assert!(
+            !took_over.is_finished(),
+            "{name}: the standby took over from a busy holder"
+        );
+        took_over.abort();
+        assert_eq!(*levels.lock().unwrap(), [level, level], "{name}");
+
+        second.stop().await?;
+        first.stop().await?;
+        common::check_delivery(
+            &f.delivered(name).await?,
+            &f.expected(&[f.id(Cat::Jobs)]).await?,
+        )?;
+    }
+
+    f.finish().await
+}
+
+/// Sets its isolation level itself, too late: the subscription's statements came first.
+struct SetsItsIsolation;
+
+impl handler::PgHandler for SetsItsIsolation {
+    async fn handle(
+        &mut self,
+        tx: &mut PgConnection,
+        _batch: &batch::Batch,
+    ) -> Result<(), handler::HandlerError> {
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *tx)
+            .await?;
+        Ok(())
+    }
+}
+
+/// `SET TRANSACTION ISOLATION LEVEL` in the handler fails, and stops the run: the level comes from
+/// `PgHandler::isolation`.
+#[tokio::test]
+async fn a_handler_cannot_set_its_isolation_level_itself() -> Result<()> {
     let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
     jobs(&f, 1).await?;
-    let recorder = Recorder::new("repeatable");
 
     let error = common::Running::spawn(
         f.store
-            .subscription(subscription_name!("repeatable"))
+            .subscription(subscription_name!("set-isolation"))
             .categories(non_empty![category!("jobs")])
-            .lease(interval!(400 ms))
-            .retry_interval(interval!(10 ms))
-            .on_error(retry(2))
-            .run_pg(RepeatableRead {
-                recorder: recorder.clone(),
-                pause: Duration::from_millis(400),
-            }),
+            .run_pg(SetsItsIsolation),
     )
     .stopped()
     .await?;
     assert!(
         matches!(&error, subscription::SubscribeError::HandlerFailed { source, .. }
-            if source.to_string().contains("could not serialize")),
+            if source.to_string().contains("before any query")),
         "{error:?}"
     );
-    assert_eq!(recorder.calls(), 2, "retried per the policy");
-    assert_eq!(f.cursor("repeatable").await?, Some(0));
-    assert!(f.delivered("repeatable").await?.is_empty());
+    assert_eq!(f.cursor("set-isolation").await?, Some(0));
 
     f.finish().await
 }
@@ -620,45 +697,49 @@ impl handler::PgHandler for Gated {
     }
 }
 
+/// Another instance takes the shard over while the holder waits for new events, before its next renewal: the
+/// holder's next batch finds the fence moved when it locks the row, runs no handler, and stands by.
 #[tokio::test]
 async fn a_deposed_instance_is_fenced_out() -> Result<()> {
     let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
-    jobs(&f, 4).await?;
+    let id = jobs(&f, 2).await?;
 
-    let (entered, gate) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    let recorder = Recorder::new("fenced");
     let running = common::Running::spawn(
         f.store
             .subscription(subscription_name!("fenced"))
             .categories(non_empty![category!("jobs")])
-            .lease(interval!(300 ms))
             .acquire_interval(interval!(20 ms))
-            .run_pg(Gated {
-                recorder: Recorder::new("fenced"),
-                entered: entered.clone(),
-                gate: gate.clone(),
-                first: Arc::new(Mutex::new(true)),
-            }),
+            .waker(recheck::Recheck::every(interval!(20 ms)))
+            .run_pg(recorder.clone()),
     );
-    tokio::time::timeout(Duration::from_secs(20), entered.notified())
-        .await
-        .context("the handler was not called")?;
+    running.wait_position(2).await?;
 
-    // Another instance took over in the meantime: the in-flight batch must not commit.
-    sqlx::query("UPDATE es.subscriptions SET fence = fence + 1 WHERE name = 'fenced'")
-        .execute(&f.pool)
-        .await?;
+    // The default lease is 15 s, so no renewal comes before the next batch.
+    sqlx::query(
+        "UPDATE es.subscriptions SET fence = fence + 1, lease_until = now() + interval '1 hour'
+         WHERE name = 'fenced'",
+    )
+    .execute(&f.pool)
+    .await?;
     let mut status = running.handle.status_changes();
-    gate.notify_one();
+    f.append(Cat::Jobs, id, 1).await?;
+    f.append(Cat::Jobs, id, 1).await?;
+    f.sequence_all().await?;
     tokio::time::timeout(
         Duration::from_secs(20),
         status.wait_for(|s| matches!(s.state, subscription::State::Standby)),
     )
     .await
     .context("the deposed instance did not stand down")??;
-    assert!(f.delivered("fenced").await?.is_empty());
-    assert_eq!(f.cursor("fenced").await?, Some(0));
+    assert_eq!(recorder.calls(), 1, "no handler ran after the takeover");
+    assert_eq!(f.delivered("fenced").await?.len(), 2);
+    assert_eq!(f.cursor("fenced").await?, Some(2));
 
-    // Once the lease lapses, it takes the lease back and delivers everything once.
+    // The other instance lets go: this one takes the lease back and delivers everything once.
+    sqlx::query("UPDATE es.subscriptions SET lease_until = NULL WHERE name = 'fenced'")
+        .execute(&f.pool)
+        .await?;
     running.wait_position(4).await?;
     running.stop().await?;
     common::check_delivery(
@@ -668,7 +749,6 @@ async fn a_deposed_instance_is_fenced_out() -> Result<()> {
 
     f.finish().await
 }
-
 #[tokio::test]
 async fn a_changed_definition_needs_redefine() -> Result<()> {
     let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
@@ -953,9 +1033,9 @@ impl handler::PgHandler for Slow {
     }
 }
 
-/// A lease renewed by a checkpoint inside `run_pg`'s transaction runs from the transaction's start (`now()`),
-/// not from the checkpoint. The holder must count it the same way, or it renews too late after a slow batch
-/// and a standby takes over while the holder is idle.
+/// A lease renewed by the checkpoint at the end of a `run_pg` batch counts from the checkpoint, not from the
+/// transaction's start, which came before the handler ran. If it counted from the start, the holder would
+/// renew too late after a slow batch and a standby would take over while the holder is idle.
 #[tokio::test]
 async fn a_slow_batch_does_not_lose_the_lease_while_idle() -> Result<()> {
     let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
@@ -1007,8 +1087,8 @@ fn runs(
     })
 }
 
-/// The lease is renewed on another connection while the handler runs, so a batch slower than the whole
-/// lease does not hand over to a standby.
+/// The batch's row lock keeps the lease while the handler runs, so a batch slower than the whole lease does
+/// not hand over to a standby.
 #[tokio::test]
 async fn a_batch_slower_than_the_lease_keeps_it() -> Result<()> {
     let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
@@ -1145,25 +1225,119 @@ async fn shutdown_ends_a_retry_backoff() -> Result<()> {
     f.finish().await
 }
 
-/// A renewal during the handler finds that another instance took the lease: the batch is not checkpointed,
-/// the other instance's lease is left alone, and this one stands by until the other lets go.
+/// The batch's transaction holds the subscription's row while the handler runs, past the lease: a standby
+/// does not take over, a write to the row waits for the batch, and the batch is checkpointed.
 #[tokio::test]
-async fn a_renewal_that_finds_the_fence_moved_stops_the_checkpoint() -> Result<()> {
+async fn a_batch_holds_the_subscription_row_until_it_commits() -> Result<()> {
     let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
     jobs(&f, 3).await?;
 
     let (entered, gate) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    let subscription = |f: &Fixture, entered: &Arc<Notify>, gate: &Arc<Notify>, first: bool| {
+        f.store
+            .subscription(subscription_name!("held"))
+            .categories(non_empty![category!("jobs")])
+            .lease(interval!(200 ms))
+            .acquire_interval(interval!(20 ms))
+            .run_pg(Gated {
+                recorder: Recorder::new("held"),
+                entered: entered.clone(),
+                gate: gate.clone(),
+                first: Arc::new(Mutex::new(first)),
+            })
+    };
+    let running = common::Running::spawn(subscription(&f, &entered, &gate, true));
+    tokio::time::timeout(Duration::from_secs(20), entered.notified())
+        .await
+        .context("the handler was not called")?;
+    let standby = common::Running::spawn(subscription(
+        &f,
+        &Arc::new(Notify::new()),
+        &Arc::new(Notify::new()),
+        false,
+    ));
+    let took_over = runs(standby.handle.status_changes());
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let lapsed: bool =
+        sqlx::query_scalar("SELECT lease_until < now() FROM es.subscriptions WHERE name = 'held'")
+            .fetch_one(&f.pool)
+            .await?;
+    assert!(lapsed, "the stored lease lapsed while the handler ran");
+    let mut tx = f.pool.begin().await?;
+    sqlx::query("SET LOCAL lock_timeout = '100ms'")
+        .execute(&mut *tx)
+        .await?;
+    let takeover = sqlx::query("UPDATE es.subscriptions SET fence = fence + 1 WHERE name = 'held'")
+        .execute(&mut *tx)
+        .await;
+    assert!(
+        matches!(&takeover, Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("55P03")),
+        "a takeover did not wait for the batch: {takeover:?}"
+    );
+    tx.rollback().await?;
+
+    gate.notify_one();
+    running.wait_position(3).await?;
+    assert!(
+        !took_over.is_finished(),
+        "the standby took over from a busy holder"
+    );
+    took_over.abort();
+
+    standby.stop().await?;
+    running.stop().await?;
+    common::check_delivery(
+        &f.delivered("held").await?,
+        &f.expected(&[f.id(Cat::Jobs)]).await?,
+    )?;
+
+    f.finish().await
+}
+
+/// A `run` handler that holds its first call until the test opens the gate, and counts its calls.
+struct GatedExternal {
+    calls: Arc<Mutex<usize>>,
+    entered: Arc<Notify>,
+    gate: Arc<Notify>,
+}
+
+impl handler::Handler for GatedExternal {
+    async fn handle(&mut self, _batch: &batch::Batch) -> Result<(), handler::HandlerError> {
+        let call = {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            *calls
+        };
+        if call == 1 {
+            self.entered.notify_one();
+            self.gate.notified().await;
+        }
+        Ok(())
+    }
+}
+
+/// `run`, for contrast: a side renewal during the handler finds that another instance took the lease, the
+/// batch is not checkpointed, the other instance's lease is left alone, and this one stands by until the
+/// other lets go.
+#[tokio::test]
+async fn a_renewal_beside_a_run_handler_that_finds_the_fence_moved_stops_the_checkpoint()
+-> Result<()> {
+    let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    jobs(&f, 3).await?;
+
+    let (entered, gate) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    let calls = Arc::new(Mutex::new(0));
     let running = common::Running::spawn(
         f.store
             .subscription(subscription_name!("taken"))
             .categories(non_empty![category!("jobs")])
             .lease(interval!(200 ms))
             .acquire_interval(interval!(20 ms))
-            .run_pg(Gated {
-                recorder: Recorder::new("taken"),
+            .run(GatedExternal {
+                calls: calls.clone(),
                 entered: entered.clone(),
                 gate: gate.clone(),
-                first: Arc::new(Mutex::new(true)),
             }),
     );
     tokio::time::timeout(Duration::from_secs(20), entered.notified())
@@ -1186,7 +1360,6 @@ async fn a_renewal_that_finds_the_fence_moved_stops_the_checkpoint() -> Result<(
     )
     .await
     .context("the deposed instance did not stand down")??;
-    assert!(f.delivered("taken").await?.is_empty());
     assert_eq!(f.cursor("taken").await?, Some(0));
     let long_lease: bool = sqlx::query_scalar(
         "SELECT lease_until > now() + interval '30 minutes' FROM es.subscriptions WHERE name = 'taken'",
@@ -1195,16 +1368,13 @@ async fn a_renewal_that_finds_the_fence_moved_stops_the_checkpoint() -> Result<(
     .await?;
     assert!(long_lease, "the deposed instance changed the new lease");
 
-    // The other instance lets go: this one takes over and delivers everything once.
+    // The other instance lets go: this one takes over and delivers the batch again.
     sqlx::query("UPDATE es.subscriptions SET lease_until = NULL WHERE name = 'taken'")
         .execute(&f.pool)
         .await?;
     running.wait_position(3).await?;
     running.stop().await?;
-    common::check_delivery(
-        &f.delivered("taken").await?,
-        &f.expected(&[f.id(Cat::Jobs)]).await?,
-    )?;
+    assert_eq!(*calls.lock().unwrap(), 2);
 
     f.finish().await
 }

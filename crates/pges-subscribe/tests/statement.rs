@@ -39,23 +39,46 @@ fn binds_and_reads_are_typed() -> Result<()> {
 
 #[test]
 fn every_query_is_typed() {
-    let queries: BTreeSet<&str> = statement::ALL.iter().map(|s| s.name).collect();
+    let queries: BTreeSet<&str> = statement::ALL
+        .iter()
+        .filter(|s| s.kind == template::Kind::Query)
+        .map(|s| s.name)
+        .collect();
     let typed: Vec<&str> = statement::TYPED.iter().map(|s| s.statement.name).collect();
 
     assert_eq!(typed.iter().copied().collect::<BTreeSet<_>>(), queries);
     assert_eq!(typed.len(), queries.len(), "a query is listed twice");
 }
 
-#[test]
-fn every_statement_is_a_query() {
-    for statement in statement::ALL {
-        assert_eq!(
-            statement.kind,
-            template::Kind::Query,
-            "{} is DDL, which this crate does not run",
-            statement.name
-        );
+/// The only statements that are not queries begin a handler's transaction at an isolation level.
+#[tokio::test]
+async fn ddl_statements_run() -> Result<()> {
+    let db = pges_testing::TestDb::new().await?;
+    let mut conn = db.connect().await?;
+    let mut ran = BTreeSet::new();
+
+    for (begin, level) in [
+        (&statement::BEGIN_REPEATABLE_READ, "repeatable read"),
+        (&statement::BEGIN_SERIALIZABLE, "serializable"),
+    ] {
+        pges_testing::statement::run_ddl(&mut conn, begin, &values()).await?;
+        ran.insert(begin.name);
+        let current: String = sqlx::query_scalar("SELECT current_setting('transaction_isolation')")
+            .fetch_one(&mut conn)
+            .await?;
+        assert_eq!(current, level, "{}", begin.name);
+        sqlx::query("ROLLBACK").execute(&mut conn).await?;
     }
+
+    let ddl: BTreeSet<&str> = statement::ALL
+        .iter()
+        .filter(|s| s.kind == template::Kind::Ddl)
+        .map(|s| s.name)
+        .collect();
+    assert_eq!(ran, ddl, "every DDL statement runs in this test");
+
+    drop(conn);
+    db.cleanup().await
 }
 
 #[tokio::test]

@@ -184,8 +184,8 @@ async fn fill(
 ## Pool size
 
 Subscriptions share the store's pool with appends and reads. Size it as at least the connections the
-application's appends and reads use at once, plus, for each subscription on the store, 2 for `run_pg` or 1
-for `run`, plus 1 for a `NotifyWaker` that listens on the store's pool. An instance of a sharded
+application's appends and reads use at once, plus 1 for each subscription on the store (`run_pg` or `run`),
+plus 1 for a `NotifyWaker` that listens on the store's pool. An instance of a sharded
 subscription reads its shards at the same time, so give it one more per shard it may hold. A subscription
 checks only its own share at start (`SubscribeError::PoolTooSmall`), so this sum is yours to keep. A backfill
 holds one connection per lane.

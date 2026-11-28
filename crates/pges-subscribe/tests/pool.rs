@@ -1,5 +1,5 @@
-//! The store's pool must allow the connections a subscription holds at once: `run_pg` 2, `run` 1, plus a
-//! `NotifyWaker` on the store's pool.
+//! The store's pool must allow the connections a subscription holds at once: 1 for `run_pg` or `run`, plus
+//! a `NotifyWaker` on the store's pool.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -8,9 +8,9 @@ mod common;
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{PgConnection, PgPool, postgres::PgPoolOptions};
 
-use pges_core::{category, non_empty};
+use pges_core::{category, interval, non_empty, stream};
 use pges_postgres::store;
 use pges_subscribe::{
     batch, handler,
@@ -18,7 +18,7 @@ use pges_subscribe::{
     subscription_name,
 };
 
-use common::{Fixture, Recorder, Running, STORE_NAME};
+use common::{Cat, Fixture, Recorder, Running, STORE_NAME};
 
 struct Ignore;
 
@@ -69,28 +69,57 @@ async fn starts(subscription: subscription::Subscription) -> Result<()> {
     running.stop().await
 }
 
+/// Records after a pause longer than the lease the test gives it.
+struct Slow(Recorder);
+
+impl handler::PgHandler for Slow {
+    async fn handle(
+        &mut self,
+        tx: &mut PgConnection,
+        batch: &batch::Batch,
+    ) -> Result<(), handler::HandlerError> {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        self.0.record(tx, batch).await?;
+        Ok(())
+    }
+}
+
+/// `run_pg` needs no connection beside its transaction: its row lock keeps the lease, so a batch slower than
+/// the lease completes on a pool of one, and no standby takes over meanwhile.
 #[tokio::test]
-async fn run_pg_needs_a_connection_for_side_renewal() -> Result<()> {
+async fn run_pg_works_on_one_connection() -> Result<()> {
     let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    f.append(Cat::Jobs, stream::StreamId::new_v7(), 2).await?;
+    f.sequence_all().await?;
 
-    let (small, store) = store_on(&f, 1).await?;
-    let subscription = store
-        .subscription(subscription_name!("pool.pg"))
-        .categories(non_empty![category!("jobs")])
-        .run_pg(Recorder::new("pool"));
-    too_small(subscription, 1, 2).await?;
-    small.close().await;
-
-    let (enough, store) = store_on(&f, 2).await?;
-    starts(
+    let subscription = |store: &store::Store| {
         store
             .subscription(subscription_name!("pool.pg"))
             .categories(non_empty![category!("jobs")])
-            .run_pg(Recorder::new("pool")),
-    )
-    .await?;
-    enough.close().await;
+            .lease(interval!(200 ms))
+            .acquire_interval(interval!(10 ms))
+            .run_pg(Slow(Recorder::new("pool")))
+    };
+    let (one, store) = store_on(&f, 1).await?;
+    let running = Running::spawn(subscription(&store));
+    let (other, standby_store) = store_on(&f, 1).await?;
+    let standby = Running::spawn(subscription(&standby_store));
+    let mut standby_status = standby.handle.status_changes();
+    let took_over = tokio::spawn(async move {
+        let _ = standby_status
+            .wait_for(|s| matches!(s.state, subscription::State::Running))
+            .await;
+    });
 
+    running.wait_position(1).await?;
+    ensure!(!took_over.is_finished(), "the standby took over");
+    took_over.abort();
+    ensure!(f.delivered("pool").await?.len() == 2);
+
+    standby.stop().await?;
+    running.stop().await?;
+    other.close().await;
+    one.close().await;
     f.finish().await
 }
 
@@ -125,15 +154,12 @@ async fn a_notify_waker_on_the_store_pool_needs_its_own_connection() -> Result<(
         .waker(notify::NotifyWaker::new(&store))
         .run(Ignore);
     too_small(subscription, 1, 2).await?;
-    one.close().await;
-
-    let (two, store) = store_on(&f, 2).await?;
     let subscription = store
         .subscription(subscription_name!("pool.notify"))
         .categories(non_empty![category!("jobs")])
         .waker(notify::NotifyWaker::new(&store))
         .run_pg(Recorder::new("pool"));
-    too_small(subscription, 2, 3).await?;
+    too_small(subscription, 1, 2).await?;
 
     // On a separate pool, the waker's connection does not count.
     starts(
@@ -147,9 +173,9 @@ async fn a_notify_waker_on_the_store_pool_needs_its_own_connection() -> Result<(
             .run_pg(Recorder::new("pool")),
     )
     .await?;
-    two.close().await;
+    one.close().await;
 
-    let (three, store) = store_on(&f, 3).await?;
+    let (two, store) = store_on(&f, 2).await?;
     starts(
         store
             .subscription(subscription_name!("pool.notify"))
@@ -158,7 +184,7 @@ async fn a_notify_waker_on_the_store_pool_needs_its_own_connection() -> Result<(
             .run_pg(Recorder::new("pool")),
     )
     .await?;
-    three.close().await;
+    two.close().await;
 
     f.finish().await
 }
