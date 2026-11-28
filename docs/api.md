@@ -144,7 +144,7 @@ pub struct StoreId(i32);                // pges_core::store; pges.stores.store_i
                                         // pges_core::store::{DEFAULT_MAX_CLOCK_SKEW (5 s),
                                         //   DEFAULT_MAX_TXN_AGE (1 h)}: the writer limits' defaults
 pub struct StoreName(/* Cow<'static, str> */);   // pges_core::store; ^[a-z][a-z0-9_]{0,39}$, not pges, public,
-                                        // information_schema or pg_*
+                                        // information_schema, pg_* or a reserved SQL keyword
 pub struct CategoryId(i32);             // pges_core::category; categories.category_id
 pub struct SchemaVersion(i32);          // pges_postgres::migrate; pges.scopes.schema_version,
                                         // pges.migrations.version; NONE = 0. Not the event's

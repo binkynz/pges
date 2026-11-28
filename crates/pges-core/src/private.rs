@@ -66,7 +66,7 @@ pub const fn store_name(name: &'static str) -> store::StoreName {
         #[allow(clippy::panic)]
         Err(_) => panic!(
             "invalid store name: it must match ^[a-z][a-z0-9_]{{0,39}}$ and not be pges, public, \
-             information_schema or start with pg_"
+             information_schema, a reserved SQL keyword, or start with pg_"
         ),
     }
 }

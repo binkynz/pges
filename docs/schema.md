@@ -30,7 +30,8 @@ Category names are limited to `^[a-z][a-z0-9_]{0,39}$` so every generated name s
 bytes, its key `commits_<cat>__pkey` 54, a leaf `commits_<cat>__<YYYYMMDD>` 58, its index `<leaf>_s` 60, and
 the `<leaf>_pkey` PostgreSQL derives when the leaf is attached 63. The attach constraint is `bound`
 (constraint names are per table); log partitions are `log_<n, at least 4 digits>`. Store names only qualify
-these names. They follow the same rule and also exclude `pges`, `public`, `information_schema` and `pg_*`.
+these names. They follow the same rule and also exclude `pges`, `public`, `information_schema`, `pg_*` and
+the SQL keywords that cannot name a schema unquoted (`select`, `user`, ...).
 `crates/pges-postgres/src/ident.rs` builds every name and tests the longest case.
 
 Category names also exclude `__`, which separates the category from the rest of every name built from it. All
