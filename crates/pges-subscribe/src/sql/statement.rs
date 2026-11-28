@@ -222,6 +222,10 @@ pges_postgres::typed_query! {
             store: &'q str,
             store_version: i32,
             outbox_version: i32,
+            keepalives_idle: i32,
+            keepalives_interval: i32,
+            keepalives_count: i32,
+            user_timeout: i32,
         },
         row { xact: Option<i64> },
     }
@@ -416,7 +420,25 @@ pges_postgres::typed_query! {
     }
 }
 
-/// Begins a batch's transaction in REPEATABLE READ.
+/// Begins a batch's transaction at the session's default level, with the batch's savepoint.
+pub const BEGIN: template::Statement = template::Statement {
+    name: "transaction/begin",
+    files: &[sql_file!("transaction/begin.sql")],
+    kind: template::Kind::Ddl,
+    params: &[],
+    columns: &[],
+};
+
+/// Begins a batch's transaction in READ COMMITTED, with the batch's savepoint.
+pub const BEGIN_READ_COMMITTED: template::Statement = template::Statement {
+    name: "transaction/begin_read_committed",
+    files: &[sql_file!("transaction/begin_read_committed.sql")],
+    kind: template::Kind::Ddl,
+    params: &[],
+    columns: &[],
+};
+
+/// Begins a batch's transaction in REPEATABLE READ, with the batch's savepoint.
 pub const BEGIN_REPEATABLE_READ: template::Statement = template::Statement {
     name: "transaction/begin_repeatable_read",
     files: &[sql_file!("transaction/begin_repeatable_read.sql")],
@@ -425,10 +447,19 @@ pub const BEGIN_REPEATABLE_READ: template::Statement = template::Statement {
     columns: &[],
 };
 
-/// Begins a batch's transaction in SERIALIZABLE.
+/// Begins a batch's transaction in SERIALIZABLE, with the batch's savepoint.
 pub const BEGIN_SERIALIZABLE: template::Statement = template::Statement {
     name: "transaction/begin_serializable",
     files: &[sql_file!("transaction/begin_serializable.sql")],
+    kind: template::Kind::Ddl,
+    params: &[],
+    columns: &[],
+};
+
+/// Rolls back to the batch's savepoint: fails if the handler ended the batch's transaction.
+pub const ROLLBACK_TO_BATCH: template::Statement = template::Statement {
+    name: "transaction/rollback_to_batch",
+    files: &[sql_file!("transaction/rollback_to_batch.sql")],
     kind: template::Kind::Ddl,
     params: &[],
     columns: &[],
@@ -469,8 +500,11 @@ pub const ALL: &[&template::Statement] = &[
     &INSERT_LSN,
     &REPLAY_LSN,
     &WAL_LAYOUT,
+    &BEGIN,
+    &BEGIN_READ_COMMITTED,
     &BEGIN_REPEATABLE_READ,
     &BEGIN_SERIALIZABLE,
+    &ROLLBACK_TO_BATCH,
 ];
 
 /// Every statement of this crate with its Rust types, for the registry test.

@@ -476,9 +476,13 @@ impl<S> Builder<S> {
     ///
     /// The lease is what a standby waits out after the holder's process died. A `run_pg` batch's lock goes
     /// with its connection: when the holder's host vanishes without closing it, the server notices only
-    /// through TCP keepalives, so set them on the server (`tcp_keepalives_idle` and its siblings) to bound
-    /// the takeover. The lapsed lease of a holder that hangs inside its handler is not taken over either,
-    /// as it would not be with a renewal on the side.
+    /// when the connection is found dead. The batch's transaction sets the session's TCP keepalives and
+    /// `tcp_user_timeout` from the lease (probes after a third of it, about 5/6 of it in all, at least 4 s)
+    /// so that happens within about one lease over TCP; over a Unix socket they do nothing, and
+    /// `tcp_user_timeout` needs a platform with `TCP_USER_TIMEOUT` (Linux). The lapsed lease of a holder
+    /// that hangs inside its handler, connected, is not taken over either, as it would not be with a renewal
+    /// on the side; `idle_in_transaction_session_timeout` on the role bounds that, at the cost of ending any
+    /// handler that pauses longer between statements.
     pub fn lease(mut self, lease: interval::Interval) -> Self {
         self.lease = lease;
         self
@@ -1180,6 +1184,37 @@ struct Ctx {
     shards: i16,
     lease: Duration,
     interval: PgInterval,
+    /// The TCP settings of a `run_pg` batch's session, from the lease ([`Keepalive::for_lease`]).
+    keepalive: Keepalive,
+}
+
+/// TCP keepalive and user timeout settings for the session that holds a subscription's row, so the server
+/// drops a vanished client's backend, and with it the row lock, within about one lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Keepalive {
+    /// `tcp_keepalives_idle`, in seconds.
+    idle: i32,
+    /// `tcp_keepalives_interval`, in seconds.
+    interval: i32,
+    /// `tcp_keepalives_count`.
+    count: i32,
+    /// `tcp_user_timeout`, in milliseconds.
+    user_timeout: i32,
+}
+
+impl Keepalive {
+    /// Probes after a third of the lease idle, then every sixth, and gives up after 3 unanswered probes:
+    /// about 5/6 of the lease, at least 4 s, since the settings count whole seconds. Unacknowledged data
+    /// gives up after one lease.
+    fn for_lease(lease: Duration) -> Self {
+        let seconds = |d: Duration| i32::try_from(d.as_secs()).unwrap_or(i32::MAX).max(1);
+        Self {
+            idle: seconds(lease / 3),
+            interval: seconds(lease / 6),
+            count: 3,
+            user_timeout: i32::try_from(lease.as_millis()).unwrap_or(i32::MAX).max(1),
+        }
+    }
 }
 
 /// One leadership term of one shard: from taking its lease to losing or releasing it.
@@ -1265,7 +1300,28 @@ enum HeldCheckpoint {
     "the handler ended the batch's transaction itself (a raw COMMIT or ROLLBACK): its writes were committed \
      or rolled back without the checkpoint, which did not move"
 )]
-pub(crate) struct HandlerEndedTransaction;
+pub(crate) struct HandlerEndedTransaction {
+    /// What the handler or the checkpoint reported afterwards, if anything.
+    #[source]
+    pub(crate) after: Option<handler::BoxError>,
+}
+
+/// The handler failure on a batch's failure path, before the batch is rolled back: `error`, or a fatal
+/// [`HandlerEndedTransaction`] if the handler ended the batch's transaction itself
+/// ([`handler::ended_by_handler`]). A retry would apply the writes it committed again.
+pub(crate) async fn unless_ended(
+    tx: &mut PgConnection,
+    error: handler::HandlerError,
+) -> Result<handler::HandlerError, sqlx::Error> {
+    if !handler::ended_by_handler(tx).await? {
+        return Ok(error);
+    }
+    let (handler::HandlerError::Transient(after) | handler::HandlerError::Fatal(after)) = error;
+
+    Ok(handler::HandlerError::Fatal(Box::new(
+        HandlerEndedTransaction { after: Some(after) },
+    )))
+}
 
 enum Delivered {
     Checkpointed,
@@ -1295,11 +1351,11 @@ enum Failure {
 pub(crate) struct AbortedTransaction;
 
 /// A handler's transaction ended under it: a savepoint begin on it failed or was dropped, and sqlx rolled
-/// back the whole transaction.
+/// back the whole transaction. The handler's statements after it ran in autocommit, so this is fatal.
 #[derive(Debug, thiserror::Error)]
 #[error(
     "the handler's transaction ended (a savepoint begin on it failed or was dropped, which rolls back the \
-     whole transaction)"
+     whole transaction; the handler's statements after it ran in autocommit)"
 )]
 pub(crate) struct EndedTransaction;
 
@@ -1636,6 +1692,7 @@ impl Ctx {
             shards: setup.shards.to_i16(),
             lease: setup.lease,
             interval: interval(setup.lease),
+            keepalive: Keepalive::for_lease(setup.lease),
         }
     }
 
@@ -1830,6 +1887,10 @@ impl Ctx {
                 store: self.store.as_str(),
                 store_version: migrate::latest_version(migrate::STORE).get(),
                 outbox_version: migrate::latest_version(migrate::OUTBOX).get(),
+                keepalives_idle: self.keepalive.idle,
+                keepalives_interval: self.keepalive.interval,
+                keepalives_count: self.keepalive.count,
+                user_timeout: self.keepalive.user_timeout,
             })
             .fetch_optional(&mut *tx)
             .await?;
@@ -2046,14 +2107,16 @@ async fn deliver_pg(
     };
 
     if let Err(error) = handler.handle(&mut tx, batch).await {
+        let error = unless_ended(&mut tx, error).await.map_err(database)?;
         let _ = tx.rollback().await;
         return Err(Failure::Handler(error));
     }
-    // Without this, the checkpoint would move in autocommit and the commit below do nothing.
+    // Without this, the checkpoint would move in autocommit and the commit below do nothing. The handler's
+    // statements after the rollback committed on their own: retrying could apply them twice.
     if !tx.is_in_transaction() {
-        return Err(Failure::Handler(handler::HandlerError::Transient(
-            Box::new(EndedTransaction),
-        )));
+        return Err(Failure::Handler(handler::HandlerError::Fatal(Box::new(
+            EndedTransaction,
+        ))));
     }
 
     // sqlx counts transactions itself and does not see a raw COMMIT or ROLLBACK the handler sent: the
@@ -2071,18 +2134,22 @@ async fn deliver_pg(
         Ok(HeldCheckpoint::OutsideBatch) => {
             let _ = tx.rollback().await;
             return Err(Failure::Handler(handler::HandlerError::Fatal(Box::new(
-                HandlerEndedTransaction,
+                HandlerEndedTransaction { after: None },
             ))));
         }
+        // Also when the handler began another transaction after a raw COMMIT and left that one aborted.
         Err(error) if is_aborted_transaction(&error) => {
+            let error = handler::HandlerError::Transient(Box::new(AbortedTransaction));
+            let error = unless_ended(&mut tx, error).await.map_err(database)?;
             let _ = tx.rollback().await;
-            return Err(Failure::Handler(handler::HandlerError::Transient(
-                Box::new(AbortedTransaction),
-            )));
+            return Err(Failure::Handler(error));
         }
         Err(error) if is_refused(&error) => {
+            let error = unless_ended(&mut tx, refused(error))
+                .await
+                .map_err(database)?;
             let _ = tx.rollback().await;
-            return Err(Failure::Handler(refused(error)));
+            return Err(Failure::Handler(error));
         }
         Err(error) => return Err(database(error)),
     };

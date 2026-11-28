@@ -241,7 +241,8 @@ async fn a_handler_whose_savepoint_begin_fails_is_not_checkpointed() -> Result<(
             if source.to_string().contains("transaction ended")),
         "{error:?}"
     );
-    assert_eq!(recorder.calls(), 2, "retried");
+    // Fatal: the handler's statements after the rollback would have run in autocommit.
+    assert_eq!(recorder.calls(), 1, "not retried");
     assert_eq!(f.cursor("savepoint").await?, Some(0));
     assert!(f.delivered("savepoint").await?.is_empty());
 
@@ -418,6 +419,225 @@ async fn a_handler_that_ends_its_transaction_is_not_checkpointed() -> Result<()>
     f.finish().await
 }
 
+/// On its first call: records, sends `end` raw (`COMMIT`, or `COMMIT; BEGIN`), then fails as `fail` says.
+/// Later calls record and pass.
+struct EndsThenFails {
+    recorder: Recorder,
+    end: &'static str,
+    fail: Fail,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Fail {
+    /// Returns a transient error.
+    ReturnsTransient,
+    /// Runs a failing statement, ignores its error and returns `Ok`: the transaction it is in is aborted.
+    IgnoresAnError,
+}
+
+impl handler::PgHandler for EndsThenFails {
+    async fn handle(
+        &mut self,
+        tx: &mut PgConnection,
+        batch: &batch::Batch,
+    ) -> Result<(), handler::HandlerError> {
+        let call = {
+            let mut calls = self.recorder.calls.lock().unwrap();
+            *calls += 1;
+            *calls
+        };
+        self.recorder.record(tx, batch).await?;
+        if call > 1 {
+            return Ok(());
+        }
+        sqlx::raw_sql(sqlx::AssertSqlSafe(self.end))
+            .execute(&mut *tx)
+            .await?;
+        match self.fail {
+            Fail::ReturnsTransient => Err(handler::HandlerError::Transient(
+                "a later step failed".into(),
+            )),
+            Fail::IgnoresAnError => {
+                let _ = sqlx::query("SELECT 1 / 0").execute(&mut *tx).await;
+                Ok(())
+            }
+        }
+    }
+}
+
+/// A raw `COMMIT` is caught on the failure paths too: when the handler then returns a transient error, and
+/// when it begins another transaction and leaves that one aborted (25P02 at the checkpoint, transient for
+/// the batch's own transaction). Either way the batch's writes committed alone, so the run stops at once
+/// with a fatal `HandlerFailed` instead of retrying them; the cursor does not move. Before, both were
+/// retried and the batch applied twice.
+#[tokio::test]
+async fn a_handler_that_commits_then_fails_is_not_retried() -> Result<()> {
+    let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    jobs(&f, 1).await?;
+
+    for (name, end, fail) in [
+        ("commit-then-err", "COMMIT", Fail::ReturnsTransient),
+        (
+            "commit-begin-aborted",
+            "COMMIT; BEGIN",
+            Fail::IgnoresAnError,
+        ),
+    ] {
+        let recorder = Recorder::new(name);
+        let error = common::Running::spawn(
+            f.store
+                .subscription(subscription::SubscriptionName::new(name).unwrap())
+                .categories(non_empty![category!("jobs")])
+                .on_error(retry(3))
+                .run_pg(EndsThenFails {
+                    recorder: recorder.clone(),
+                    end,
+                    fail,
+                }),
+        )
+        .stopped()
+        .await?;
+        assert!(
+            matches!(&error, subscription::SubscribeError::HandlerFailed { source, .. }
+                if source.to_string().contains("ended the batch's transaction")),
+            "{name}: {error:?}"
+        );
+        assert_eq!(recorder.calls(), 1, "{name}: retried");
+        assert_eq!(f.delivered(name).await?.len(), 1, "{name}: applied twice");
+        assert_eq!(f.cursor(name).await?, Some(0), "{name}");
+    }
+
+    f.finish().await
+}
+
+/// Sets its transaction READ ONLY, which the level-setting check lets through.
+struct SetsReadOnly {
+    calls: Arc<Mutex<usize>>,
+}
+
+impl handler::PgHandler for SetsReadOnly {
+    async fn handle(
+        &mut self,
+        tx: &mut PgConnection,
+        _batch: &batch::Batch,
+    ) -> Result<(), handler::HandlerError> {
+        *self.calls.lock().unwrap() += 1;
+        // The level the transaction has already passes.
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("SET TRANSACTION READ ONLY")
+            .execute(&mut *tx)
+            .await?;
+        Ok(())
+    }
+}
+
+/// `SET TRANSACTION` fails only when it changes the level: setting the level the transaction has passes, and
+/// `READ ONLY` passes, then fails the checkpoint (25006), which is transient and retried until the policy
+/// stops the run.
+#[tokio::test]
+async fn a_read_only_handler_transaction_fails_at_the_checkpoint() -> Result<()> {
+    let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    jobs(&f, 1).await?;
+    let calls = Arc::new(Mutex::new(0));
+
+    let error = common::Running::spawn(
+        f.store
+            .subscription(subscription_name!("read-only"))
+            .categories(non_empty![category!("jobs")])
+            .on_error(retry(2))
+            .run_pg(SetsReadOnly {
+                calls: calls.clone(),
+            }),
+    )
+    .stopped()
+    .await?;
+    assert!(
+        matches!(&error, subscription::SubscribeError::HandlerFailed { source, .. }
+            if source.to_string().contains("read-only transaction")),
+        "{error:?}"
+    );
+    assert_eq!(*calls.lock().unwrap(), 2, "retried per the policy");
+    assert_eq!(f.cursor("read-only").await?, Some(0));
+
+    f.finish().await
+}
+
+/// A session's `tcp_keepalives_idle`, `_interval`, `_count`, `tcp_user_timeout`, and whether it is on a
+/// Unix socket.
+type TcpSettings = (String, String, String, String, bool);
+
+/// Reads its session's TCP settings while it holds the subscription's row.
+struct ReadsKeepalives {
+    settings: Arc<Mutex<Vec<TcpSettings>>>,
+}
+
+impl handler::PgHandler for ReadsKeepalives {
+    async fn handle(
+        &mut self,
+        tx: &mut PgConnection,
+        _batch: &batch::Batch,
+    ) -> Result<(), handler::HandlerError> {
+        let row: TcpSettings = sqlx::query_as(
+            "SELECT current_setting('tcp_keepalives_idle'), current_setting('tcp_keepalives_interval'),
+                    current_setting('tcp_keepalives_count'), current_setting('tcp_user_timeout'),
+                    inet_client_addr() IS NULL",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        self.settings.lock().unwrap().push(row);
+        Ok(())
+    }
+}
+
+/// The session that holds a subscription's row has TCP keepalives and a user timeout derived from the lease
+/// (15 s: probes after 5 s idle, every 2 s, 3 of them; 15000 ms unacknowledged), so the server drops a
+/// vanished client's backend and its lock within about one lease instead of the hours its defaults take.
+/// They are local to the batch's transaction: the pooled connection keeps its own settings afterwards. Over
+/// a Unix socket the server ignores them and reports 0.
+#[tokio::test]
+async fn the_holding_session_has_keepalives_from_the_lease() -> Result<()> {
+    let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    jobs(&f, 1).await?;
+    let settings = Arc::new(Mutex::new(Vec::new()));
+
+    let running = common::Running::spawn(
+        f.store
+            .subscription(subscription_name!("keepalive"))
+            .categories(non_empty![category!("jobs")])
+            .lease(interval!(15 s))
+            .run_pg(ReadsKeepalives {
+                settings: settings.clone(),
+            }),
+    );
+    running.wait_position(1).await?;
+    running.stop().await?;
+
+    let settings = settings.lock().unwrap().clone();
+    let [(idle, interval, count, user_timeout, unix)] = settings.as_slice() else {
+        panic!("one batch: {settings:?}");
+    };
+    if *unix {
+        assert_eq!(
+            (idle.as_str(), interval.as_str(), count.as_str()),
+            ("0", "0", "0")
+        );
+    } else {
+        assert_eq!(
+            (
+                idle.as_str(),
+                interval.as_str(),
+                count.as_str(),
+                user_timeout.as_str()
+            ),
+            ("5", "2", "3", "15000")
+        );
+    }
+
+    f.finish().await
+}
+
 /// Writes two equal keys into a table whose unique constraint is deferred: every COMMIT is refused.
 struct BreaksADeferredConstraint;
 
@@ -496,9 +716,9 @@ impl handler::PgHandler for Isolated {
     }
 }
 
-/// A handler at REPEATABLE READ or SERIALIZABLE whose batches outlast the lease keeps its lease and is
-/// checkpointed: nothing renews the subscription's row after the handler's snapshot, and a standby does not
-/// take over.
+/// A handler at READ COMMITTED (asked for, not the default), REPEATABLE READ or SERIALIZABLE whose batches
+/// outlast the lease keeps its lease and is checkpointed: nothing renews the subscription's row after the
+/// handler's snapshot, and a standby does not take over.
 #[tokio::test]
 async fn a_repeatable_read_or_serializable_batch_slower_than_the_lease_is_checkpointed()
 -> Result<()> {
@@ -506,6 +726,11 @@ async fn a_repeatable_read_or_serializable_batch_slower_than_the_lease_is_checkp
     jobs(&f, 2).await?;
 
     for (name, isolation, level) in [
+        (
+            "read-committed",
+            handler::Isolation::ReadCommitted,
+            "read committed",
+        ),
         (
             "repeatable",
             handler::Isolation::RepeatableRead,

@@ -124,8 +124,9 @@ async fn a_failed_run_resumes_without_handling_an_event_twice() -> Result<()> {
     f.finish().await
 }
 
-/// A handler whose savepoint begin fails, which ends its transaction, moves no lane: the batch is retried, and
-/// a later run handles every event once.
+/// A handler whose savepoint begin fails, which ends its transaction, moves no lane: the backfill stops at
+/// once (the handler's statements after it ran in autocommit, and a retry could apply them twice), and a
+/// later run handles every event once.
 #[tokio::test]
 async fn a_handler_whose_savepoint_begin_fails_moves_no_lane() -> Result<()> {
     let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
@@ -150,7 +151,7 @@ async fn a_handler_whose_savepoint_begin_fails_moves_no_lane() -> Result<()> {
         panic!("expected a handler failure, got {result:?}");
     };
     assert!(source.to_string().contains("transaction ended"), "{source}");
-    assert!(failing.recorder.calls() >= 2, "retried");
+    assert_eq!(failing.recorder.calls(), 1, "not retried");
     assert!(f.delivered("savepoint").await?.is_empty());
 
     f.store
@@ -478,6 +479,181 @@ async fn a_second_run_that_moves_a_lane_overtakes_this_one() -> Result<()> {
     assert_eq!(overtaking.calls.load(Ordering::SeqCst), 1);
 
     f.finish().await
+}
+
+/// On its first call: records, sends `end` raw (`COMMIT`, or `COMMIT; BEGIN`), then fails: with a transient
+/// error, or by ignoring a failed statement's error, which leaves the transaction it is in aborted.
+#[derive(Clone)]
+struct EndsThenFails {
+    recorder: Recorder,
+    end: &'static str,
+    returns_error: bool,
+}
+
+impl handler::PgHandler for EndsThenFails {
+    async fn handle(
+        &mut self,
+        tx: &mut PgConnection,
+        batch: &batch::Batch,
+    ) -> Result<(), handler::HandlerError> {
+        let call = {
+            let mut calls = self.recorder.calls.lock().unwrap();
+            *calls += 1;
+            *calls
+        };
+        self.recorder.record(tx, batch).await?;
+        if call > 1 {
+            return Ok(());
+        }
+        sqlx::raw_sql(sqlx::AssertSqlSafe(self.end))
+            .execute(&mut *tx)
+            .await?;
+        if self.returns_error {
+            return Err(handler::HandlerError::Transient(
+                "a later step failed".into(),
+            ));
+        }
+        let _ = sqlx::query("SELECT 1 / 0").execute(&mut *tx).await;
+        Ok(())
+    }
+}
+
+/// A raw `COMMIT` is caught on the failure paths too: a transient error after it, or another transaction
+/// begun after it and left aborted, stops the backfill with a fatal `HandlerFailed` and moves no lane. Before,
+/// both were retried and applied the batch twice.
+#[tokio::test]
+async fn a_handler_that_commits_then_fails_is_not_retried() -> Result<()> {
+    let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    write(&f, 1, 1).await?;
+
+    for (name, end, returns_error) in [
+        ("commit-then-err", "COMMIT", true),
+        ("commit-begin-aborted", "COMMIT; BEGIN", false),
+    ] {
+        let ending = EndsThenFails {
+            recorder: Recorder::new(name),
+            end,
+            returns_error,
+        };
+        let result = f
+            .store
+            .backfill(
+                subscription::SubscriptionName::new(name).unwrap(),
+                backfill::Until::Head,
+            )
+            .category::<common::JobEvent>()
+            .on_error(subscription::RetryPolicy::new(
+                interval!(1 ms),
+                NonZeroU32::new(3).unwrap(),
+            ))
+            .run_pg(ending.clone())
+            .await;
+        let Err(backfill::BackfillError::HandlerFailed { source, .. }) = result else {
+            panic!("{name}: expected a handler failure, got {result:?}");
+        };
+        assert!(
+            source.to_string().contains("ended the batch's transaction"),
+            "{name}: {source}"
+        );
+        assert_eq!(ending.recorder.calls(), 1, "{name}: retried");
+        assert_eq!(f.delivered(name).await?.len(), 1, "{name}: applied twice");
+        let moved: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM es.backfills WHERE name = $1 AND position > 0",
+        )
+        .bind(name)
+        .fetch_one(&f.pool)
+        .await?;
+        assert_eq!(moved, 0, "{name}: a lane moved");
+    }
+
+    f.finish().await
+}
+
+/// A REPEATABLE READ lane whose lane lock waited for another run that then moved the lane fails with 40001
+/// instead of finding no row; that is `Overtaken` too, as at READ COMMITTED, not a database error.
+#[tokio::test]
+async fn a_repeatable_read_lane_overtaken_while_it_waits_is_overtaken() -> Result<()> {
+    let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    write(&f, 1, 3).await?;
+
+    let overtaking = OvertakingWhileHeld {
+        pool: f.pool.clone(),
+        calls: Arc::new(AtomicUsize::new(0)),
+        mover: Arc::new(std::sync::Mutex::new(None)),
+    };
+    let result = f
+        .store
+        .backfill(subscription_name!("rr-overtaken"), backfill::Until::Head)
+        .categories(non_empty![category!("jobs")])
+        .batch_size(NonZeroU32::new(1).unwrap())
+        .run_pg(overtaking.clone())
+        .await;
+
+    assert!(
+        matches!(result, Err(backfill::BackfillError::Overtaken)),
+        "{result:?}"
+    );
+    assert_eq!(overtaking.calls.load(Ordering::SeqCst), 1);
+    let mover = overtaking.mover.lock().unwrap().take().unwrap();
+    mover.await??;
+
+    f.finish().await
+}
+
+/// At REPEATABLE READ, plays a second run that moves every lane while the first batch holds its lane, and
+/// commits the move only once the next batch's lane lock waits for it, after that batch's snapshot.
+#[derive(Clone)]
+struct OvertakingWhileHeld {
+    pool: PgPool,
+    calls: Arc<AtomicUsize>,
+    mover: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<Result<()>>>>>,
+}
+
+impl handler::PgHandler for OvertakingWhileHeld {
+    async fn handle(
+        &mut self,
+        _tx: &mut PgConnection,
+        _batch: &batch::Batch,
+    ) -> Result<(), handler::HandlerError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let pool = self.pool.clone();
+        let mover = tokio::spawn(async move {
+            let mut tx = pool.begin().await?;
+            sqlx::query(
+                "UPDATE es.backfills SET position = position + 1000000 WHERE name = 'rr-overtaken'",
+            )
+            .execute(&mut *tx)
+            .await?;
+            wait_for_lock(&pool, "%backfills%FOR NO KEY UPDATE%").await?;
+            tx.commit().await?;
+            anyhow::Ok(())
+        });
+        *self.mover.lock().unwrap() = Some(mover);
+        wait_for_lock(&self.pool, "UPDATE es.backfills%").await?;
+        Ok(())
+    }
+
+    fn isolation(&self) -> handler::Isolation {
+        handler::Isolation::RepeatableRead
+    }
+}
+
+/// Waits until a statement whose text is `LIKE pattern` waits for a lock.
+async fn wait_for_lock(pool: &PgPool, pattern: &str) -> Result<(), sqlx::Error> {
+    loop {
+        let waits: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT FROM pg_stat_activity
+                            WHERE datname = current_database() AND wait_event_type = 'Lock'
+                              AND query LIKE $1)",
+        )
+        .bind(pattern)
+        .fetch_one(pool)
+        .await?;
+        if waits {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 #[tokio::test]

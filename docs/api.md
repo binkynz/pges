@@ -958,7 +958,7 @@ pub trait PgHandler: Send {                // run_pg: writes only through tx; ne
 }
 #[non_exhaustive]
 #[derive(Default)]
-pub enum Isolation { #[default] Default, RepeatableRead, Serializable }
+pub enum Isolation { #[default] Default, ReadCommitted, RepeatableRead, Serializable }
 // Savepoints on tx are allowed; one whose begin fails or is dropped ends tx (sqlx 0.9.1), and the batch is
 // retried as transient like an aborted one: no checkpoint moves.
 
@@ -1031,23 +1031,32 @@ The first `.categories(..)` takes a `NonEmpty<CategoryName>`, later ones any ite
 - Frames decode through `pges_core::frame`. Type ids come from the store's `event_types`, reloaded once when
   an id is unknown (`SubscribeError::UnknownEventType` if it stays unknown).
 - `run_pg`: the transaction begins at `PgHandler::isolation()` (`handler::Isolation::{Default,
-  RepeatableRead, Serializable}`, `#[non_exhaustive]`; `Default` is the session's
-  `default_transaction_isolation`) and locks the subscription's row, fenced, before the handler runs. Then
+  ReadCommitted, RepeatableRead, Serializable}`, `#[non_exhaustive]`; `Default` is the session's
+  `default_transaction_isolation`, which may be SERIALIZABLE, so `ReadCommitted` asks for READ COMMITTED
+  whatever it says), takes the savepoint `pges_batch`, and locks the subscription's row, fenced, before the
+  handler runs, so the handler's statements run in a subtransaction. Then
   the handler runs, the checkpoint runs in the same transaction, and it commits. The read model must live in
   the store's database. After any retried error the subscriber re-reads its stored cursor, and the checkpoint
   moves the cursor only from where the subscriber holds it, so a COMMIT whose reply was lost does not deliver
-  the batch twice, also when it lands after the re-read. A handler cannot set the level itself:
-  `SET TRANSACTION ISOLATION LEVEL` fails after the lock, and the run stops with `HandlerFailed`.
+  the batch twice, also when it lands after the re-read. A handler cannot change the level itself:
+  `SET TRANSACTION ISOLATION LEVEL` to another level fails after the lock, and the run stops with
+  `HandlerFailed` (the level the transaction has passes). `SET TRANSACTION READ ONLY` passes, then fails the
+  checkpoint with 25006, which is transient and retried until the `RetryPolicy` stops the run.
 - `run`: the handler runs first, then an autocommit checkpoint. A crash or lost lease in between delivers the
   batch again; make the effect idempotent.
 - A handler that leaves its transaction aborted is detected (25P02 at the checkpoint), rolled back, and
   counted as a transient failure, because the failed statement may have been a serialization failure.
 - A handler that ends the transaction itself with a raw `COMMIT` or `ROLLBACK` (sqlx does not see it, so
   `is_in_transaction()` still says yes) is detected by the checkpoint, which checks it runs in the
-  transaction the batch began (the id the row lock returned, `pg_current_xact_id()`). Nothing is
-  checkpointed, and the run stops with `HandlerFailed` (fatal: the handler's writes may already have
-  committed, so a retry could apply them twice). The same holds for a backfill's lanes. It costs no extra
-  statement in `run_pg`, and one per lane batch in a backfill (its lane lock).
+  transaction the batch began (the id the row lock returned, `pg_current_xact_id()`). When the handler
+  returns an error instead, or the checkpoint finds a transaction aborted (25P02) or fails, the subscriber
+  rolls back to the savepoint `pges_batch` before rolling back, which fails if the batch's transaction is
+  gone (also after `COMMIT; BEGIN`). Either way nothing is checkpointed, and the run stops with
+  `HandlerFailed` (fatal, whatever the handler returned: its writes may already have committed, so a retry
+  could apply them twice). So does a transaction sqlx ended itself (a savepoint begin of the handler's that
+  failed or was dropped; the statements after it ran in autocommit). The same holds for a backfill's lanes.
+  It costs no extra statement in `run_pg` on success (the savepoint rides on the `BEGIN`), one on a failure,
+  and one per lane batch in a backfill (its lane lock).
 - An error the server reports (severity ERROR) for the checkpoint or the COMMIT, such as a deferred
   constraint or a serialization failure, rolled the batch back for sure. It counts as the handler's
   failure and follows the `RetryPolicy`, so a batch that can never commit stops the run with
@@ -1057,7 +1066,11 @@ The first `.categories(..)` takes a `NonEmpty<CategoryName>`, later ones any ite
   (SQLSTATE class 23 or 22, such as a deferred unique constraint), which fails every attempt the same way
   and is fatal. A lost connection or a FATAL error may hide a commit, and stays a database error. Any
   isolation level works: nothing updates the subscription's row during the handler, so a serialization
-  failure comes only from the handler's own tables or the COMMIT.
+  failure comes only from the handler's own tables or the COMMIT. An error the row lock gets before the
+  handler runs (40001 under REPEATABLE READ behind a renewal still in flight, a lock timeout) is classified
+  the same way and counts as one of the batch's attempts, although the handler was not called. A backfill
+  lane's lock that fails with 40001 (it waited for another run that moved the lane) is `Overtaken`, as at
+  READ COMMITTED.
 - Category names are checked against `categories` at start (`UnknownCategory`). The requested categories are
   compared with `subscriptions.category_ids`; a mismatch fails with
   `SubscribeError::DefinitionChanged { stored, requested }` unless `.redefine(Start::…)` is given. A changed
@@ -1102,8 +1115,15 @@ The first `.categories(..)` takes a `NonEmpty<CategoryName>`, later ones any ite
   `Recovering`; the fenced checkpoint keeps a lapsed lease safe. A backoff whose renewal found the fence
   moved still runs to its end before the instance stands by. Release on shutdown and on a fatal error, so a
   standby takes over at once. A `run_pg` holder that dies releases its lock with its connection: at once
-  when the process exits, after the server's TCP keepalives notice a vanished host. A holder that hangs in
-  its handler keeps the shard, as a side renewal would have kept it.
+  when the process exits, and for a vanished host once the server finds the connection dead. The batch's
+  transaction sets `tcp_keepalives_idle`, `_interval`, `_count` and `tcp_user_timeout` from the lease
+  (`set_config(…, true)`, local to the transaction), which bounds that to about one lease over TCP (at least
+  4 s, since keepalives count whole seconds); the server's defaults take about 2 h 11 min. Over a Unix socket
+  they do nothing, and `tcp_user_timeout` (dead data in flight) needs `TCP_USER_TIMEOUT` (Linux). A holder
+  that hangs in its handler, connected, keeps the shard, as a side renewal would have kept it;
+  `idle_in_transaction_session_timeout` on the role bounds a holder stuck between statements, but ends any
+  handler that pauses longer (an external call, a slow computation) with a FATAL error, so set it above the
+  longest such pause.
 - Pool size: `run_pg` holds one connection for the handler's transaction, which is all it needs; `run`
   needs one; a waker adds `Waker::store_connections()` (1 for a `NotifyWaker` on the store's pool). A subscription whose store's pool allows fewer fails at start with
   `SubscribeError::PoolTooSmall { max_connections, needed }`. Other users of the pool need their own

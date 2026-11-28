@@ -5,7 +5,7 @@
 
 use std::{collections::BTreeSet, path::Path};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use pges_core::category;
 use pges_postgres::{admin, sql::template};
@@ -50,14 +50,21 @@ fn every_query_is_typed() {
     assert_eq!(typed.len(), queries.len(), "a query is listed twice");
 }
 
-/// The only statements that are not queries begin a handler's transaction at an isolation level.
+/// The only statements that are not queries begin a handler's transaction at an isolation level, with the
+/// batch's savepoint, and roll back to that savepoint. The session's default level is SERIALIZABLE here, so
+/// READ COMMITTED has to be asked for; rolling back to the savepoint fails once the transaction is gone.
 #[tokio::test]
 async fn ddl_statements_run() -> Result<()> {
     let db = pges_testing::TestDb::new().await?;
     let mut conn = db.connect().await?;
     let mut ran = BTreeSet::new();
+    sqlx::query("SET default_transaction_isolation = 'serializable'")
+        .execute(&mut conn)
+        .await?;
 
     for (begin, level) in [
+        (&statement::BEGIN, "serializable"),
+        (&statement::BEGIN_READ_COMMITTED, "read committed"),
         (&statement::BEGIN_REPEATABLE_READ, "repeatable read"),
         (&statement::BEGIN_SERIALIZABLE, "serializable"),
     ] {
@@ -67,8 +74,18 @@ async fn ddl_statements_run() -> Result<()> {
             .fetch_one(&mut conn)
             .await?;
         assert_eq!(current, level, "{}", begin.name);
+        pges_testing::statement::run_ddl(&mut conn, &statement::ROLLBACK_TO_BATCH, &values())
+            .await
+            .with_context(|| format!("no savepoint after {}", begin.name))?;
         sqlx::query("ROLLBACK").execute(&mut conn).await?;
     }
+    ran.insert(statement::ROLLBACK_TO_BATCH.name);
+    assert!(
+        pges_testing::statement::run_ddl(&mut conn, &statement::ROLLBACK_TO_BATCH, &values())
+            .await
+            .is_err(),
+        "rolled back to the batch's savepoint outside its transaction"
+    );
 
     let ddl: BTreeSet<&str> = statement::ALL
         .iter()
