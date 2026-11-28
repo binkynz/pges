@@ -1034,7 +1034,11 @@ The first `.categories(..)` takes a `NonEmpty<CategoryName>`, later ones any ite
   ReadCommitted, RepeatableRead, Serializable}`, `#[non_exhaustive]`; `Default` is the session's
   `default_transaction_isolation`, which may be SERIALIZABLE, so `ReadCommitted` asks for READ COMMITTED
   whatever it says), takes the savepoint `pges_batch`, and locks the subscription's row, fenced, before the
-  handler runs, so the handler's statements run in a subtransaction. Then
+  handler runs, so the handler's statements run in a subtransaction (a writing batch uses two
+  transaction ids; more than 63 savepoints of the handler's own overflow the subtransaction cache, a
+  SubtransSLRU cost for other sessions while it runs). `pges_batch` is reserved: rolling back to it or
+  releasing it releases the row lock early (fencing still keeps the batch exactly once), and releasing it
+  makes any later failure of the batch fatal. Then
   the handler runs, the checkpoint runs in the same transaction, and it commits. The read model must live in
   the store's database. After any retried error the subscriber re-reads its stored cursor, and the checkpoint
   moves the cursor only from where the subscriber holds it, so a COMMIT whose reply was lost does not deliver
@@ -1116,10 +1120,10 @@ The first `.categories(..)` takes a `NonEmpty<CategoryName>`, later ones any ite
   moved still runs to its end before the instance stands by. Release on shutdown and on a fatal error, so a
   standby takes over at once. A `run_pg` holder that dies releases its lock with its connection: at once
   when the process exits, and for a vanished host once the server finds the connection dead. The batch's
-  transaction sets `tcp_keepalives_idle`, `_interval`, `_count` and `tcp_user_timeout` from the lease
-  (`set_config(…, true)`, local to the transaction), which bounds that to about one lease over TCP (at least
-  4 s, since keepalives count whole seconds); the server's defaults take about 2 h 11 min. Over a Unix socket
-  they do nothing, and `tcp_user_timeout` (dead data in flight) needs `TCP_USER_TIMEOUT` (Linux). A holder
+  transaction sets `tcp_keepalives_idle`, `_interval` and `_count` from the lease (`set_config(…, true)`,
+  local to the transaction), which bounds that to about one lease over TCP (at least 4 s, since keepalives
+  count whole seconds); the server's defaults take about 2 h 11 min. Over a Unix socket they do nothing. A
+  backfill's lane lock sets the same as for a 15 s lease. Not `tcp_user_timeout`: on Linux it also bounds a full receive window, so it dropped a healthy handler that read a large result slower than the lease, on every attempt. A holder
   that hangs in its handler, connected, keeps the shard, as a side renewal would have kept it;
   `idle_in_transaction_session_timeout` on the role bounds a holder stuck between statements, but ends any
   handler that pauses longer (an external call, a slow computation) with a FATAL error, so set it above the
