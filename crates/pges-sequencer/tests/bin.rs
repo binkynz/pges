@@ -110,6 +110,97 @@ async fn smoke(kind: Kind) -> Result<()> {
     f.finish().await
 }
 
+/// A shutdown that hangs, here releasing the lease while the test holds the lease row's lock, ends on a
+/// second signal: the binary exits at once with 128 plus that signal's number.
+#[tokio::test]
+async fn a_second_signal_forces_a_hung_shutdown() -> Result<()> {
+    let f = Fixture::new().await?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pges-sequencer"))
+        .args(["--source", "outbox"])
+        .args(["--lease-ttl", "60s", "--renew-interval", "30s"])
+        .env("PGES_DATABASE_URL", f.db.url())
+        .env("RUST_LOG", "info")
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let pid = child.id().context("the binary exited early")?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let leading: bool =
+            sqlx::query_scalar("SELECT lease_until IS NOT NULL FROM pges.sequencer")
+                .fetch_one(&f.pool)
+                .await?;
+        if leading {
+            break;
+        }
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the binary never took the lease"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let mut lock = f.pool.begin().await?;
+    sqlx::query("SELECT FROM pges.sequencer FOR UPDATE")
+        .execute(&mut *lock)
+        .await?;
+    signal(pid, "-TERM")?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(&f.pool)
+        .await?;
+        if waiting > 0 {
+            break;
+        }
+        ensure!(
+            child.try_wait()?.is_none(),
+            "the binary exited on the first signal"
+        );
+        ensure!(
+            tokio::time::Instant::now() < deadline,
+            "the shutdown never waited on the lease row"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    ensure!(
+        child.try_wait()?.is_none(),
+        "the binary exited on the first signal"
+    );
+
+    signal(pid, "-INT")?;
+    let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .context("the second signal did not end the binary")??;
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .await?;
+    ensure!(status.code() == Some(130), "exit status {status}: {stderr}");
+    ensure!(stderr.contains("shutting down"), "{stderr}");
+    ensure!(stderr.contains("shutdown forced"), "{stderr}");
+    // The server still runs the release the binary sent before it exited, once the lock is gone.
+    lock.rollback().await?;
+
+    f.finish().await
+}
+
+/// Sends `signal` (`-TERM`, `-INT`) to the process `pid`.
+fn signal(pid: u32, signal: &str) -> Result<()> {
+    let sent = std::process::Command::new("kill")
+        .args([signal, &pid.to_string()])
+        .status()?;
+    ensure!(sent.success(), "kill {signal} failed");
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_binary_killed_mid_load_loses_and_repeats_nothing() -> Result<()> {
     killed_mid_load(Kind::Outbox).await

@@ -1360,6 +1360,11 @@ environment variable:
 - Logs go to stderr, filtered by `RUST_LOG` (default `info`); every status change is logged.
 - SIGINT or SIGTERM: finish the batch, store the token, release the lease, exit 0. A `RunError` exits 1
   (status `Halted`; the status logger skips it, so the error is logged once).
+- A second SIGINT or SIGTERM once shutdown has begun (after the first signal, or after the gRPC server
+  failed) exits at once with 128 plus the signal's number: 130 for SIGINT, 143 for SIGTERM. It logs the
+  forced shutdown as an error and does not wait for the batch, the token or the release, so the lease may be
+  left to expire; a statement already sent may still complete on the server. Use it when shutdown hangs, for
+  example releasing the lease while the database is unreachable (sqlx waits up to its 30 s acquire timeout).
 - A panic in the run exits with Rust's status 101 and leaves the status `Abandoned`; the lease stays until
   it expires. The binary logs `Abandoned` as an error, but that line may not be written while the panic
   unwinds, so watch the exit status. This relies on `panic = "unwind"` (design.md, Decided, gRPC watch).
