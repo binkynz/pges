@@ -680,17 +680,18 @@ impl Subscription {
     /// Database and waker errors are retried every [`Builder::retry_interval`], shown as
     /// [`State::Recovering`]; a lost lease returns to standby. Every other error releases the lease and ends
     /// the run.
+    ///
+    /// The status becomes [`State::Stopped`] when the run returns, and also when its future is dropped
+    /// before that (a panicking handler, an aborted task). A dropped run does not release its lease: a
+    /// standby takes over once it lapses.
     pub async fn run_until(
         self,
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> Result<(), SubscribeError> {
         let mut shutdown: Shutdown = Box::pin(shutdown.fuse());
-        let status = self.status.clone();
+        let _stopped = MarkStopped(self.status.clone());
 
-        let result = self.run_inner(&mut shutdown).await;
-
-        status.send_modify(|status| status.state = State::Stopped);
-        result
+        self.run_inner(&mut shutdown).await
     }
 
     async fn run_inner(self, shutdown: &mut Shutdown) -> Result<(), SubscribeError> {
@@ -952,7 +953,7 @@ pub enum State {
     Running,
     /// It is retrying after this error.
     Recovering(Arc<SubscribeError>),
-    /// It has stopped.
+    /// It has stopped: the run returned, or its future was dropped (a panicking handler, an aborted task).
     Stopped,
 }
 
@@ -2004,6 +2005,15 @@ async fn renewing<T>(ctx: &Ctx, term: &mut Term, work: impl Future<Output = T>) 
                 Err(_) => retry_at = Some(Instant::now() + ctx.lease / RENEW_RETRY_FRACTION),
             },
         }
+    }
+}
+
+/// Sets the status to [`State::Stopped`] when the run ends, also when its future is dropped mid-run.
+struct MarkStopped(watch::Sender<Status>);
+
+impl Drop for MarkStopped {
+    fn drop(&mut self) {
+        self.0.send_modify(|status| status.state = State::Stopped);
     }
 }
 

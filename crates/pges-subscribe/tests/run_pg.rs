@@ -319,6 +319,49 @@ async fn a_handler_that_drops_a_savepoint_begin_is_not_checkpointed() -> Result<
     f.finish().await
 }
 
+/// Panics on every batch: a bug in the handler.
+struct Panics;
+
+impl handler::PgHandler for Panics {
+    async fn handle(
+        &mut self,
+        _tx: &mut PgConnection,
+        _batch: &batch::Batch,
+    ) -> Result<(), handler::HandlerError> {
+        panic!("injected handler panic");
+    }
+}
+
+#[tokio::test]
+async fn a_panicking_handler_leaves_the_status_stopped() -> Result<()> {
+    let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    jobs(&f, 2).await?;
+
+    let handle = f
+        .store
+        .subscription(subscription_name!("panics"))
+        .categories(non_empty![category!("jobs")])
+        .run_pg(Panics)
+        .spawn();
+    let status = handle.status_changes();
+    let joined = tokio::time::timeout(Duration::from_secs(20), handle.join())
+        .await
+        .context("the subscription did not stop")?;
+
+    assert!(
+        matches!(joined, Err(subscription::SubscribeError::Aborted)),
+        "{joined:?}"
+    );
+    assert!(
+        matches!(status.borrow().state, subscription::State::Stopped),
+        "a dead subscription reports {:?}",
+        status.borrow().state
+    );
+    assert_eq!(f.cursor("panics").await?, Some(0));
+
+    f.finish().await
+}
+
 #[tokio::test]
 async fn a_standby_takes_over_from_the_checkpoint() -> Result<()> {
     let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
