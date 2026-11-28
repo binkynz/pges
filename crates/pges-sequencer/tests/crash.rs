@@ -308,7 +308,8 @@ async fn wait_hanging(pool: &PgPool, application_name: &str) -> Result<()> {
     loop {
         let hanging: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
-                            WHERE application_name = $1 AND wait_event = 'PgSleep')",
+                            WHERE datname = current_database() AND application_name = $1
+                              AND wait_event = 'PgSleep')",
         )
         .bind(application_name)
         .fetch_one(pool)
