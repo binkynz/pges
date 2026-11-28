@@ -592,7 +592,16 @@ async fn a_role_that_does_not_own_the_publication_creates_only_outbox_stores() -
             .execute(&mut conn)
             .await?;
 
-        let created = run_with_outbox(&mut conn, store_name!("n1"), outbox).await;
+        // The shared schema belongs to the owner, who migrated it: the creator only creates the store.
+        let created = migrate::run_store(&mut conn, &store_name!("n1"), &definition(outbox)).await;
+        let shared = migrate::run_shared(&mut conn).await;
+        assert!(
+            matches!(
+                shared,
+                Err(migrate::MigrateError::SharedSchemaNotOwned { .. })
+            ),
+            "{shared:?}"
+        );
 
         sqlx::query("RESET ROLE").execute(&mut conn).await?;
         match outbox {
@@ -670,6 +679,70 @@ async fn the_shared_tables_are_not_created_in_a_schema_of_another_role() -> Resu
     conn.execute(sqlx::AssertSqlSafe(format!(
         "DROP SCHEMA q1, pges CASCADE; DROP PUBLICATION IF EXISTS pges;
          DROP OWNED BY {squatter}; DROP ROLE {squatter}"
+    )))
+    .await?;
+    conn.close().await?;
+    db.cleanup().await
+}
+
+/// The owner check does not rely on anything inside the schema: a squatter whose `pges` already records
+/// every shared migration with the right checksums (here it ran them itself) is refused on every run,
+/// though no shared migration is left to apply, and no store is created there. Its owner runs them again,
+/// and so does a login role that inherits from a NOLOGIN owner after `SET ROLE` to it, while the login role
+/// itself is refused.
+#[tokio::test]
+async fn a_schema_of_another_role_is_refused_with_its_migrations_applied() -> Result<()> {
+    let db = pges_testing::TestDb::new().await?;
+    let mut conn = db.connect().await?;
+    let squatter = format!("{}_squatter", db.name());
+    let member = format!("{}_member", db.name());
+    conn.execute(sqlx::AssertSqlSafe(format!(
+        "DROP PUBLICATION pges; DROP SCHEMA pges CASCADE;
+         CREATE ROLE {squatter} NOLOGIN; GRANT CREATE ON DATABASE {database} TO {squatter};
+         CREATE ROLE {member} LOGIN IN ROLE {squatter};",
+        database = db.name()
+    )))
+    .await?;
+    conn.execute(sqlx::AssertSqlSafe(format!("SET ROLE {squatter}")))
+        .await?;
+    migrate::run_shared(&mut conn).await?;
+    conn.execute("RESET ROLE").await?;
+
+    let error = run(&mut conn, store_name!("q1")).await.unwrap_err();
+    assert!(
+        matches!(&error, migrate::MigrateError::SharedSchemaNotOwned { owner } if *owner == squatter),
+        "{error}"
+    );
+    let error = migrate::run_shared(&mut conn).await.unwrap_err();
+    assert!(
+        matches!(&error, migrate::MigrateError::SharedSchemaNotOwned { .. }),
+        "{error}"
+    );
+    assert!(store_names(&mut conn).await?.is_empty());
+    let schema: Option<String> =
+        sqlx::query_scalar("SELECT nspname::text FROM pg_namespace WHERE nspname = 'q1'")
+            .fetch_optional(&mut conn)
+            .await?;
+    assert_eq!(schema, None, "no store schema was created");
+
+    // A member of the owner is refused as itself, and migrates after SET ROLE to the owner.
+    conn.execute(sqlx::AssertSqlSafe(format!("SET ROLE {member}")))
+        .await?;
+    let error = migrate::run_shared(&mut conn).await.unwrap_err();
+    assert!(
+        matches!(&error, migrate::MigrateError::SharedSchemaNotOwned { .. }),
+        "{error}"
+    );
+    conn.execute(sqlx::AssertSqlSafe(format!("SET ROLE {squatter}")))
+        .await?;
+    run_with_outbox(&mut conn, store_name!("q1"), store::Outbox::Enabled).await?;
+    run_with_outbox(&mut conn, store_name!("q1"), store::Outbox::Enabled).await?;
+    conn.execute("RESET ROLE").await?;
+    assert_eq!(store_names(&mut conn).await?, ["q1"]);
+
+    conn.execute(sqlx::AssertSqlSafe(format!(
+        "DROP SCHEMA q1, pges CASCADE; DROP PUBLICATION IF EXISTS pges;
+         DROP OWNED BY {squatter}, {member}; DROP ROLE {member}; DROP ROLE {squatter}"
     )))
     .await?;
     conn.close().await?;

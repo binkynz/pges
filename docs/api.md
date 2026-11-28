@@ -639,6 +639,15 @@ connection already inside a transaction each is a savepoint, and a future of `mi
 knowing, so its `commit` does nothing (sqlx 0.9.1's savepoint begin; design.md, Decided, sqlx 0.9.1).
 `Store::open` runs them on a pooled connection outside a transaction.
 
+`migrate::run` and `run_shared`, and so an auto-migrating `Store::open`, fail with
+`MigrateError::SharedSchemaNotOwned { owner }` when the schema `pges` exists and its owner is not
+`current_user`, also when nothing is left to apply; a superuser or a member of the owner is refused too
+(schema.md, Migrations). Migrate as the owner: a login role that inherits from a NOLOGIN owner group runs
+`SET ROLE <owner>` on the connection first. An application whose pool role does not own `pges` keeps
+auto-migrate off and migrates separately. `run_store` alone does not check, so a store creator that does
+not own `pges` can create stores in the schema the owner migrated; call it only after the owner's
+`run_shared`.
+
 ```rust
 // pges_postgres::retention
 #[non_exhaustive] pub enum Retention {            // Default Forever

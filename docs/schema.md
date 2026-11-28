@@ -132,11 +132,18 @@ own statements in `crates/pges-postgres/sql/migrate/`.
 - Each migration runs in its own transaction holding `pg_advisory_xact_lock(hashtext('pges.migrate'))`, so
   concurrent runners apply it once. Store migrations run with `SET LOCAL search_path` set to the store, so
   their SQL uses unqualified names.
-- The first shared migration refuses a schema `pges` that already exists and belongs to another role
+- Every `run_shared` (so every `migrate::run` and auto-migrating `Store::open`) first refuses a schema `pges` that belongs to another role than `current_user`
   (`crates/pges-postgres/sql/migrate/shared_schema_owner.sql`, `MigrateError::SharedSchemaNotOwned`), a
   superuser or a member of the owner's role included: a schema's owner may drop any table in it and put its
-  own in its place, whose triggers then run as each role that writes to it. A schema created ahead by its
-  future owner (`CREATE SCHEMA pges AUTHORIZATION <owner>`) is used when that owner migrates.
+  own in its place, whose triggers then run as each role that writes to it. The check reads only the
+  catalog and runs before anything in the schema is read, so it does not depend on what the schema holds:
+  a squatter that fills in `pges.migrations` and `pges.scopes` with the right rows and checksums is refused
+  as well. A schema created ahead by its future owner (`CREATE SCHEMA pges AUTHORIZATION <owner>`) is used
+  when that owner migrates. To migrate a schema owned by another role, migrate as that role: a login role
+  that inherits from a NOLOGIN owner group runs `SET ROLE <owner>` on the connection first (Roles).
+  `run_store` alone does not check: it trusts a schema the owner migrated, so a store creator granted
+  privileges in `pges` creates stores without owning it (Roles, The publication). It is called alone only
+  after the owner ran `run_shared`.
 - An applied migration is compared with the embedded text by its SHA-256 checksum; an edited one fails with
   `ChecksumMismatch`. A runner whose newest migration is below the scope's `min_compatible` fails with
   `CrateTooOld`.
@@ -1523,11 +1530,13 @@ an outbox store is created outside the publication (the logical source never rea
 logical source fails with SQLSTATE `42501`: added later, its commits made before then would never reach a
 slot that already exists. Without the publication (dropped, or a restore with `--no-publications`), store
 creation skips it, and the logical source creates it and adds every store before it streams (Logical
-source).
+source). A store creator that does not own `pges` creates stores with `migrate::run_store` after the owner
+ran `migrate::run_shared`: `run_shared`, and so `migrate::run`, refuses a `pges` schema whose owner is not
+`current_user` (Migrations).
 
 | Role | Needs |
 |---|---|
-| owner | owns `pges` and store schemas and, for the logical source, the publication `pges` (or inherits from its owner); runs migrations, maintenance, `apply_retention`, `prune_log` and `set_writer_limits` (DDL, `VACUUM`, `UPDATE` on `pges.stores`; `pg_db_role_setting` is readable by PUBLIC). The one-source-kind trigger needs nothing more: it runs as the inserting role, and `pg_advisory_xact_lock` is executable by PUBLIC |
+| owner | owns `pges` and store schemas (migrations refuse a `pges` schema whose owner is not `current_user`: a login role that inherits from a NOLOGIN owner runs `SET ROLE <owner>` before migrating) and, for the logical source, the publication `pges` (or inherits from its owner); runs migrations, maintenance, `apply_retention`, `prune_log` and `set_writer_limits` (DDL, `VACUUM`, `UPDATE` on `pges.stores`; `pg_db_role_setting` is readable by PUBLIC). The one-source-kind trigger needs nothing more: it runs as the inserting role, and `pg_advisory_xact_lock` is executable by PUBLIC |
 | writer | `INSERT`, `UPDATE` on `streams` (`UPDATE` also covers the `SELECT … FOR UPDATE` taken before a rerun with a new commit id); `INSERT` on `commits`, `pending`, `event_types`, `commit_tags`, `tag_heads`; `UPDATE` on `tag_heads`, `snapshots`; `INSERT` on `snapshots`; `DELETE` on `commits` and `snapshots` and `INSERT` on `deleted_commits` (`delete_stream`); `SELECT` on all, including `pges.stores` (`Store::open` reads the writer limits); `EXECUTE` on `pges.check_commit_id`. The outbox trigger's `pg_notify` needs nothing extra (PUBLIC). Set `transaction_timeout` and `idle_in_transaction_session_timeout` on the role, at most the store's `max_txn_age` |
 | reader | `SELECT` on store tables and `pges.scopes` (taking and renewing leases checks `min_compatible`); `SELECT`, `INSERT`, `UPDATE` on `subscriptions` and `backfills`; `SELECT`, `INSERT`, `UPDATE`, `DELETE` on `subscription_members` (the heartbeat deletes lapsed members, and leaving deletes the instance's own row). Replica reads need nothing more: `pg_current_wal_insert_lsn()`, `pg_last_wal_replay_lsn()`, `pg_is_in_recovery()`, `current_setting` and `pg_settings` are available to PUBLIC; the replica pool's role needs `SELECT` on the store tables |
 | sequencer | `REPLICATION` (logical source only); `SELECT` on `pges.sequencer`, `pges.scopes` (taking and renewing the lease checks `min_compatible`), `pges.stores`, `categories`, `pending`, `log`; `INSERT` on `log`; `UPDATE` on `categories`, `pges.stores`, `pges.sequencer`; `DELETE` on `pending`; `EXECUTE` on the `pg_replication_origin_*` functions for token option (a). `pg_current_wal_insert_lsn()` is executable by PUBLIC. Terminating the previous leader's walsender needs no extra grant when every sequencer instance uses the same role; otherwise grant `pg_signal_backend`. With the logical source and a missing publication: `CREATE` on the database (`CREATE PUBLICATION`) and ownership of the publication (`ALTER PUBLICATION … ADD TABLE`); `SELECT` on `commits` for the commits check before a new slot. With `watch-notify`: nothing extra (`pg_notify` is PUBLIC). `resequence`: `SELECT` on `pges.stores`, `commits` and `categories` (in the exported snapshot), `INSERT` on `log`, `UPDATE` on `categories` (the resequenced range) and `pges.sequencer`, `REPLICATION`; the writer-role check reads `pg_db_role_setting`, `pg_database` and `pg_roles` (PUBLIC) |
