@@ -6,7 +6,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crates
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-11-27
+## [0.1.0] - 2026-11-28
 
 The first release: `pges`, `pges-core`, `pges-derive`, `pges-postgres`, `pges-subscribe`, `pges-sequencer`,
 `pges-replication`, `pges-watch-proto` and `pges-testing`. It needs PostgreSQL 18 and Rust 1.94.
