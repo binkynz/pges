@@ -17,8 +17,9 @@ projection in the same database sees every event exactly once.
   position is never skipped and never reused, also across restarts and failover, so a cursor is an integer
   and nothing is missed.
 - **No polling on the live path.** The sequencer reads commits from a logical replication slot, or from an
-  outbox woken by `LISTEN/NOTIFY`. Subscribers can be woken by the sequencer, in process or by `NOTIFY`.
-  The poll waker, the default for now, is for setups that have neither.
+  outbox woken by `LISTEN/NOTIFY`. Subscribers can be woken by the sequencer: over its gRPC watch, in
+  process or by `NOTIFY`. The poll waker is for setups that have none of these; without a waker, a
+  subscription rechecks the log on a timer.
 
 ## Architecture
 
@@ -29,7 +30,7 @@ writers ──▶ streams + commits           one statement per append (or a uni
                     outbox source:  pending queue, woken by LISTEN/NOTIFY
             sequencer ──▶ log            per-store positions, gap-free, commit order
                  │
-                 ▼  wake-up: in process, NOTIFY, or poll
+                 ▼  wake-up: gRPC watch, in process, NOTIFY, or poll
             subscriptions                run_pg: exactly once, in the projection's transaction
                                          run:    at least once, for anything else
 ```
