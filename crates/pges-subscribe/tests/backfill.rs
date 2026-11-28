@@ -449,6 +449,95 @@ async fn a_backfill_reads_each_category_from_its_retention_horizon() -> Result<(
     f.finish().await
 }
 
+/// A listed read fetches the commits of the rows at or below the merge cut only. With jobs a hundred times
+/// busier than orders, each page is cut at the end of a full page of jobs, before most orders rows: the
+/// orders commits are fetched once each, on the pages that deliver them, not once per page. Counted as
+/// scans of the orders partition's leaves; every fetch is one scan of the leaf holding its ids.
+#[tokio::test]
+async fn a_sparse_category_fetches_only_the_commits_up_to_the_cut() -> Result<()> {
+    const JOBS: usize = 300;
+    const ORDERS: usize = 3;
+    const BATCH: u32 = 10;
+
+    let mut f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    // Write and sequence on a pool of their own, closed before counting, so their scans are reported.
+    let setup = f.db.pool().await?;
+    f.pool = setup.clone();
+    f.store = pges_postgres::store::Store::open(
+        setup.clone(),
+        pges_postgres::store::StoreConfig::new(common::STORE_NAME),
+    )
+    .await?;
+    let (job, order) = (stream::StreamId::new_v7(), stream::StreamId::new_v7());
+    for n in 1..=JOBS {
+        f.append(Cat::Jobs, job, 1).await?;
+        if n % (JOBS / ORDERS) == JOBS / ORDERS / 2 {
+            f.append(Cat::Orders, order, 1).await?;
+        }
+    }
+    f.sequence_all().await?;
+    let until = common::head(&setup).await?;
+    let expected = expected(&f, &[Cat::Jobs, Cat::Orders], until).await?;
+    setup.close().await;
+    f.pool = f.db.pool().await?;
+    let before = scans_of_commits(&f, "orders").await?;
+
+    let reading = f.db.pool().await?;
+    let store = pges_postgres::store::Store::open(
+        reading.clone(),
+        pges_postgres::store::StoreConfig::new(common::STORE_NAME),
+    )
+    .await?;
+    let finished = store
+        .backfill(subscription_name!("skewed"), pges_testing::position(until))
+        .categories(non_empty![category!("jobs"), category!("orders")])
+        .batch_size(NonZeroU32::new(BATCH).unwrap())
+        .run_pg(Recorder::new("skewed"))
+        .await?;
+    reading.close().await;
+    let scans = scans_of_commits(&f, "orders").await? - before;
+
+    assert_eq!(finished.events, (JOBS + ORDERS) as u64);
+    check(&f, "skewed", &expected).await?;
+    let pages = JOBS as i64 / i64::from(BATCH);
+    println!("{scans} scans of the orders commits over {pages} pages, for {ORDERS} commits");
+    assert!(
+        scans <= ORDERS as i64,
+        "{scans} scans of the orders commits over {pages} pages, for {ORDERS} commits"
+    );
+
+    f.finish().await
+}
+
+/// The scans (sequential and index) of the leaves of `es.commits_<category>`, once the backends that ran
+/// them have exited and reported them: the same in three reads in a row.
+async fn scans_of_commits(f: &Fixture, category: &str) -> Result<i64> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let (mut previous, mut same) = (-1, 0);
+    loop {
+        let mut conn = f.db.connect().await?;
+        let scans: i64 = sqlx::query_scalar(
+            "SELECT coalesce(sum(coalesce(seq_scan, 0) + coalesce(idx_scan, 0)), 0)::int8
+             FROM pg_stat_user_tables WHERE schemaname = 'es' AND relname LIKE $1",
+        )
+        .bind(format!("commits\\_{category}\\_\\_%"))
+        .fetch_one(&mut conn)
+        .await?;
+        conn.close().await?;
+        same = if scans == previous { same + 1 } else { 0 };
+        if same == 2 {
+            return Ok(scans);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the scans of commits_{category} kept changing"
+        );
+
+        previous = scans;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// Appends `streams` streams in each of jobs, orders and parts, `commits` single and double event commits
 /// each, interleaved, and sequences them. Returns the streams.
 async fn write(f: &Fixture, streams: usize, commits: u32) -> Result<Vec<(Cat, stream::StreamId)>> {

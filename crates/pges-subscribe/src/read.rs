@@ -245,11 +245,12 @@ impl Reader {
 
     /// 1. Read each category's next log rows after `cursor` (for [`BeforeHorizon::Skip`], after its
     ///    retention horizon when that is higher), up to `head`, at most `limit` each, with its horizon
-    ///    checked in the statement; then the commits of those rows by id. For a shard, other shards'
-    ///    commits come without payload and are skipped.
+    ///    checked in the statement.
     /// 2. The cut is the lowest last position of the categories that returned a full page of log rows, or
     ///    `head` if none did: no category can have an unread row at or below it.
-    /// 3. Return the rows up to the cut, in position order.
+    /// 3. Fetch the commits of the rows at or below the cut by id, and return them in position order. Rows
+    ///    above the cut are read again by the next page, so their commits are not fetched. For a shard,
+    ///    other shards' commits come without payload and are skipped.
     async fn read_listed(
         &mut self,
         pool: &PgPool,
@@ -279,9 +280,22 @@ impl Reader {
         floors: &[position::Position],
         head: position::Position,
     ) -> Result<Option<Page>, subscription::SubscribeError> {
-        let mut pages = Vec::with_capacity(self.categories.len());
+        let mut logs = Vec::with_capacity(self.categories.len());
         for (category, floor) in self.categories.iter().zip(floors) {
-            pages.push(self.read_category(pool, category, *floor, head).await?);
+            logs.push(self.read_category_log(pool, category, *floor, head).await?);
+        }
+
+        let limit = usize::try_from(self.reading.limit).unwrap_or(usize::MAX);
+        let cut = cut(
+            head,
+            limit,
+            logs.iter()
+                .map(|log| (log.len(), log.last().map(|row| row.last_position))),
+        );
+
+        let mut pages = Vec::with_capacity(self.categories.len());
+        for (category, log) in self.categories.iter().zip(&logs) {
+            pages.push(self.fetch_category(pool, category, log, cut).await?);
         }
 
         // A category is checked against its horizon when its log page is empty, which the statement also
@@ -292,8 +306,8 @@ impl Reader {
             .categories
             .iter()
             .zip(floors)
-            .zip(&pages)
-            .filter(|(_, page)| page.log_rows == 0 || page.missing == Missing::Some)
+            .zip(logs.iter().zip(&pages))
+            .filter(|(_, (log, page))| log.is_empty() || page.missing == Missing::Some)
             .map(|((category, floor), _)| (category.id, *floor))
             .collect();
         if let Some(passed) = self.passed_horizon(&suspect).await? {
@@ -303,18 +317,10 @@ impl Reader {
             };
         }
 
-        let limit = usize::try_from(self.reading.limit).unwrap_or(usize::MAX);
-        let cut = cut(
-            head,
-            limit,
-            pages.iter().map(|page| (page.log_rows, page.last_position)),
-        );
-
         let mut commits: Vec<(usize, CommitRow)> = pages
             .into_iter()
             .enumerate()
             .flat_map(|(index, page)| page.commits.into_iter().map(move |row| (index, row)))
-            .filter(|(_, row)| row.last_position <= cut)
             .collect();
         commits.sort_unstable_by_key(|(_, row)| row.last_position);
 
@@ -329,18 +335,15 @@ impl Reader {
         }))
     }
 
-    /// One category's page: its next log rows after `floor`, up to `head`, then their commits by id from the
-    /// category's partition. A second statement planned for the ids prunes the category's time leaves to the
-    /// ones the page touches, so its cost does not grow with the leaves.
-    async fn read_category(
+    /// One category's next log rows after `floor`, up to `head`, in position order.
+    async fn read_category_log(
         &self,
         pool: &PgPool,
         category: &Watched,
         floor: position::Position,
         head: position::Position,
-    ) -> Result<CategoryPage, subscription::SubscribeError> {
-        let log = self
-            .sql
+    ) -> Result<Vec<LogRow>, subscription::SubscribeError> {
+        self.sql
             .read_category_log
             .bind(statement::read_category_log::Params {
                 category_id: category.id.get(),
@@ -349,16 +352,37 @@ impl Reader {
                 limit: i64::from(self.reading.limit),
             })
             .fetch_all(pool)
-            .await?;
-        let Some(last) = log.last() else {
+            .await?
+            .into_iter()
+            .map(|row| {
+                Ok(LogRow {
+                    last_position: to_position(row.last_position)?,
+                    commit_id: row.commit_id,
+                    category_id: category.id,
+                    event_count: row.event_count,
+                })
+            })
+            .collect()
+    }
+
+    /// The commits of one category's log rows at or below `cut`, by id from the category's partition. A
+    /// statement planned for the ids prunes the category's time leaves to the ones the page touches, so its
+    /// cost does not grow with the leaves.
+    async fn fetch_category(
+        &self,
+        pool: &PgPool,
+        category: &Watched,
+        log: &[LogRow],
+        cut: position::Position,
+    ) -> Result<CategoryPage, subscription::SubscribeError> {
+        let below = log.partition_point(|row| row.last_position <= cut);
+        let log = &log[..below];
+        if log.is_empty() {
             return Ok(CategoryPage {
-                log_rows: 0,
-                last_position: None,
                 commits: Vec::new(),
                 missing: Missing::None,
             });
-        };
-        let last_position = Some(to_position(last.last_position)?);
+        }
 
         let commit_ids: Vec<Uuid> = log.iter().map(|row| row.commit_id).collect();
         let mut fetched = self
@@ -367,7 +391,7 @@ impl Reader {
 
         let mut missing = Missing::None;
         let mut commits = Vec::with_capacity(log.len());
-        for row in &log {
+        for row in log {
             let Some(data) = fetched.remove(&row.commit_id) else {
                 missing = Missing::Some;
                 continue;
@@ -376,7 +400,7 @@ impl Reader {
                 continue;
             };
             commits.push(CommitRow {
-                last_position: to_position(row.last_position)?,
+                last_position: row.last_position,
                 event_count: row.event_count,
                 stream_id: data.stream_id,
                 last_version: data.last_version,
@@ -386,12 +410,7 @@ impl Reader {
             });
         }
 
-        Ok(CategoryPage {
-            log_rows: log.len(),
-            last_position,
-            commits,
-            missing,
-        })
+        Ok(CategoryPage { commits, missing })
     }
 
     /// The commits of one category by id, on `pool`; for a shard, other shards' commits without payload.
@@ -899,14 +918,10 @@ struct CommitRow {
     payload: Vec<u8>,
 }
 
-/// One category's page of a listed read.
+/// The commits of one category's log rows at or below the cut, for a listed read.
 #[derive(Debug)]
 struct CategoryPage {
-    /// The log rows read, which decide whether the page was full.
-    log_rows: usize,
-    /// The last log row's position.
-    last_position: Option<position::Position>,
-    /// The commits of the rows, in position order, without other shards' commits and missing ones.
+    /// In position order, without other shards' commits and missing ones.
     commits: Vec<CommitRow>,
     missing: Missing,
 }
@@ -918,7 +933,7 @@ enum Missing {
     Some,
 }
 
-/// One row of a page of the whole store's log.
+/// One row of a page of the log: the whole store's, or one category's.
 #[derive(Debug)]
 struct LogRow {
     last_position: position::Position,
