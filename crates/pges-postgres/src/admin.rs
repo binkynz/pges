@@ -51,6 +51,9 @@ impl Admin {
     /// category it only creates what is missing, and neither its bucket nor its retention is changed;
     /// [`Admin::change_bucket`] and [`Admin::set_retention`] do that. Stores opened before the
     /// call learn about the category the first time they need it.
+    ///
+    /// Fails with [`RegisterCategoryError::KeepTooLong`] if [`CategoryConfig::retention`] keeps commits
+    /// longer than [`retention::Retention::MAX_KEEP`].
     pub async fn register_category(
         &self,
         name: category::CategoryName,
@@ -265,6 +268,12 @@ pub enum RegisterCategoryError {
         /// The taken name: the partition's, or its index's.
         name: RelationName,
     },
+    /// [`CategoryConfig::retention`] has a `keep` longer than [`retention::Retention::MAX_KEEP`]. To keep
+    /// everything, use [`retention::Retention::Forever`].
+    #[error(
+        "retention keep {0:?} is longer than Retention::MAX_KEEP; use Retention::Forever to keep everything"
+    )]
+    KeepTooLong(Duration),
     /// A database error, including DDL that kept timing out waiting for a lock.
     #[error(transparent)]
     Database(#[from] error::DbError),
@@ -359,6 +368,12 @@ impl From<EnsureError> for MaintainError {
             EnsureError::NameTaken(name) => Self::NameTaken { name },
             EnsureError::Database(source) => source.into(),
         }
+    }
+}
+
+impl From<retention::KeepTooLong> for RegisterCategoryError {
+    fn from(retention::KeepTooLong(keep): retention::KeepTooLong) -> Self {
+        Self::KeepTooLong(keep)
     }
 }
 
@@ -490,7 +505,7 @@ async fn register_in_transaction(
     config: CategoryConfig,
 ) -> Result<(), RegisterCategoryError> {
     let (retention, retain_for) = match config.retention {
-        Some(policy) => retention::to_columns(policy),
+        Some(policy) => retention::to_columns(policy)?,
         None => retention::store_default(conn, admin.store()).await?,
     };
     admin

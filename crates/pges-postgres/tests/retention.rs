@@ -680,6 +680,82 @@ async fn categories_take_the_store_default_when_registered() -> Result<()> {
     f.finish().await
 }
 
+/// A `keep` far beyond any real window, such as `Duration::MAX` meant as "forever", would take the
+/// database clock minus `keep` out of PostgreSQL's range and fail every retention run; it is refused where
+/// it is set. `MAX_KEEP` itself works.
+#[tokio::test]
+async fn a_keep_beyond_the_maximum_is_refused() -> Result<()> {
+    let f = Fixture::new().await?;
+    let jobs = pges_core::category!("jobs");
+    let too_long = retention::Retention::MAX_KEEP + Duration::from_secs(1);
+    let window = |keep| retention::Retention::Window {
+        keep,
+        then: retention::AfterWindow::Drop,
+    };
+
+    for keep in [too_long, Duration::MAX] {
+        let error = f.admin.set_retention(jobs, window(keep)).await.unwrap_err();
+        assert!(
+            matches!(error, retention::SetRetentionError::KeepTooLong(k) if k == keep),
+            "{error:?}"
+        );
+    }
+    let error = f
+        .admin
+        .set_retention(
+            jobs,
+            retention::Retention::SnapshotAndTruncate { keep: too_long },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, retention::SetRetentionError::KeepTooLong(_)),
+        "{error:?}"
+    );
+    let error = f
+        .admin
+        .set_default_retention(window(too_long))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, retention::SetDefaultRetentionError::KeepTooLong(_)),
+        "{error:?}"
+    );
+    let mut config = admin::CategoryConfig::default();
+    config.retention = Some(window(too_long));
+    let error = f
+        .admin
+        .register_category(pges_core::category!("parts"), config)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, admin::RegisterCategoryError::KeepTooLong(_)),
+        "{error:?}"
+    );
+    let registered: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM es.categories WHERE name = 'parts'")
+            .fetch_one(&f.pool)
+            .await?;
+    assert_eq!(registered, 0);
+
+    f.admin
+        .set_retention(jobs, window(retention::Retention::MAX_KEEP))
+        .await?;
+    f.admin
+        .set_retention(
+            pges_core::category!("orders"),
+            retention::Retention::SnapshotAndTruncate {
+                keep: retention::Retention::MAX_KEEP,
+            },
+        )
+        .await?;
+    let report = f.apply().await?;
+    assert!(refused(&report).is_empty(), "{report:?}");
+    assert!(f.exists(&f.leaf(3).await?).await?);
+
+    f.finish().await
+}
+
 #[tokio::test]
 async fn an_archive_policy_is_refused() -> Result<()> {
     let f = Fixture::new().await?;

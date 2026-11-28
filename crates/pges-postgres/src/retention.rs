@@ -26,14 +26,15 @@ impl admin::Admin {
     /// Sets the retention of a registered category. It applies from the next
     /// [`admin::Admin::apply_retention`]; nothing is dropped now.
     ///
-    /// Fails with [`SetRetentionError::UnknownCategory`] if the category is not registered.
+    /// Fails with [`SetRetentionError::UnknownCategory`] if the category is not registered, and with
+    /// [`SetRetentionError::KeepTooLong`] if `keep` is longer than [`Retention::MAX_KEEP`].
     pub async fn set_retention(
         &self,
         name: category::CategoryName,
         retention: Retention,
     ) -> Result<(), SetRetentionError> {
+        let (code, retain_for) = to_columns(retention)?;
         let mut conn = self.session().await?;
-        let (code, retain_for) = to_columns(retention);
         let updated = self
             .sql()
             .set_category_retention
@@ -56,13 +57,14 @@ impl admin::Admin {
     /// Sets the store's default retention: the policy of categories registered from now on without one of
     /// their own ([`admin::CategoryConfig::retention`]). Registered categories keep theirs.
     ///
-    /// Fails with [`SetDefaultRetentionError::StoreNotFound`] if the store does not exist.
+    /// Fails with [`SetDefaultRetentionError::StoreNotFound`] if the store does not exist, and with
+    /// [`SetDefaultRetentionError::KeepTooLong`] if `keep` is longer than [`Retention::MAX_KEEP`].
     pub async fn set_default_retention(
         &self,
         retention: Retention,
     ) -> Result<(), SetDefaultRetentionError> {
+        let (code, retain_for) = to_columns(retention)?;
         let mut conn = self.session().await?;
-        let (code, retain_for) = to_columns(retention);
         let updated = statement::set_default_retention::Query::fixed()
             .bind(statement::set_default_retention::Params {
                 store: self.store(),
@@ -146,6 +148,8 @@ impl admin::Admin {
 }
 
 /// What retention keeps of a category.
+///
+/// `keep` is at most [`Retention::MAX_KEEP`]; to keep everything, use [`Retention::Forever`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum Retention {
@@ -165,6 +169,12 @@ pub enum Retention {
         /// How long commits are kept.
         keep: Duration,
     },
+}
+
+impl Retention {
+    /// The longest `keep`: 1,000 years of 365 days. Retention compares a leaf's bound with the database
+    /// clock minus `keep`, and a much longer `keep` would take that time out of PostgreSQL's range.
+    pub const MAX_KEEP: Duration = Duration::from_secs(1_000 * 365 * 24 * 60 * 60);
 }
 
 /// What happens to a time leaf once [`Retention::Window`] no longer keeps it.
@@ -318,6 +328,12 @@ pub enum SetRetentionError {
     /// The category is not registered in the store.
     #[error("category {0} is not registered in the store")]
     UnknownCategory(category::CategoryName),
+    /// The policy's `keep` is longer than [`Retention::MAX_KEEP`]. To keep everything, use
+    /// [`Retention::Forever`].
+    #[error(
+        "retention keep {0:?} is longer than Retention::MAX_KEEP; use Retention::Forever to keep everything"
+    )]
+    KeepTooLong(Duration),
     /// A database error.
     #[error(transparent)]
     Database(#[from] error::DbError),
@@ -330,6 +346,12 @@ pub enum SetDefaultRetentionError {
     /// No store with this name exists.
     #[error("store {0} does not exist")]
     StoreNotFound(pges_core::store::StoreName),
+    /// The policy's `keep` is longer than [`Retention::MAX_KEEP`]. To keep everything, use
+    /// [`Retention::Forever`].
+    #[error(
+        "retention keep {0:?} is longer than Retention::MAX_KEEP; use Retention::Forever to keep everything"
+    )]
+    KeepTooLong(Duration),
     /// A database error.
     #[error(transparent)]
     Database(#[from] error::DbError),
@@ -371,6 +393,18 @@ pub enum PruneLogError {
 impl From<sqlx::Error> for SetRetentionError {
     fn from(source: sqlx::Error) -> Self {
         Self::Database(source.into())
+    }
+}
+
+impl From<KeepTooLong> for SetRetentionError {
+    fn from(KeepTooLong(keep): KeepTooLong) -> Self {
+        Self::KeepTooLong(keep)
+    }
+}
+
+impl From<KeepTooLong> for SetDefaultRetentionError {
+    fn from(KeepTooLong(keep): KeepTooLong) -> Self {
+        Self::KeepTooLong(keep)
     }
 }
 
@@ -432,22 +466,25 @@ impl RetentionCode {
     }
 }
 
+/// A policy's `keep` is longer than [`Retention::MAX_KEEP`].
+#[derive(Debug)]
+pub(crate) struct KeepTooLong(pub(crate) Duration);
+
 /// The `retention` and `retain_for` columns for a policy.
-pub(crate) fn to_columns(retention: Retention) -> (i16, Option<PgInterval>) {
-    match retention {
-        Retention::Forever => (RetentionCode::Forever.code(), None),
+pub(crate) fn to_columns(retention: Retention) -> Result<(i16, Option<PgInterval>), KeepTooLong> {
+    let (code, keep) = match retention {
+        Retention::Forever => return Ok((RetentionCode::Forever.code(), None)),
         Retention::Window {
             keep,
             then: AfterWindow::Drop,
-        } => (
-            RetentionCode::WindowDrop.code(),
-            Some(store::interval(keep)),
-        ),
-        Retention::SnapshotAndTruncate { keep } => (
-            RetentionCode::SnapshotAndTruncate.code(),
-            Some(store::interval(keep)),
-        ),
+        } => (RetentionCode::WindowDrop, keep),
+        Retention::SnapshotAndTruncate { keep } => (RetentionCode::SnapshotAndTruncate, keep),
+    };
+    if keep > Retention::MAX_KEEP {
+        return Err(KeepTooLong(keep));
     }
+
+    Ok((code.code(), Some(store::interval(keep))))
 }
 
 /// The store's default retention columns; [`Retention::Forever`] if the store has no row.
@@ -1215,13 +1252,19 @@ mod tests {
     #[test]
     fn policies_map_to_their_codes() {
         let keep = Duration::from_secs(90);
-        assert_eq!(to_columns(Retention::Forever), (0, None));
+        assert_eq!(to_columns(Retention::Forever).unwrap(), (0, None));
         let (code, retain_for) = to_columns(Retention::Window {
             keep,
             then: AfterWindow::Drop,
-        });
+        })
+        .unwrap();
         assert_eq!(code, 1);
         assert_eq!(retain_for.map(|i| i.microseconds), Some(90_000_000));
-        assert_eq!(to_columns(Retention::SnapshotAndTruncate { keep }).0, 3);
+        assert_eq!(
+            to_columns(Retention::SnapshotAndTruncate { keep })
+                .unwrap()
+                .0,
+            3
+        );
     }
 }
