@@ -244,7 +244,7 @@ impl StoreName {
     pub fn parse(name: impl Into<String>) -> Result<Self, StoreNameError>;   // also FromStr
     pub fn as_str(&self) -> &str;                                            // also Display, AsRef<str>
 }
-#[non_exhaustive] pub enum StoreNameError { Empty, TooLong, InvalidStart, InvalidCharacter, Reserved }
+#[non_exhaustive] pub enum StoreNameError { Empty, TooLong, InvalidStart, InvalidCharacter, Reserved, Keyword }
 
 // pges_core::interval: 1 ms to 30 days
 pub struct Interval(Duration);           // Copy, Ord; From<Interval> for Duration;
