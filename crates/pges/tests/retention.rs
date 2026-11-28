@@ -254,3 +254,122 @@ async fn subscribers_see_a_deleted_stream_but_not_its_events() -> Result<()> {
     pool.close().await;
     db.cleanup().await
 }
+
+/// A commit of the next leaf can be sequenced before the last commit of the leaf retention drops: its id is
+/// past the leaf's upper bound, but it committed first. Its position is then below the horizon, so a
+/// subscription started at the horizon (as `CursorBeforeHorizon` advises) never delivers it, although it
+/// still exists.
+#[tokio::test]
+async fn a_subscription_started_at_the_horizon_reads_every_commit_retention_kept() -> Result<()> {
+    let db = pges_testing::TestDb::new().await?;
+    let mut conn = db.connect().await?;
+    let es = pges::core::store_name!("es");
+    pges_testing::create_store(
+        &mut conn,
+        &es,
+        &pges_testing::definition(store::Outbox::Disabled),
+    )
+    .await?;
+    pges_testing::register_category(&mut conn, &es, JobEvent::CATEGORY, 3, 1).await?;
+    pges_testing::create_log_partition(&mut conn, &es, 0).await?;
+    conn.execute(sqlx::AssertSqlSafe(format!(
+        "ALTER ROLE CURRENT_USER IN DATABASE {} SET transaction_timeout = '1min'",
+        db.name()
+    )))
+    .await?;
+    let role: String = sqlx::query_scalar("SELECT current_user::text")
+        .fetch_one(&mut conn)
+        .await?;
+    let pool = db.pool().await?;
+    let wide = Duration::from_secs(200 * 86_400);
+    let admin = admin::Admin::new(pool.clone(), es.clone());
+    admin
+        .set_writer_limits(limit::WriterLimits::new(
+            wide,
+            pges::core::interval!(pges::core::store::DEFAULT_MAX_TXN_AGE),
+        ))
+        .await?;
+    let mut config = store::StoreConfig::new(es);
+    config.max_clock_skew = Some(wide);
+    let store = store::Store::open(pool.clone(), config).await?;
+
+    // The last millisecond of the month before last, and the first of last month: two commits a
+    // millisecond apart on either side of a leaf bound.
+    let (before, after): (sqlx::types::Uuid, sqlx::types::Uuid) = sqlx::query_as(
+        "WITH b AS (SELECT date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+                           - interval '1 month' AS bound)
+         SELECT pges.uuidv7_floor(bound - interval '1 millisecond'), pges.uuidv7_floor(bound) FROM b",
+    )
+    .fetch_one(&pool)
+    .await?;
+    // The later id commits first: the log gives it position 1, and the earlier id position 2.
+    store
+        .append(
+            stream::StreamId::new_v7(),
+            version::ExpectedVersion::NoStream,
+            &created("after"),
+        )
+        .commit_id(commit::CommitId::from_uuid(after).unwrap())
+        .await?;
+    sequence(&pool).await?;
+    store
+        .append(
+            stream::StreamId::new_v7(),
+            version::ExpectedVersion::NoStream,
+            &created("before"),
+        )
+        .commit_id(commit::CommitId::from_uuid(before).unwrap())
+        .await?;
+    sequence(&pool).await?;
+
+    pool.execute(
+        "UPDATE pges.stores SET max_clock_skew = '5 seconds', max_txn_age = '1 minute'
+         WHERE schema_name = 'es'",
+    )
+    .await?;
+    // Keeps last month's leaf, drops the one before.
+    let since_month_start: f64 = sqlx::query_scalar(
+        "SELECT extract(epoch FROM now() - (date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'))::float8",
+    )
+    .fetch_one(&pool)
+    .await?;
+    admin
+        .set_retention(
+            JobEvent::CATEGORY,
+            retention::Retention::Window {
+                keep: Duration::from_secs_f64(since_month_start) + Duration::from_secs(86_400),
+                then: retention::AfterWindow::Drop,
+            },
+        )
+        .await?;
+    let report = admin
+        .apply_retention(&retention::RetentionConfig::new(limit::WriterRoles::one(
+            role,
+        )))
+        .await?;
+    let horizon = report.dropped.last().expect("a leaf dropped").horizon;
+    assert!(report.refused.is_empty(), "{report:?}");
+    let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM es.commits")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(kept, 1, "the commit after the bound is kept");
+
+    let collector = Collector::default();
+    let at_horizon = store
+        .subscription(pges::subscribe::subscription_name!("at-horizon"))
+        .category::<JobEvent>()
+        .start(subscription::Start::Position(horizon))
+        .waker(recheck::Recheck::every(pges::core::interval!(10 ms)))
+        .run(collector.clone())
+        .spawn();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    at_horizon.shutdown().await?;
+    assert_eq!(
+        collector.seen(),
+        [Seen::Event(1)],
+        "horizon {horizon:?}: the kept commit at position 1 is delivered"
+    );
+
+    pool.close().await;
+    db.cleanup().await
+}
