@@ -5,7 +5,10 @@
 
 mod common;
 
+use std::num::NonZeroU32;
+
 use anyhow::Result;
+use sqlx::Executor as _;
 
 use pges_core::{category, interval, non_empty, position, stream};
 use pges_subscribe::{
@@ -268,6 +271,69 @@ async fn a_subscription_started_at_retained_reads_commits_kept_below_the_horizon
             "{name}"
         );
     }
+
+    f.finish().await
+}
+
+/// A store-wide subscription started at `Start::Retained` does not page through the log rows of commits
+/// retention dropped below a category's start: the log statement leaves them out, so the first page holds
+/// the commits that are left, and the cursor moves once.
+#[tokio::test]
+async fn a_store_wide_retained_subscription_skips_dead_rows_in_one_page() -> Result<()> {
+    let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    let (job, order) = (stream::StreamId::new_v7(), stream::StreamId::new_v7());
+    for _ in 0..10 {
+        f.append(Cat::Jobs, job, 1).await?;
+    }
+    for _ in 0..2 {
+        f.append(Cat::Orders, order, 1).await?;
+    }
+    f.sequence_all().await?;
+    // As apply_retention records it after dropping every jobs commit, before prune_log deletes their rows.
+    sqlx::query(
+        "UPDATE es.categories SET horizon_position = 10, start_position = 10 WHERE category_id = $1",
+    )
+    .bind(f.id(Cat::Jobs).get())
+    .execute(&f.pool)
+    .await?;
+    sqlx::query("DELETE FROM es.commits_jobs")
+        .execute(&f.pool)
+        .await?;
+    // Every cursor the subscription stores, in order.
+    f.pool
+        .execute(
+            "CREATE TABLE es.moved (seq int8 GENERATED ALWAYS AS IDENTITY, position int8 NOT NULL);
+             CREATE FUNCTION es.record_move() RETURNS trigger LANGUAGE plpgsql AS
+               $$ BEGIN INSERT INTO es.moved (position) VALUES (NEW.position); RETURN NEW; END $$;
+             CREATE TRIGGER record_move AFTER UPDATE OF position ON es.subscriptions FOR EACH ROW
+               WHEN (OLD.position IS DISTINCT FROM NEW.position) EXECUTE FUNCTION es.record_move();",
+        )
+        .await?;
+
+    let running = common::Running::spawn(
+        f.store
+            .subscription(subscription_name!("retained"))
+            .all_categories()
+            .start(subscription::Start::Retained)
+            .batch_size(NonZeroU32::new(2).unwrap())
+            .waker(recheck::Recheck::every(interval!(5 ms)))
+            .run_pg(Recorder::new("retained")),
+    );
+    running.wait_position(12).await?;
+    running.stop().await?;
+
+    assert_eq!(
+        f.delivered("retained")
+            .await?
+            .iter()
+            .map(|d| d.0)
+            .collect::<Vec<_>>(),
+        [11, 12]
+    );
+    let moved: Vec<i64> = sqlx::query_scalar("SELECT position FROM es.moved ORDER BY seq")
+        .fetch_all(&f.pool)
+        .await?;
+    assert_eq!(moved, [12], "one page, not one per two dead rows");
 
     f.finish().await
 }
