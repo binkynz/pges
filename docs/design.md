@@ -2069,7 +2069,8 @@ the halt, 43 recovered, 335 after.
     before the table exists. Not a `pges.stores` row: the sequencer has `UPDATE` on that table. The runner
     already holds the row when its store insert fires the trigger, so the trigger's lock is a no-op there.
   - Migrations and `Admin` operations try their lock (`SKIP LOCKED`, `pg_try_advisory_lock`) with a backoff
-    of 10 ms to 250 ms, up to a total wait (`MigrateConfig::lock_wait`, `Admin::with_lock_wait`; 60 s), then
+    of 10 ms to 250 ms, up to a total wait (`MigrateConfig::lock_wait`, `Admin::with_lock_wait`; 60 s) that
+    counts only time spent waiting, never time spent working under a lock, then
     fail with `lock::LockTimeout`, naming the holder from `pg_locks` and `pg_stat_activity`. A legitimate
     second maintainer is still waited for, up to the wait. A waiting `Admin` operation returns its pooled
     connection between tries, so it never holds one for longer than a try.
@@ -2078,7 +2079,7 @@ the halt, 43 recovered, 335 after.
     dedicated connection for `Admin`, which would skip the pool's `after_connect` (where a deployment may
     `SET ROLE`). Trade-off: tries are not fair (a waiter may be overtaken), and a freed lock is noticed up to
     250 ms late; both are irrelevant for migrations and maintenance.
-  - `Store::open` migrates with the default wait; `migrate::run` takes a `MigrateConfig` for another.
+  - `Store::open` migrates with `StoreConfig::migrate_config`; `migrate::run` takes a `MigrateConfig`.
 - Functions the migrations create pin `search_path = pg_catalog, pg_temp` (2026-11-28; schema.md,
   Migrations). Without it, `pges.check_commit_id` resolved `uuid_extract_version` through its caller's path,
   so a function in `public` could stand in for it and accept ids that are not UUIDv7. The cost is a GUC save

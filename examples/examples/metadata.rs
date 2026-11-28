@@ -52,7 +52,7 @@ async fn example(db: &database::Database) -> Result<()> {
         &mut conn,
         &config.name,
         &store::StoreDefinition::default(),
-        &migrate::MigrateConfig::default(),
+        migrate::MigrateConfig::default(),
     )
     .await?;
     drop(conn);

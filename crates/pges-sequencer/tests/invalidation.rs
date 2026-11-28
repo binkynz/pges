@@ -72,11 +72,8 @@ async fn invalidate(container: &ContainerAsync<Postgres>) -> Result<()> {
     let port = container.get_host_port_ipv4(5432).await?;
     let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
     let mut conn = connect(&url).await?;
-    pges_postgres::migrate::run_shared(
-        &mut conn,
-        &pges_postgres::migrate::MigrateConfig::default(),
-    )
-    .await?;
+    pges_postgres::migrate::run_shared(&mut conn, pges_postgres::migrate::MigrateConfig::default())
+        .await?;
     let db = pges_testing::TestDb::existing("postgres", url);
     let f = Fixture::on(db, Kind::Logical).await?;
     let slot = f.slot().await?;

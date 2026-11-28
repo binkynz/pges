@@ -258,7 +258,7 @@ async fn scenario(
             &mut conn,
             &pges_core::store_name!("es2"),
             &pges_testing::definition(outbox),
-            &migrate::MigrateConfig::default(),
+            migrate::MigrateConfig::default(),
         )
         .await
         .unwrap_err();

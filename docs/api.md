@@ -497,6 +497,7 @@ pub struct StoreConfig {                                 // how a writer opens a
     pub write_format: frame::Format,
     pub migrate: store::AutoMigrate,                     // CreateOrMigrate(StoreDefinition)
                                                          // | Disabled (default)
+    pub migrate_config: migrate::MigrateConfig,          // how CreateOrMigrate migrates: lock_wait, 60 s
     pub append_routing: store::AppendRouting,            // Auto (default): name the stream's partition
                                                          // when it fits | Streams: through `streams`
 }
@@ -511,7 +512,7 @@ pub struct StoreDefinition {                             // what a store is crea
 ```
 
 - `StoreConfig` opens a store; `StoreDefinition` is what a store is created with. Only
-  `AutoMigrate::CreateOrMigrate(definition)` and `migrate::run(conn, &name, &definition, &config)` read a
+  `AutoMigrate::CreateOrMigrate(definition)` and `migrate::run(conn, &name, &definition, config)` read a
   definition, and only to create a missing store: an existing store keeps its own. `Store::name() -> &StoreName`.
 - `StoreDefinition`, `AutoMigrate`, `admin::CategoryConfig`, `retention::Retention` and `AfterWindow` are
   `Clone` but not `Copy`, so a later variant or field may hold owned data (an archive destination).
@@ -603,10 +604,11 @@ set `append_routing` to `AppendRouting::Streams`.
 Migrations and administration:
 
 ```rust
-let config = migrate::MigrateConfig::default();             // lock_wait: Interval, 60 s (lock::DEFAULT_WAIT)
-migrate::run(&mut conn, &name, &definition, &config).await?;       // run_shared, then run_store; both public
-migrate::run_shared(&mut conn, &config).await?;                    // the shared pges schema
-migrate::run_store(&mut conn, &name, &definition, &config).await?; // creates the store from the
+let config = migrate::MigrateConfig::default()      // Copy; lock_wait: Interval, 60 s (lock::DEFAULT_WAIT),
+    .with_lock_wait(interval!(5 min));              // counting only time spent waiting for the lock
+migrate::run(&mut conn, &name, &definition, config).await?;       // run_shared, then run_store; both public
+migrate::run_shared(&mut conn, config).await?;                    // the shared pges schema
+migrate::run_store(&mut conn, &name, &definition, config).await?; // creates the store from the
                                                             // StoreDefinition if missing, then migrates it;
                                                             // each takes &mut PgConnection and returns a
                                                             // BoxFuture

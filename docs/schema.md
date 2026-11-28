@@ -137,12 +137,18 @@ own statements in `crates/pges-postgres/sql/migrate/`.
   (`crates/pges-postgres/sql/migrate/bootstrap_lock.sql`); a runner that takes it and then finds the table
   locks the row too, so no runner holds only the advisory lock while another holds the row.
 - The runner tries the lock and does not wait in the server: between tries it sleeps 10 ms, doubling up to
-  250 ms. One run waits at most `MigrateConfig::lock_wait` in all (60 s by default), then fails with
+  250 ms. One run waits at most `MigrateConfig::lock_wait` in all (60 s by default; `StoreConfig::migrate_config`
+  for an auto-migrating `Store::open`), counting only the time from a failed try to the try that takes the
+  lock, not the time spent applying migrations. Then it fails with
   `MigrateError::LockTimeout`, naming the session holding the lock: for the row, the transaction in its
   `xmax` looked up in `pg_locks` (`crates/pges-postgres/sql/migrate/lock_holder.sql`); for the advisory lock,
   its key in `pg_locks` (`crates/pges-postgres/sql/migrate/bootstrap_holder.sql`); the role from
   `pg_stat_activity`. Both views show these columns to every role. A run that finds every migration applied
   takes no lock.
+- A holder that took the row lock in a savepoint it has since released is not found: the row's `xmax` is
+  the savepoint's subtransaction, whose id `pg_locks` no longer lists, though the lock lasts until the outer
+  transaction ends. `migrate::run` on a connection already in a transaction leaves its lock that way after
+  each migration. `LockTimeout::holder` is then `None`.
 - Store migrations run with `SET LOCAL search_path` set to the store (and `pg_temp` last), so their SQL uses
   unqualified names.
 - Every function the migrations create (`pges.check_one_source_kind`, `pges.uuidv7_floor`,
@@ -1281,7 +1287,8 @@ the first, not fail after a second). A busy try returns the connection to the po
 up to 250 ms, so operations waiting for another maintainer hold a pooled connection only for each try and
 cannot drain the store's pool (`Store::admin` uses it). A try's connection is closed instead if its future
 is dropped before the try returns, since it may hold the lock. After the operation's lock wait
-(`Admin::with_lock_wait`, 60 s by default) it fails with its error's `LockTimeout` variant, naming the holder
+(`Admin::with_lock_wait`, 60 s by default; only time spent waiting counts, and `freeze_closed_partitions`
+spends one wait across all its partitions) it fails with its error's `LockTimeout` variant, naming the holder
 from `pg_locks` and `pg_stat_activity` (`crates/pges-postgres/sql/maintain/holder.sql`). A dedicated
 connection outside the pool was rejected: it would skip the pool's `after_connect`, which may `SET ROLE`.
 
