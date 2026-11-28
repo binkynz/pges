@@ -1220,6 +1220,7 @@ crate::typed_query! {
         },
         row {
             horizon: Option<i64>,
+            first_kept: Option<i64>,
             sequenced: bool,
             next_scan_from: Option<i64>,
         },
@@ -1285,16 +1286,18 @@ crate::typed_query! {
 }
 
 crate::typed_query! {
-    /// Raises a category's retention horizon.
+    /// Raises a category's retention horizon and start position.
     pub RAISE_HORIZON, mod raise_horizon {
         name: "retention/raise_horizon",
         files: [sql_file!("retention/raise_horizon.sql")],
         params {
             category_id: i32,
             horizon: Option<i64>,
+            first_kept: Option<i64>,
         },
         row {
             horizon_position: i64,
+            start_position: i64,
         },
     }
 }
@@ -1315,7 +1318,7 @@ crate::typed_query! {
 }
 
 crate::typed_query! {
-    /// Reads a category's retention horizon.
+    /// Reads a category's retention horizon and start position.
     pub HORIZON, mod horizon {
         name: "retention/horizon",
         files: [sql_file!("retention/horizon.sql")],
@@ -1324,6 +1327,7 @@ crate::typed_query! {
         },
         row {
             horizon_position: i64,
+            start_position: i64,
         },
     }
 }

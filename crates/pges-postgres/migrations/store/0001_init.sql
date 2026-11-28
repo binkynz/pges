@@ -16,6 +16,8 @@ CREATE TABLE categories (
   last_position       int8     NOT NULL DEFAULT 0,       -- category high-water mark; written by the
                                                          -- sequencer at most once a second
   horizon_position    int8     NOT NULL DEFAULT 0,       -- retention floor; cursors below it are rejected
+  start_position      int8     NOT NULL DEFAULT 0,       -- every commit at or below it was dropped; a
+                                                         -- read of what retention kept starts here
   retention_scan_from int8     NOT NULL DEFAULT 0,       -- where the next retention scan of log starts
   resequenced_from    int8     NOT NULL DEFAULT 0,       -- positions resequence gave this category's
   resequenced_through int8     NOT NULL DEFAULT 0,       -- commits, in commit id order; 0, 0: none
@@ -150,6 +152,8 @@ CREATE TABLE deleted_commits (
 -- Updated on every checkpoint; keep HOT.
 CREATE TABLE subscriptions (
   position     int8   NOT NULL DEFAULT 0,
+  skip_through int8   NOT NULL DEFAULT 0,               -- commits retention dropped at or below it are
+                                                        -- skipped, not an error (Start::Retained); 0: none
   fence        int8   NOT NULL DEFAULT 0,               -- bumped on every lease takeover and on a redefine
   shard        int2   NOT NULL DEFAULT 0,               -- rows with shard >= shards are retired
   shards       int2   NOT NULL DEFAULT 1 CHECK (shards BETWEEN 1 AND 1024),

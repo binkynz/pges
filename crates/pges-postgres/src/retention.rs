@@ -100,11 +100,14 @@ impl admin::Admin {
     ///   snapshot at or after its last version in the leaf ([`RefusalReason::MissingSnapshots`]).
     ///
     /// Before the leaf is detached, the category's retention horizon is raised to the newest position in it,
-    /// and each of its streams' retention floor to its newest version in it, in one transaction, which also
-    /// forgets the commits `delete_stream` recorded whose log rows the horizon now covers. From then on
-    /// a subscription whose cursor is behind the horizon fails with `CursorBeforeHorizon`, and a read below a
-    /// stream's floor fails with [`crate::read::ReadError::Truncated`]: load such streams with
-    /// [`store::Store::load_snapshotted`]. A category's later leaves are not tried after a refusal.
+    /// its start position to the position before the oldest commit that stays (or the horizon, if that is
+    /// lower), and each of its streams' retention floor to its newest version in it, in one transaction,
+    /// which also forgets the commits `delete_stream` recorded whose log rows the horizon now covers. From
+    /// then on a subscription whose cursor is behind the horizon fails with `CursorBeforeHorizon`, a new
+    /// subscription created with `Start::Retained` and a backfill read the category after its start
+    /// position ([`DroppedLeaf::start`]), and a read below a stream's floor fails with
+    /// [`crate::read::ReadError::Truncated`]: load such streams with [`store::Store::load_snapshotted`]. A
+    /// category's later leaves are not tried after a refusal.
     ///
     /// Fails without dropping anything while the sequencer is halted (`pges.sequencer.halted`, a lost
     /// replication slot awaiting `resequence`), and unless every role in
@@ -223,8 +226,14 @@ pub struct DroppedLeaf {
     pub category: category::CategoryName,
     /// The leaf's table name.
     pub leaf: PartitionName,
-    /// The category's retention horizon after the drop.
+    /// The category's retention horizon after the drop: every commit retention dropped is at or below it.
+    /// A subscription whose cursor is behind it fails with `CursorBeforeHorizon`.
     pub horizon: position::Position,
+    /// The category's start position after the drop: every commit at or below it was dropped. It is at
+    /// most [`DroppedLeaf::horizon`]. Commits that stay can lie between the two, when they committed
+    /// before the dropped leaf's last commit; a subscription created with `Start::Retained`, and a
+    /// backfill, read the category from here.
+    pub start: position::Position,
 }
 
 /// A leaf retention could not drop. Later leaves of the category were not tried.
@@ -551,14 +560,21 @@ struct Leaf {
 /// What the scan of the log found for one leaf (`retention/scan.sql`).
 struct Scan {
     horizon: Option<i64>,
+    first_kept: Option<i64>,
     sequenced: bool,
     next_scan_from: Option<i64>,
 }
 
 /// The outcome of one leaf.
 enum LeafOutcome {
-    Dropped(position::Position),
+    Dropped(Horizon),
     Refused(RefusalReason),
+}
+
+/// A category's retention horizon and start position (`categories.horizon_position`, `start_position`).
+struct Horizon {
+    horizon: position::Position,
+    start: position::Position,
 }
 
 /// The intervals the eligibility checks need.
@@ -668,11 +684,14 @@ async fn apply_retention(
             )
             .await?;
             match outcome {
-                LeafOutcome::Dropped(horizon) => report.dropped.push(DroppedLeaf {
-                    category: category_name,
-                    leaf: PartitionName::of(&leaf.name),
-                    horizon,
-                }),
+                LeafOutcome::Dropped(Horizon { horizon, start }) => {
+                    report.dropped.push(DroppedLeaf {
+                        category: category_name,
+                        leaf: PartitionName::of(&leaf.name),
+                        horizon,
+                        start,
+                    });
+                }
                 LeafOutcome::Refused(reason) => {
                     report.refused.push(Refusal {
                         category: category_name,
@@ -759,16 +778,17 @@ async fn retire_leaf(
         .execute(&mut *tx)
         .await?;
     tx.execute(statement::PLAN_JOINS.sql()).await?;
-    let horizon = admin
+    let raised = admin
         .sql()
         .raise_horizon
         .bind(statement::raise_horizon::Params {
             category_id: category.id.get(),
             horizon: scan.horizon,
+            first_kept: scan.first_kept,
         })
         .fetch_one(&mut *tx)
-        .await?
-        .horizon_position;
+        .await?;
+    let horizon = raised.horizon_position;
     // In the horizon's transaction: once it commits, no store-wide read reaches these log rows.
     admin
         .sql()
@@ -800,7 +820,10 @@ async fn retire_leaf(
         *retire.scan_from = (*retire.scan_from).max(next);
     }
 
-    Ok(LeafOutcome::Dropped(to_position(horizon)))
+    Ok(LeafOutcome::Dropped(Horizon {
+        horizon: to_position(horizon),
+        start: to_position(raised.start_position),
+    }))
 }
 
 /// Finds the leaf's horizon and whether every commit in it has a log row, scanning the category's log
@@ -886,6 +909,7 @@ async fn scan_log_in_snapshot(
 
     Ok(Scan {
         horizon: row.horizon,
+        first_kept: row.first_kept,
         sequenced: row.sequenced,
         next_scan_from: row.next_scan_from,
     })
@@ -936,7 +960,7 @@ async fn horizon_of(
     conn: &mut PgConnection,
     admin: &admin::Admin,
     category_id: category::CategoryId,
-) -> Result<position::Position, sqlx::Error> {
+) -> Result<Horizon, sqlx::Error> {
     let row = admin
         .sql()
         .horizon
@@ -946,7 +970,10 @@ async fn horizon_of(
         .fetch_one(&mut *conn)
         .await?;
 
-    Ok(to_position(row.horizon_position))
+    Ok(Horizon {
+        horizon: to_position(row.horizon_position),
+        start: to_position(row.start_position),
+    })
 }
 
 /// `pges.sequencer.halted`.

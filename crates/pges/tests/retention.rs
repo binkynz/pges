@@ -69,6 +69,16 @@ impl handler::Handler for Collector {
     }
 }
 
+impl handler::PgHandler for Collector {
+    async fn handle(
+        &mut self,
+        _tx: &mut sqlx::PgConnection,
+        batch: &batch::Batch,
+    ) -> Result<(), handler::HandlerError> {
+        handler::Handler::handle(self, batch).await
+    }
+}
+
 /// Gives every commit without a log row one, in commit id order.
 async fn sequence(pool: &PgPool) -> Result<()> {
     pool.execute(
@@ -257,10 +267,10 @@ async fn subscribers_see_a_deleted_stream_but_not_its_events() -> Result<()> {
 
 /// A commit of the next leaf can be sequenced before the last commit of the leaf retention drops: its id is
 /// past the leaf's upper bound, but it committed first. Its position is then below the horizon, so a
-/// subscription started at the horizon (as `CursorBeforeHorizon` advises) never delivers it, although it
-/// still exists.
+/// subscription started at the horizon would never deliver it, although it still exists. Retention records
+/// the start position before it, and a subscription started at `Start::Retained` reads from there.
 #[tokio::test]
-async fn a_subscription_started_at_the_horizon_reads_every_commit_retention_kept() -> Result<()> {
+async fn a_subscription_started_at_retained_reads_every_commit_retention_kept() -> Result<()> {
     let db = pges_testing::TestDb::new().await?;
     let mut conn = db.connect().await?;
     let es = pges::core::store_name!("es");
@@ -347,28 +357,51 @@ async fn a_subscription_started_at_the_horizon_reads_every_commit_retention_kept
             role,
         )))
         .await?;
-    let horizon = report.dropped.last().expect("a leaf dropped").horizon;
+    let dropped = report.dropped.last().expect("a leaf dropped");
+    let (horizon, start) = (dropped.horizon, dropped.start);
     assert!(report.refused.is_empty(), "{report:?}");
+    assert_eq!(
+        horizon,
+        pges_testing::position(2),
+        "the dropped commit's position"
+    );
+    assert_eq!(
+        start,
+        position::Position::BEGINNING,
+        "before the kept commit"
+    );
     let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM es.commits")
         .fetch_one(&pool)
         .await?;
     assert_eq!(kept, 1, "the commit after the bound is kept");
 
     let collector = Collector::default();
-    let at_horizon = store
-        .subscription(pges::subscribe::subscription_name!("at-horizon"))
+    let retained = store
+        .subscription(pges::subscribe::subscription_name!("retained"))
         .category::<JobEvent>()
-        .start(subscription::Start::Position(horizon))
+        .start(subscription::Start::Retained)
         .waker(recheck::Recheck::every(pges::core::interval!(10 ms)))
         .run(collector.clone())
         .spawn();
     tokio::time::sleep(Duration::from_millis(500)).await;
-    at_horizon.shutdown().await?;
+    retained.shutdown().await?;
     assert_eq!(
         collector.seen(),
         [Seen::Event(1)],
-        "horizon {horizon:?}: the kept commit at position 1 is delivered"
+        "horizon {horizon:?}, start {start:?}: the kept commit at position 1 is delivered"
     );
+
+    // A backfill reads it too.
+    let backfilled = Collector::default();
+    store
+        .backfill(
+            pges::subscribe::subscription_name!("backfill"),
+            pges::subscribe::backfill::Until::Head,
+        )
+        .category::<JobEvent>()
+        .run_pg(backfilled.clone())
+        .await?;
+    assert_eq!(backfilled.seen(), [Seen::Event(1)]);
 
     pool.close().await;
     db.cleanup().await

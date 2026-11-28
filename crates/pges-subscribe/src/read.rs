@@ -55,18 +55,6 @@ pub(crate) struct Reading {
     pub(crate) on_unknown: event::OnUnknown,
     /// The number of shards; 1 reads every stream.
     pub(crate) shards: i16,
-    /// What a listed read does when its cursor is below a category's retention horizon.
-    pub(crate) before_horizon: BeforeHorizon,
-}
-
-/// What a listed read does when its cursor is below a category's retention horizon.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BeforeHorizon {
-    /// Fails with [`subscription::SubscribeError::CursorBeforeHorizon`]: a subscription must not skip events
-    /// it has not handled.
-    Fail,
-    /// Reads each category from its horizon: the events before it are gone. For backfills.
-    Skip,
 }
 
 impl Reading {
@@ -108,6 +96,13 @@ pub(crate) struct Reader {
     reading: Reading,
     /// The shard read, below `reading.shards`.
     shard: i16,
+    /// A category whose retention horizon is at or below this is read after its start position, and the
+    /// commits retention dropped from it are skipped; a category whose horizon is above it is read after
+    /// the cursor only if the cursor is not behind the horizon, or the read fails with
+    /// [`subscription::SubscribeError::CursorBeforeHorizon`]. `BEGINNING` for a subscription, which must
+    /// not skip events it has not handled; the head at creation for one started at
+    /// [`subscription::Start::Retained`]; `MAX` for a backfill.
+    skip_through: position::Position,
 }
 
 impl Reader {
@@ -131,7 +126,14 @@ impl Reader {
             listed,
             reading,
             shard: 0,
+            skip_through: position::Position::BEGINNING,
         }
+    }
+
+    /// Skips the commits retention dropped from categories whose horizon is at or below `through` (see
+    /// `Reader::skip_through`).
+    pub(crate) fn skip_dropped_through(&mut self, through: position::Position) {
+        self.skip_through = through;
     }
 
     /// The same reader, for one shard's streams.
@@ -254,9 +256,9 @@ impl Reader {
         }
     }
 
-    /// 1. Read each category's next log rows after `cursor` (for [`BeforeHorizon::Skip`], after its
-    ///    retention horizon when that is higher), up to `head`, at most `limit` each, with its horizon
-    ///    checked in the statement.
+    /// 1. Read each category's next log rows after `cursor` (for a category whose dropped commits the reader
+    ///    skips, after its start position when that is higher), up to `head`, at most `limit` each, with
+    ///    its horizon or start checked in the statement.
     /// 2. The cut is the lowest last position of the categories that returned a full page of log rows, or
     ///    `head` if none did: no category can have an unread row at or below it.
     /// 3. Fetch the commits of the rows at or below the cut by id, and return them in position order. Rows
@@ -269,21 +271,23 @@ impl Reader {
         head: position::Position,
     ) -> Result<Page, subscription::SubscribeError> {
         loop {
-            let floors = match self.reading.before_horizon {
-                BeforeHorizon::Fail => vec![cursor; self.categories.len()],
-                BeforeHorizon::Skip => self.horizon_floors(cursor).await?,
+            // At or past `skip_through`, every skipped category's start is at or below the cursor.
+            let floors = if cursor < self.skip_through {
+                self.start_floors(cursor).await?
+            } else {
+                vec![cursor; self.categories.len()]
             };
             match self.read_listed_from(pool, cursor, &floors, head).await? {
                 Some(page) => return Ok(page),
-                // Retention raised a horizon between the statements; read again from the new one.
+                // Retention raised a skipped category's start between the statements; read again from it.
                 None => continue,
             }
         }
     }
 
-    /// [`Reader::read_listed`] with each category read after its floor: the cursor, or for
-    /// [`BeforeHorizon::Skip`] the category's horizon when that is higher. `None` when a horizon passed a
-    /// floor meanwhile and the reader skips horizons.
+    /// [`Reader::read_listed`] with each category read after its floor: the cursor, or for a category whose
+    /// dropped commits the reader skips, its start position when that is higher. `None` when such a
+    /// category's start passed its floor meanwhile.
     async fn read_listed_from(
         &mut self,
         pool: &PgPool,
@@ -312,7 +316,8 @@ impl Reader {
         // A category is checked against its horizon when its log page is empty, which the statement also
         // returns below the horizon, or when a commit of its page is missing: retention may have raised the
         // horizon and dropped the commit between the two statements. A commit missing without that, such as
-        // one `delete_stream` deleted, is skipped.
+        // one `delete_stream` deleted, or one retention dropped from a category the reader skips, is
+        // skipped.
         let suspect: Vec<(category::CategoryId, position::Position)> = self
             .categories
             .iter()
@@ -321,11 +326,10 @@ impl Reader {
             .filter(|(_, (log, page))| log.is_empty() || page.missing == Missing::Some)
             .map(|((category, floor), _)| (category.id, *floor))
             .collect();
-        if let Some(passed) = self.passed_horizon(&suspect).await? {
-            return match self.reading.before_horizon {
-                BeforeHorizon::Fail => Err(passed),
-                BeforeHorizon::Skip => Ok(None),
-            };
+        match self.passed_horizon(&suspect).await? {
+            Some(Passed::Behind(error)) => return Err(error),
+            Some(Passed::Skipped) => return Ok(None),
+            None => {}
         }
 
         let mut commits: Vec<(usize, CommitRow)> = pages
@@ -361,6 +365,7 @@ impl Reader {
                 after: to_i64(floor),
                 head: to_i64(head),
                 limit: i64::from(self.reading.limit),
+                skip_through: to_i64(self.skip_through),
             })
             .fetch_all(pool)
             .await?
@@ -463,8 +468,9 @@ impl Reader {
     ///    `head`: one statement saw every row up to `head`, so no merge is needed.
     /// 2. Fetch the commits of each category in the page by id, loading categories registered since the
     ///    last read. For a shard, other shards' commits come without payload and are skipped.
-    /// 3. Skip the log rows of commits `delete_stream` deleted. Any other missing commit was dropped by
-    ///    retention, which the highest horizon shows, or the log is corrupt.
+    /// 3. Skip the log rows of commits `delete_stream` deleted, and of commits retention dropped from a
+    ///    category whose dropped commits the reader skips. Any other missing commit was dropped by retention,
+    ///    which the highest horizon shows, or the log is corrupt.
     async fn read_all(
         &mut self,
         pool: &PgPool,
@@ -478,6 +484,7 @@ impl Reader {
                 after: to_i64(cursor),
                 head: to_i64(head),
                 limit: i64::from(self.reading.limit),
+                skip_through: to_i64(self.skip_through),
             })
             .fetch_all(pool)
             .await?
@@ -520,11 +527,14 @@ impl Reader {
         }
 
         let deleted = self.deleted_commits(&log, &fetched).await?;
+        let dropped = self.dropped_commits(cursor, &log, &fetched).await?;
 
         let mut records = Vec::new();
         for row in log {
             let Some(data) = fetched.remove(&(row.category_id, row.commit_id)) else {
-                if deleted.contains(&(row.category_id, row.commit_id)) {
+                if deleted.contains(&(row.category_id, row.commit_id))
+                    || dropped.contains(&(row.category_id, row.commit_id))
+                {
                     continue;
                 }
                 self.check_highest_horizon(cursor).await?;
@@ -624,6 +634,44 @@ impl Reader {
             .collect())
     }
 
+    /// The log rows of `log` whose commit is missing from `fetched` because retention dropped it from a
+    /// category whose dropped commits the reader skips: the row is at or below the category's horizon, and
+    /// the horizon at or below `skip_through`. Read after the commits: retention raises the horizon before
+    /// it drops them.
+    async fn dropped_commits(
+        &self,
+        cursor: position::Position,
+        log: &[LogRow],
+        fetched: &HashMap<(category::CategoryId, Uuid), CommitData>,
+    ) -> Result<HashSet<(category::CategoryId, Uuid)>, subscription::SubscribeError> {
+        // Past `skip_through`, every row is above the horizon of each skipped category.
+        if cursor >= self.skip_through {
+            return Ok(HashSet::new());
+        }
+        let missing: Vec<&LogRow> = log
+            .iter()
+            .filter(|row| !fetched.contains_key(&(row.category_id, row.commit_id)))
+            .collect();
+        if missing.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let mut ids: Vec<i32> = missing.iter().map(|row| row.category_id.get()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let retained = self.retained(&ids).await?;
+
+        Ok(missing
+            .into_iter()
+            .filter(|row| {
+                retained.get(&row.category_id).is_some_and(|retained| {
+                    self.skips(retained.horizon) && row.last_position <= retained.horizon
+                })
+            })
+            .map(|row| (row.category_id, row.commit_id))
+            .collect())
+    }
+
     fn index_of(
         &self,
         id: category::CategoryId,
@@ -638,7 +686,7 @@ impl Reader {
     }
 
     /// The log statement of the whole store returns no rows for a cursor behind the highest horizon of any
-    /// category; tell that apart from being caught up.
+    /// category it does not skip; tell that apart from being caught up.
     async fn check_highest_horizon(
         &self,
         cursor: position::Position,
@@ -646,7 +694,9 @@ impl Reader {
         let row = self
             .sql
             .highest_horizon
-            .bind(statement::highest_horizon::Params {})
+            .bind(statement::highest_horizon::Params {
+                skip_through: to_i64(self.skip_through),
+            })
             .fetch_optional(&self.pool)
             .await?;
         let Some(row) = row else {
@@ -665,68 +715,92 @@ impl Reader {
         Ok(())
     }
 
-    /// The read statement returns no rows for a cursor behind a category's horizon. For the categories that
-    /// returned none, each with the position it was read after, tell that apart from being caught up: the
-    /// first whose horizon is above that position, as
-    /// [`CursorBeforeHorizon`](subscription::SubscribeError::CursorBeforeHorizon).
+    /// The read statement returns no rows for a cursor behind a category's horizon, or for a category whose
+    /// dropped commits the reader skips, behind its start. For the categories that returned none or missed
+    /// a commit, each with the position it was read after, tell that apart from being caught up: the first
+    /// whose horizon is above that position, as
+    /// [`CursorBeforeHorizon`](subscription::SubscribeError::CursorBeforeHorizon), or else
+    /// [`Passed::Skipped`] if a skipped category's start is.
     async fn passed_horizon(
         &self,
         empty: &[(category::CategoryId, position::Position)],
-    ) -> Result<Option<subscription::SubscribeError>, subscription::SubscribeError> {
+    ) -> Result<Option<Passed>, subscription::SubscribeError> {
         if empty.is_empty() {
             return Ok(None);
         }
 
         let ids: Vec<i32> = empty.iter().map(|(id, _)| id.get()).collect();
-        let rows = self
-            .sql
-            .horizons
-            .bind(statement::horizons::Params { category_ids: &ids })
-            .fetch_all(&self.pool)
-            .await?;
-        for row in rows {
-            let id = category::CategoryId::new(row.category_id);
-            let horizon = to_position(row.horizon_position)?;
-            let Some((_, read_after)) = empty.iter().find(|(empty_id, _)| *empty_id == id) else {
+        let retained = self.retained(&ids).await?;
+        let mut passed = None;
+        for (id, read_after) in empty {
+            let Some(retained) = retained.get(id) else {
                 continue;
             };
-            if horizon > *read_after {
-                return Ok(Some(subscription::SubscribeError::CursorBeforeHorizon {
-                    category: id,
-                    cursor: *read_after,
-                    horizon,
-                }));
+            if !self.skips(retained.horizon) {
+                if retained.horizon > *read_after {
+                    return Ok(Some(Passed::Behind(
+                        subscription::SubscribeError::CursorBeforeHorizon {
+                            category: *id,
+                            cursor: *read_after,
+                            horizon: retained.horizon,
+                        },
+                    )));
+                }
+            } else if retained.start > *read_after {
+                passed = Some(Passed::Skipped);
             }
         }
 
-        Ok(None)
+        Ok(passed)
     }
 
-    /// For each category, in order, `cursor` or the category's retention horizon, whichever is higher.
-    async fn horizon_floors(
+    /// For each category, in order, `cursor`, or for a category whose dropped commits the reader skips, its
+    /// start position when that is higher.
+    async fn start_floors(
         &self,
         cursor: position::Position,
     ) -> Result<Vec<position::Position>, subscription::SubscribeError> {
         let ids: Vec<i32> = self.categories.iter().map(|c| c.id.get()).collect();
+        let retained = self.retained(&ids).await?;
+
+        Ok(self
+            .categories
+            .iter()
+            .map(|category| match retained.get(&category.id) {
+                Some(retained) if self.skips(retained.horizon) => cursor.max(retained.start),
+                _ => cursor,
+            })
+            .collect())
+    }
+
+    /// The retention horizon and start position of the categories `ids`.
+    async fn retained(
+        &self,
+        ids: &[i32],
+    ) -> Result<HashMap<category::CategoryId, Retained>, subscription::SubscribeError> {
         let rows = self
             .sql
             .horizons
-            .bind(statement::horizons::Params { category_ids: &ids })
+            .bind(statement::horizons::Params { category_ids: ids })
             .fetch_all(&self.pool)
             .await?;
-        let mut floors = vec![cursor; self.categories.len()];
+        let mut retained = HashMap::with_capacity(rows.len());
         for row in rows {
-            let horizon = to_position(row.horizon_position)?;
-            if let Some(index) = self
-                .categories
-                .iter()
-                .position(|c| c.id.get() == row.category_id)
-            {
-                floors[index] = floors[index].max(horizon);
-            }
+            retained.insert(
+                category::CategoryId::new(row.category_id),
+                Retained {
+                    horizon: to_position(row.horizon_position)?,
+                    start: to_position(row.start_position)?,
+                },
+            );
         }
 
-        Ok(floors)
+        Ok(retained)
+    }
+
+    /// Whether the reader skips the commits retention dropped from a category with this horizon.
+    fn skips(&self, horizon: position::Position) -> bool {
+        horizon <= self.skip_through
     }
 
     async fn decode(
@@ -935,6 +1009,22 @@ struct CategoryPage {
     /// In position order, without other shards' commits and missing ones.
     commits: Vec<CommitRow>,
     missing: Missing,
+}
+
+/// A category's retention horizon and start position.
+#[derive(Debug, Clone, Copy)]
+struct Retained {
+    horizon: position::Position,
+    start: position::Position,
+}
+
+/// How a read's cursor stands against a category's retention.
+#[derive(Debug)]
+enum Passed {
+    /// Behind the horizon of a category whose dropped commits the reader does not skip.
+    Behind(subscription::SubscribeError),
+    /// Behind the start of a category whose dropped commits the reader skips: read again from it.
+    Skipped,
 }
 
 /// Whether a log row's commit was not found.

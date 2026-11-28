@@ -61,21 +61,21 @@ pges_postgres::typed_query! {
 }
 
 pges_postgres::typed_query! {
-    /// The retention horizon of some categories.
+    /// The retention horizon and start position of some categories.
     pub HORIZONS, mod horizons {
         name: "read/horizons",
         files: [sql_file!("read/horizons.sql")],
         params<'q> { category_ids: &'q [i32] },
-        row { category_id: i32, horizon_position: i64 },
+        row { category_id: i32, horizon_position: i64, start_position: i64 },
     }
 }
 
 pges_postgres::typed_query! {
-    /// The category with the highest retention horizon.
+    /// The category with the highest retention horizon above a position.
     pub HIGHEST_HORIZON, mod highest_horizon {
         name: "read/highest_horizon",
         files: [sql_file!("read/highest_horizon.sql")],
-        params {},
+        params { skip_through: i64 },
         row { category_id: i32, horizon_position: i64 },
     }
 }
@@ -85,7 +85,7 @@ pges_postgres::typed_query! {
     pub READ_LOG, mod read_log {
         name: "read/log",
         files: [sql_file!("read/log.sql")],
-        params { after: i64, head: i64, limit: i64 },
+        params { after: i64, head: i64, limit: i64, skip_through: i64 },
         row { last_position: i64, commit_id: Uuid, category_id: i32, event_count: i16 },
     }
 }
@@ -105,7 +105,7 @@ pges_postgres::typed_query! {
     pub READ_CATEGORY_LOG, mod read_category_log {
         name: "read/category_log",
         files: [sql_file!("read/category_log.sql")],
-        params { category_id: i32, after: i64, head: i64, limit: i64 },
+        params { category_id: i32, after: i64, head: i64, limit: i64, skip_through: i64 },
         row { last_position: i64, commit_id: Uuid, event_count: i16 },
     }
 }
@@ -157,7 +157,13 @@ pges_postgres::typed_query! {
     pub CREATE, mod create {
         name: "subscription/create",
         files: [sql_file!("subscription/create.sql")],
-        params<'q> { position: i64, name: &'q str, shards: i16, category_ids: &'q [i32] },
+        params<'q> {
+            position: i64,
+            name: &'q str,
+            shards: i16,
+            category_ids: &'q [i32],
+            skip_through: i64,
+        },
         row {},
     }
 }
@@ -183,6 +189,7 @@ pges_postgres::typed_query! {
             shard: Option<i16>,
             fence: Option<i64>,
             position: Option<i64>,
+            skip_through: Option<i64>,
             shards: Option<i16>,
             category_ids: Option<Vec<i32>>,
         },
@@ -194,7 +201,13 @@ pges_postgres::typed_query! {
     pub REDEFINE, mod redefine {
         name: "subscription/redefine",
         files: [sql_file!("subscription/redefine.sql")],
-        params<'q> { name: &'q str, position: i64, shards: i16, category_ids: &'q [i32] },
+        params<'q> {
+            name: &'q str,
+            position: i64,
+            shards: i16,
+            category_ids: &'q [i32],
+            skip_through: i64,
+        },
         row {},
     }
 }

@@ -185,6 +185,7 @@ mod before {
   WHERE l.category_id = $1 AND l.last_position > $2 AND l.last_position <= $3
 )
 SELECT (SELECT max(last_position) FROM seen WHERE commit_id < $4) AS horizon,
+       (SELECT min(last_position) FROM seen WHERE commit_id >= $4) AS first_kept,
        NOT EXISTS (SELECT 1 FROM es.{leaf} d
                    WHERE NOT EXISTS (SELECT 1 FROM seen s
                                      WHERE s.commit_id = d.commit_id)) AS sequenced,
@@ -233,7 +234,7 @@ const PLANS: [&str; 7] = [
     "SET LOCAL enable_seqscan = off; SET LOCAL enable_material = off; SET LOCAL enable_memoize = off",
 ];
 
-type ScanRow = (Option<i64>, bool, Option<i64>);
+type ScanRow = (Option<i64>, Option<i64>, bool, Option<i64>);
 
 /// One answer of every retention statement, old or new, for a set of scan and policy parameters.
 #[derive(Debug, PartialEq)]
@@ -414,14 +415,14 @@ async fn the_statements_answer_as_before_under_every_plan() -> Result<()> {
 
     let expected = f.answers(jobs, upper, PLANS[0], true).await?;
     assert!(
-        expected.scans.iter().all(|scan| !scan.1),
+        expected.scans.iter().all(|scan| !scan.2),
         "one in 23 commits has no log row"
     );
     assert!(
         expected
             .scans
             .iter()
-            .any(|scan| scan.0.is_some() && scan.2.is_some())
+            .any(|scan| scan.0.is_some() && scan.1.is_some() && scan.3.is_some())
     );
     assert!(
         expected.stops.iter().any(Option::is_some) && expected.stops.iter().any(Option::is_none)
@@ -463,9 +464,9 @@ async fn the_statements_answer_as_before_under_every_plan() -> Result<()> {
         )
         .await?;
     let expected = f.answers(jobs, upper, PLANS[0], true).await?;
-    assert!(expected.scans[0].1, "{:?}", expected.scans);
+    assert!(expected.scans[0].2, "{:?}", expected.scans);
     assert!(
-        expected.scans.iter().any(|scan| !scan.1),
+        expected.scans.iter().any(|scan| !scan.2),
         "{:?}",
         expected.scans
     );

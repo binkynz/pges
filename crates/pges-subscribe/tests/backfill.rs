@@ -657,17 +657,19 @@ async fn wait_for_lock(pool: &PgPool, pattern: &str) -> Result<(), sqlx::Error> 
 }
 
 #[tokio::test]
-async fn a_backfill_reads_each_category_from_its_retention_horizon() -> Result<()> {
+async fn a_backfill_reads_each_category_from_its_retention_start() -> Result<()> {
     let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
     write(&f, 6, 3).await?;
     let until = common::head(&f.pool).await?;
-    // Retention removed jobs up to a commit boundary; orders keeps everything.
+    // Retention removed jobs up to a commit boundary, and kept no commit below it; orders keeps everything.
     let horizon: i64 = sqlx::query_scalar(
         "SELECT last_position FROM es.log ORDER BY last_position OFFSET 20 LIMIT 1",
     )
     .fetch_one(&f.pool)
     .await?;
-    sqlx::query("UPDATE es.categories SET horizon_position = $2 WHERE category_id = $1")
+    sqlx::query(
+        "UPDATE es.categories SET horizon_position = $2, start_position = $2 WHERE category_id = $1",
+    )
         .bind(f.id(Cat::Jobs).get())
         .bind(horizon)
         .execute(&f.pool)

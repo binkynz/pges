@@ -13,7 +13,7 @@ order, the queries the crate runs and how partitions are maintained.
 | Tables | plural nouns, no prefix inside a store schema | `streams`, `commits`, `log` |
 | Ids | `<thing>_id` | `stream_id`, `commit_id`, `category_id` |
 | Stream versions | `version`, `last_version`, `floor_version` | |
-| Store positions | `position`, `last_position`, `horizon_position` | |
+| Store positions | `position`, `last_position`, `horizon_position`, `start_position` | |
 | Ranges | plural of the thing, always virtual | `versions`, `positions` |
 | Small enums | `int2` with a CHECK and a comment, not Postgres enums (enums need DDL to extend) | `state`, `retention` |
 | Partitions | `<table>_<category>` for LIST, `<table>_<category>__<yyyymm[dd]>` for RANGE leaves | `commits_jobs__202611` |
@@ -92,7 +92,7 @@ types travel inside the payload frame instead, and subscribers filter after deco
 | `pges.scopes` | migration runner | one row per scope | `schema_version`, `min_compatible` |
 | `pges.stores` | runner, sequencer, admin | one row per store | coarse store high-water mark, `outbox` and `dcb` flags, default retention for new categories (`retention`, `retain_for`), writer limits `max_clock_skew` and `max_txn_age` (recorded at creation, only raised, by `Admin::set_writer_limits`; Writer limits); all stores of a database share one `outbox` value (Migrations) |
 | `pges.sequencer` | sequencer, resequence | single row | lease, fence, `source_token`, `halted` (cleared by `pges-sequencer resequence`) |
-| `categories` | admin, sequencer, resequence | one row per category | coarse category high-water mark, retention policy and horizon, partition bucket, the positions resequence gave the category (`resequenced_from`, `resequenced_through`; 0, 0: none) |
+| `categories` | admin, sequencer, resequence | one row per category | coarse category high-water mark, retention policy, horizon and start position, partition bucket, the positions resequence gave the category (`resequenced_from`, `resequenced_through`; 0, 0: none) |
 | `event_types` | crate, outside the caller's transaction | one row per type name | ids cached by the client after commit |
 | `streams` | append path | one row per stream, HASH(`stream_partitions`) | version, first and last commit id, retention floor; autovacuum scale factor 0.02, insert scale factor 0.05 |
 | `commits` | append path | one row per append, LIST(category) → RANGE(commit_id) | the events |
@@ -100,7 +100,7 @@ types travel inside the payload frame instead, and subscribers filter after deco
 | `pending` | append path, sequencer | queue, outbox stores only | drained by the sequencer |
 | `deleted_commits` | `delete_stream`, retention | one row per deleted commit, key (`category_id`, `commit_id`) | lets the store-wide read tell a deleted commit's log row from corruption; retention forgets the rows whose log rows its horizon covers when it drops a leaf (Partition maintenance, retention step 2) |
 | `snapshots` | append path (`snapshot_after`), `save_snapshot` | latest per stream, HASH(`stream_partitions`) | upserted |
-| `subscriptions` | subscribers | one row per shard (one, shard 0, for an unsharded subscription) | cursor, lease, fence, definition (categories, number of shards); rows with `shard >= shards` are retired |
+| `subscriptions` | subscribers | one row per shard (one, shard 0, for an unsharded subscription) | cursor, lease, fence, definition (categories, number of shards), `skip_through` (`Start::Retained`: the head at creation; 0 otherwise); rows with `shard >= shards` are retired |
 | `subscription_members` | sharded subscriptions | one row per running instance | liveness, for each instance's fair share of the shards |
 | `backfills` | backfills (`pges-subscribe`) | one row per lane of a backfill | lane cursor, end, lane count, categories |
 | `tag_heads`, `commit_tags` | append path | DCB stores only | |
@@ -662,7 +662,7 @@ In two steps:
 
 1. A page of the category's log, with the horizon checked in the same statement:
    `crates/pges-subscribe/sql/read/category_log.sql` (`$1` the category id, `$2` the cursor, `$3` `H`, `$4`
-   the page size). `log_by_category` covers it as an index-only scan.
+   the page size, `$5` the reader's `skip_through`). `log_by_category` covers it as an index-only scan.
 2. The commits of the page's rows at or below the merge cut (below), by id from the category's own
    partition: `crates/pges-subscribe/sql/read/commits.sql` (`commit_id = ANY($1)`), or
    `crates/pges-subscribe/sql/read/commits_sharded.sql` for a shard. A custom plan prunes the time leaves to
@@ -679,21 +679,30 @@ In two steps:
   join over the whole category per page (185 ms per page at 1000 leaves).
 - The horizon check is part of the log statement, never a separate step. Retention commits the new horizon
   before `DETACH … CONCURRENTLY` starts, and the detach waits for older snapshots, so a statement that passes
-  the check still sees the leaf. On zero rows the client reads `horizon_position` once more, in one statement
-  for every category that returned none: a cursor below it raises `CursorBeforeHorizon`, otherwise the
-  category is caught up (`crates/pges-subscribe/sql/read/horizons.sql`).
+  the check still sees the leaf. On zero rows the client reads `horizon_position` and `start_position` once
+  more, in one statement for every category that returned none: a cursor below the horizon raises
+  `CursorBeforeHorizon`, otherwise the category is caught up (`crates/pges-subscribe/sql/read/horizons.sql`).
+- The reader's `skip_through` decides which of the two the statement checks. A category whose horizon is
+  above it is checked against the horizon: 0 for a subscription, so it never skips a commit it has not
+  handled. A category whose horizon is at or below it is checked against `start_position`, and the client
+  reads it after max(cursor, `start_position`): every commit at or below the start was dropped, and a commit
+  missing between the start and the horizon was dropped too and is skipped. `skip_through` is the head at
+  creation for a subscription started at `Start::Retained` (stored in `subscriptions.skip_through`), and the
+  largest position for a backfill. Only a reader whose cursor is below `skip_through` reads the starts
+  before a page; past it, every such start is at or below the cursor.
 - The fetch is a second statement, so retention can raise the horizon and drop commits between the two.
   Retention commits the horizon raise before it drops commits, so when a page's commit is missing the client
-  reads the category's horizon again (`horizons.sql`). If it is now above the read's floor, `Fail` mode
-  raises `CursorBeforeHorizon` and `Skip` mode (backfills) reads again from the new horizon. Otherwise the
-  log row is skipped, as for a stream `delete_stream` deleted; listed-category reads do not consult
-  `deleted_commits`, so they cannot tell such a commit from a corrupt one.
+  reads the category's horizon and start again (`horizons.sql`). If the horizon is now above the read's
+  floor and above `skip_through`, the read raises `CursorBeforeHorizon`; if the category's horizon is at or
+  below `skip_through` and its start is above the floor, the page is read again from the new start.
+  Otherwise the log row is skipped, as for a stream `delete_stream` deleted; listed-category reads do not
+  consult `deleted_commits`, so they cannot tell such a commit from a corrupt one.
 - The cut comes from the log rows (`$4` rows read means a full page), not from the commits fetched, so
   skipped rows still move the cursor.
 - `$3` is `H`, below. A single-category subscription uses it too, so one rule covers one or more categories.
 - `$4` is the subscription's `batch_size` (default 1024): log rows per category per page.
 - The same code serves replica reads (both statements on the replica, the horizon re-read on the primary),
-  backfill lanes and both `BeforeHorizon` modes.
+  backfill lanes and every `skip_through`.
 - `crates/pges-subscribe/tests/two_step.rs` checks that the two-step read delivers exactly what the
   `LATERAL` statement gave, whole and sharded (testing.md).
 
@@ -703,7 +712,7 @@ each has its own snapshot and its own `LIMIT`. The client:
 1. Reads `H`, the store's newest position, 0 for an empty log (`crates/pges-subscribe/sql/read/head.sql`). The
    sequencer writes log rows in order, one transaction at a time, so every position at or below `H` is already
    visible. If `H` is at or below the cursor, no category is read.
-2. Runs each category's log query with `$3 = H`, each against that category's horizon.
+2. Runs each category's log query with `$3 = H`, each against that category's horizon (or start, above).
 3. Lets `cut` be the smallest last row position over the categories that returned exactly `LIMIT` rows, or
    `H` if none did.
 4. Fetches the commits of the rows at or below `cut` only, emits them and sets
@@ -728,27 +737,33 @@ a type id not yet loaded.
 **All categories** (`.all_categories()`). Read a page of `log` alone, then fetch the commits per category.
 `subscriptions.category_ids` is `'{}'`.
 
-- The log page, checked against the highest horizon of any category: `crates/pges-subscribe/sql/read/log.sql`.
+- The log page, checked against the highest horizon above `skip_through` (`$4`) of any category:
+  `crates/pges-subscribe/sql/read/log.sql`.
 - For each category in the page, its commits by id: `crates/pges-subscribe/sql/read/commits.sql`.
 - For the commits missing from the fetch, on the primary, those `deleted_commits` records:
   `crates/pges-subscribe/sql/read/deleted_commits.sql`.
-- On an empty page, or a missing commit `deleted_commits` does not record, the category with the highest
-  horizon: `crates/pges-subscribe/sql/read/highest_horizon.sql`.
+- For the other missing commits, while the cursor is below `skip_through`, the horizons of their categories
+  (`crates/pges-subscribe/sql/read/horizons.sql`).
+- On an empty page, or a missing commit neither lookup explains, the category with the highest horizon above
+  `skip_through`: `crates/pges-subscribe/sql/read/highest_horizon.sql`.
 - For a category id the subscription has not seen yet (registered after start), its name
   (`crates/pges-subscribe/sql/read/categories_by_id.sql`), then its event types.
 
 - The log page reads up to `H`. The cut is the last row's position for a full page, otherwise `H`. One
   statement saw every row up to `H`, so no merge is needed.
 - `coalesce` lets a store with no categories pass the check.
-- A cursor behind the highest horizon of any category raises `CursorBeforeHorizon`.
+- A cursor behind the highest horizon of any category raises `CursorBeforeHorizon`, except horizons at or
+  below `skip_through` (`Start::Retained`): a missing commit of such a category at or below its horizon was
+  dropped and its log row is skipped. Rows below such a category's start are read and skipped one by one;
+  the statement cannot start each category at its own start.
 - A commit missing from the fetch that `deleted_commits` records was deleted by `delete_stream`, and its log
   row is skipped. The page's cut still comes from the log rows, so skipped rows move the cursor.
 - The client keys fetched commits and the `deleted_commits` records by (category, commit id), like the
   tables: caller-chosen commit ids may repeat across categories, and two such commits in one page keep their
   own data.
-- Any other missing commit means retention ran in between: the client checks the highest horizon, which is
-  at or above the dropped commit's own category horizon. If that horizon is not past the cursor, the
-  missing commit is `Corrupt`.
+- Any other missing commit means retention ran in between: the client checks the highest horizon above
+  `skip_through`, which is at or above the dropped commit's own category horizon. If that horizon is not
+  past the cursor, the missing commit is `Corrupt`.
 - The lookup runs on the primary, also for replica reads: a commit missing from a replica's fetch was
   deleted by a transaction the primary already shows. It runs after the fetch, and the delete and its
   `deleted_commits` insert are one statement, so a delete landing between the log read and the fetch is
@@ -1312,12 +1327,13 @@ integer) modulo the lane count; persisted progress depends on it, so it never ch
 
 - Pages use "Read a category from a cursor" with `$3 = P`. `P` is at most `H`, which the run read once at its
   start (`UntilAhead` otherwise), and positions only become visible, never invisible, so pages do not read
-  `H` again. Each category is read after its own
-  floor, `$2` = max(the lowest lane cursor, the category's retention horizon): before every page the
-  backfill reads its categories' horizons (`crates/pges-subscribe/sql/read/horizons.sql`). Events below a
-  horizon are gone, so it skips them instead of failing. The read statement still checks its `$2` against
-  the horizon; if retention raised one between the two statements, the page is read again. Nothing exists
-  below a floor, so the merge cut stays valid. Backfills always read unsharded, from the primary. Each lane
+  `H` again. Each category is read after its own floor, `$2` = max(the lowest lane cursor, the category's
+  retention start position): before every page the backfill reads its categories' starts
+  (`crates/pges-subscribe/sql/read/horizons.sql`). Its `skip_through` is the largest position, so every
+  category is read this way: events retention dropped are skipped instead of failing, and events it kept
+  below the horizon are read. The read statement checks its `$2` against the start; if retention raised one
+  between the two statements, the page is read again. Nothing exists below a floor, so the merge cut stays
+  valid. Backfills always read unsharded, from the primary. Each lane
   skips events at or below its own cursor.
 - For `Until::Subscription`, retired shard rows are ignored; no row means `UnknownSubscription`.
 - `P` is fixed at creation. A run with other categories, another lane count or another explicit `P` is
@@ -1473,7 +1489,8 @@ matching CHECK constraint lets it skip the validation scan. Each attach still in
      is above `retention_scan_from`, the stop position becomes the greater of the two. Then one statement
      (`crates/pges-postgres/sql/retention/scan.sql`) reads the category's log rows from `retention_scan_from`
      to the stop position and returns the leaf's horizon (the newest position of a commit below its upper
-     bound), `sequenced` (every commit of the leaf has a log row), and `next_scan_from`: the newest position,
+     bound), `first_kept` (the oldest position of a commit at or past the bound, which stays),
+     `sequenced` (every commit of the leaf has a log row), and `next_scan_from`: the newest position,
      outside the resequenced range, of a commit older than the leaf's upper bound minus `max_txn_age + 2 ×
      max_clock_skew`.
 
@@ -1506,7 +1523,15 @@ matching CHECK constraint lets it skip the validation scan. Each attach still in
      leaf (`crates/pges-postgres/sql/retention/missing_snapshots.sql`, `MissingSnapshots`). Any row refuses
      the leaf. Otherwise, for both policies, each stream's floor is raised to its last version in the leaf
      (`crates/pges-postgres/sql/retention/raise_floors.sql`), and the category's horizon to the scan's horizon
-     (`crates/pges-postgres/sql/retention/raise_horizon.sql`; NULL leaves it).
+     and its start position to least(the new horizon, `first_kept - 1`)
+     (`crates/pges-postgres/sql/retention/raise_horizon.sql`; a NULL horizon leaves both). Both only rise.
+
+     The two differ when a commit past the leaf's bound committed before the leaf's last commit: its
+     position is below the horizon, but it stays. Every commit that stays is positioned after
+     `retention_scan_from` (as every commit of the next leaf is), so the scan sees the oldest one, and every
+     commit at or below the start is dropped. Rows sequenced after the scan's snapshot are positioned past
+     everything it saw, and a range resequence wrote before it is inside the scan, so neither can hold a
+     commit that stays below the start.
 
      Both checks look each distinct stream of the leaf up on its own (`CROSS JOIN LATERAL (… LIMIT 1)`), so
      they cost O(leaf streams) and never rely on their LIMIT stopping early: a droppable leaf has no such
@@ -1520,8 +1545,10 @@ matching CHECK constraint lets it skip the validation scan. Each attach still in
      of the nested loop (O(streams × leaf streams)). In the same transaction,
      `crates/pges-postgres/sql/retention/forget_deleted.sql` deletes the category's `deleted_commits` rows
      with a commit id below the leaf's upper bound whose log row lies in (`retention_scan_from`, the new
-     horizon]. Once the horizon commits, no store-wide read reaches those log rows. A deleted commit whose log
-     row is not written yet stays recorded, because that row may land above the horizon.
+     horizon]. Once the horizon commits, no store-wide read reaches those log rows, except one started at
+     `Start::Retained`, which skips missing commits at or below their category's horizon without consulting
+     `deleted_commits`. A deleted commit whose log row is not written yet stays recorded, because that row
+     may land above the horizon.
   3. Detach without blocking writers, then drop, then raise the scan start (only when `next_scan_from` is not
      null): `crates/pges-postgres/sql/partition/detach_pending.sql` (no row: already detached),
      `crates/pges-postgres/sql/partition/detach_concurrently.sql`
@@ -1534,8 +1561,9 @@ matching CHECK constraint lets it skip the validation scan. Each attach still in
      second phase must be finished with `FINALIZE`. A detach that fails in either phase leaves the horizon
      recorded and the scan start unmoved, so the next run finishes it.
 
-  - The horizon and the floors are recorded before anything disappears, so a subscription behind the horizon
-    fails with `CursorBeforeHorizon` and a read below a stream's floor with `Truncated`. Window raises the
+  - The horizon, the start and the floors are recorded before anything disappears, so a subscription behind
+    the horizon fails with `CursorBeforeHorizon`, a reader that skips dropped commits starts after the start,
+    and a read below a stream's floor fails with `Truncated`. Window raises the
     floors too: otherwise a stream whose commits were dropped would read as empty or partial.
   - `retention_scan_from` moves only after the drop. A run interrupted before the drop scans the leaf again
     from the old start. If the start had already moved, the leaf's commits would look unsequenced and the

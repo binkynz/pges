@@ -96,9 +96,13 @@
 //! Each read checks, in the same statement, that the cursor is not behind the category's retention horizon
 //! (for a store-wide subscription, the highest horizon of any category).
 //! A cursor that is behind stops the subscription with
-//! [`SubscribeError::CursorBeforeHorizon`](subscription::SubscribeError::CursorBeforeHorizon): the events
-//! after it are gone, and the read model must be rebuilt from snapshots or another projection. A backfill
-//! does not stop: it reads each category from its horizon (see [`backfill`]).
+//! [`SubscribeError::CursorBeforeHorizon`](subscription::SubscribeError::CursorBeforeHorizon): events
+//! after it are gone, and the read model must be rebuilt, from snapshots or another projection for the
+//! state they built. A new subscription created with
+//! [`Start::Retained`](subscription::Start::Retained) reads every event retention kept and skips those it
+//! dropped; a later position is not enough, since a kept commit can be positioned below the horizon when it
+//! committed before the dropped leaf's last commit. A backfill does not stop either: it reads each category
+//! from its start position (see [`backfill`]).
 //!
 //! # Features
 //!
