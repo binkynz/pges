@@ -108,7 +108,7 @@ async fn ddl_statements_run() -> Result<()> {
         &mut conn,
         &mut ran,
         &statement::EXPLAIN,
-        "(1, 0, 10, 10)",
+        "(1, 0, 10, 10, 0)",
         " ",
     )
     .await?;
@@ -117,7 +117,7 @@ async fn ddl_statements_run() -> Result<()> {
         &mut conn,
         &mut ran,
         &statement::EXECUTE,
-        "(1, 0, 10, 10)",
+        "(1, 0, 10, 10, 0)",
         " ",
     )
     .await?;
