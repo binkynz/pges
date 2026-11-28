@@ -17,7 +17,6 @@ all-features = true
 [features]
 default = ["json"]
 json = ["dep:serde_json"]
-serde_json = ["dep:serde_json"]
 # W3C trace context from and to the current `tracing` span, through tracing-opentelemetry.
 otel = ["dep:opentelemetry", "dep:tracing", "dep:tracing-opentelemetry"]
 
