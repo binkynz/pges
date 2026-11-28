@@ -203,7 +203,7 @@ async fn a_fatal_error_closes_the_source_and_halts_the_status() -> Result<()> {
     let result = running.result().await;
     assert!(
         matches!(
-            &result,
+            result.as_ref().map_err(|error| &**error),
             Err(sequencer::RunError::Source(source::SourceError::Fatal(_)))
         ),
         "{result:?}"
@@ -249,7 +249,7 @@ async fn a_dead_term_connection_still_records_the_halt() -> Result<()> {
     let result = running.result().await;
     assert!(
         matches!(
-            &result,
+            result.as_ref().map_err(|error| &**error),
             Err(sequencer::RunError::Source(source::SourceError::Halt(_)))
         ),
         "{result:?}"

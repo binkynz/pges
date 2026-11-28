@@ -177,7 +177,7 @@ pin the slot's `restart_lsn` and so retained WAL; `max_txn_age` caps them.
    `pges.sequencer.halted`, stops sequencing, puts the watch into an error state and alerts. It never
    recreates the slot by itself. Retention refuses to run while `halted` is set. Built:
    `SourceError::Halt(logical::SlotLost)`; the sequencer writes `pges.sequencer.halted` under its fence,
-   releases the lease, and `run` returns the error. The watch status becomes `Status::Halted(text of run's
+   releases the lease, and `run` returns the error. The watch status becomes `Status::Halted(run's
    error)`, which is the alert; the binary logs the error and exits 1. Tested end to end with
    `max_slot_wal_keep_size` in a private container (`tests/invalidation.rs`).
 2. Recovery is an explicit `LogicalSource::resequence` (CLI `pges-sequencer resequence`), run while every
@@ -1102,7 +1102,8 @@ the halt, 43 recovered, 335 after.
     at acquire, `SourceMismatch`, fatal and invalid source errors, unknown or invalid stores, position
     overflow. It carries the error's text, not the error: `RunError` cannot be cloned (it holds boxed source
     errors), and `run` returns it by value. The typed error is `run`'s result. A shutdown still gives
-    `Stopped`.
+    `Stopped`. Superseded before 0.1.0 (2026-11-28): the status is `Halted(Arc<RunError>)` and `run`
+    returns the same `Arc<RunError>`.
   - Slot bootstrap as built: `LogicalSource::bootstrap` and the subcommand `pges-sequencer bootstrap` (not a
     `--create-slot` flag) create the publication and the slot without a lease. It is idempotent: an existing
     valid slot is kept; an invalidated slot or a missing slot with a stored token halts without recording

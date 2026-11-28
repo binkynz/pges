@@ -163,7 +163,7 @@ async fn a_halted_database_stops_the_sequencer() -> Result<()> {
     let running = f.start(common::fast()).await?;
     let result = running.result().await;
     assert!(
-        matches!(&result, Err(sequencer::RunError::Halted(reason)) if reason == "slot invalidated"),
+        matches!(result.as_ref().map_err(|error| &**error), Err(sequencer::RunError::Halted(reason)) if reason == "slot invalidated"),
         "{result:?}"
     );
     let released: bool = sqlx::query_scalar("SELECT lease_until IS NULL FROM pges.sequencer")
@@ -185,7 +185,7 @@ async fn a_token_of_another_source_kind_is_refused() -> Result<()> {
     let result = running.result().await;
     assert!(
         matches!(
-            &result,
+            result.as_ref().map_err(|error| &**error),
             Err(sequencer::RunError::SourceMismatch { stored, configured }) if stored == "logical" && configured.as_str() == "outbox"
         ),
         "{result:?}"
@@ -268,7 +268,7 @@ async fn a_migration_past_the_crate_stops_the_leader_at_renewal() -> Result<()> 
 
         assert!(
             matches!(
-                &result,
+                result.as_ref().map_err(|error| &**error),
                 Err(sequencer::RunError::CrateTooOld { scope, min_compatible, crate_version })
                     if scope == raised && min_compatible.get() == 9 && crate_version.get() == 1
             ),
@@ -310,7 +310,7 @@ async fn a_sequencer_past_its_crate_does_not_take_a_free_lease() -> Result<()> {
 
         assert!(
             matches!(
-                &result,
+                result.as_ref().map_err(|error| &**error),
                 Err(sequencer::RunError::CrateTooOld { scope, min_compatible, crate_version })
                     if scope == raised && min_compatible.get() == 9 && crate_version.get() == 1
             ),

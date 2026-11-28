@@ -1175,7 +1175,8 @@ let sequencer = sequencer::Sequencer::new(pool, source, config);   // cannot fai
 let watch = sequencer.watch();                       // take it before run
 let mut high_water = watch.high_water(store.store_id());          // tokio::sync::watch::Receiver<HighWater>
 let mut status = watch.status();                     // tokio::sync::watch::Receiver<sequencer::Status>
-sequencer.run(shutdown).await?;                      // shutdown: impl Future<Output = ()> + Send; RunError
+sequencer.run(shutdown).await?;                      // shutdown: impl Future<Output = ()> + Send;
+                                                     // Err(Arc<RunError>)
 ```
 
 - One sequencer leads per database and serves every store in it; others stand by (schema.md, Sequencer
@@ -1190,10 +1191,10 @@ sequencer.run(shutdown).await?;                      // shutdown: impl Future<Ou
 - `SourceError::Halt` stops `run` like `Fatal`, but first writes the error text to `pges.sequencer.halted`
   (under the term's fence), then closes the source and releases the lease. Every later acquire then stops
   with `RunError::Halted`.
-- Whenever `run` returns an error, the status becomes `Status::Halted(text)` with the error's text. After a
-  shutdown it becomes `Stopped`. When `run`'s future is dropped before it returns (a panic, an aborted task),
-  it becomes `Abandoned`: the lease is not released, so a standby takes over only once it expires. Alert on
-  `Halted` and `Abandoned`. The typed error is `run`'s result (`RunError` cannot be cloned).
+- Whenever `run` returns an error, the status becomes `Status::Halted(error)` with the same error: `run`
+  returns `Arc<RunError>`, since `RunError` cannot be cloned. After a shutdown it becomes `Stopped`. When
+  `run`'s future is dropped before it returns (a panic, an aborted task), it becomes `Abandoned`: the lease
+  is not released, so a standby takes over only once it expires. Alert on `Halted` and `Abandoned`.
 - `Status::Leading` is announced once the term's source is open and the stores are loaded, so a logical
   source's slot exists when a caller sees `Leading`.
 - The pool needs one connection for the leader, plus whatever the source uses (the logical source reads
@@ -1238,8 +1239,9 @@ pub struct OutboxConfig {                    // Default
 }
 
 #[non_exhaustive]
-pub enum Status { Standby, Leading(Fence), Recovering(Arc<RunError>), Halted(Arc<str>), Stopped, Abandoned }
-                                             // Halted: run returned this error's text;
+pub enum Status { Standby, Leading(Fence), Recovering(Arc<RunError>), Halted(Arc<RunError>), Stopped,
+                  Abandoned }
+                                             // Halted: run returned this error;
                                              // Stopped: run returned after a shutdown;
                                              // Abandoned: its future was dropped before it returned;
                                              // the lease is kept until it expires

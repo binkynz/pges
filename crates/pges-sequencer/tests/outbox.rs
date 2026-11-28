@@ -34,7 +34,7 @@ async fn positions_past_the_end_stop_the_sequencer() -> Result<()> {
         .await?;
     let result = running.result().await;
     assert!(
-        matches!(result, Err(sequencer::RunError::PositionOverflow(store)) if store == f.store_id),
+        matches!(result.as_ref().map_err(|error| &**error), Err(sequencer::RunError::PositionOverflow(store)) if *store == f.store_id),
         "{result:?}"
     );
 

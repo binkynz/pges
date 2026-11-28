@@ -515,7 +515,7 @@ pub async fn head(pool: &PgPool) -> Result<u64> {
 pub struct Sequencer {
     pub watch: pges_sequencer::watch::Watch,
     stop: oneshot::Sender<()>,
-    task: JoinHandle<Result<(), sequencer::RunError>>,
+    task: JoinHandle<Result<(), Arc<sequencer::RunError>>>,
     pool: PgPool,
     errors: Arc<Mutex<Vec<String>>>,
 }

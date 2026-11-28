@@ -345,7 +345,9 @@ async fn a_commit_racing_the_slot_creation_is_not_skipped() -> Result<()> {
     unit.commit().await?;
 
     let result = running.result().await;
-    let Err(sequencer::RunError::Source(source::SourceError::Halt(error))) = &result else {
+    let Err(sequencer::RunError::Source(source::SourceError::Halt(error))) =
+        result.as_ref().map_err(|error| &**error)
+    else {
         panic!("expected a halt, got {result:?}");
     };
     assert!(
@@ -561,7 +563,9 @@ async fn a_dropped_slot_halts_sequencing() -> Result<()> {
     proxy.admit();
 
     let result = running.result().await;
-    let Err(sequencer::RunError::Source(source::SourceError::Halt(error))) = &result else {
+    let Err(sequencer::RunError::Source(source::SourceError::Halt(error))) =
+        result.as_ref().map_err(|error| &**error)
+    else {
         panic!("expected a halt, got {result:?}");
     };
     assert_eq!(
@@ -579,7 +583,7 @@ async fn a_dropped_slot_halts_sequencing() -> Result<()> {
     let again = f.start(common::fast()).await?;
     let result = again.result().await;
     assert!(
-        matches!(&result, Err(sequencer::RunError::Halted(reason)) if *reason == halted),
+        matches!(result.as_ref().map_err(|error| &**error), Err(sequencer::RunError::Halted(reason)) if *reason == halted),
         "{result:?}"
     );
 
@@ -593,7 +597,9 @@ async fn commits_from_before_the_slot_are_not_skipped() -> Result<()> {
 
     let running = f.start(common::fast()).await?;
     let result = running.result().await;
-    let Err(sequencer::RunError::Source(source::SourceError::Halt(error))) = &result else {
+    let Err(sequencer::RunError::Source(source::SourceError::Halt(error))) =
+        result.as_ref().map_err(|error| &**error)
+    else {
         panic!("expected a halt, got {result:?}");
     };
     assert!(

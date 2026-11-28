@@ -441,7 +441,9 @@ async fn halt(f: &Fixture) -> Result<()> {
 async fn halt_on_missing_slot(f: &Fixture) -> Result<()> {
     let halting = f.start(common::fast()).await?;
     let result = halting.result().await;
-    let Err(sequencer::RunError::Source(source::SourceError::Halt(error))) = &result else {
+    let Err(sequencer::RunError::Source(source::SourceError::Halt(error))) =
+        result.as_ref().map_err(|error| &**error)
+    else {
         panic!("expected a halt, got {result:?}");
     };
     assert!(
