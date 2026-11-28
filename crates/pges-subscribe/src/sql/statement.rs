@@ -31,6 +31,17 @@ pges_postgres::typed_query! {
 }
 
 pges_postgres::typed_query! {
+    /// The `skip_through` of a subscription started at `Start::Retained`: the greater of the head and the
+    /// highest retention horizon.
+    pub SKIP_THROUGH, mod skip_through {
+        name: "read/skip_through",
+        files: [sql_file!("read/skip_through.sql")],
+        params {},
+        row { skip_through: i64 },
+    }
+}
+
+pges_postgres::typed_query! {
     /// Category ids by name.
     pub CATEGORIES, mod categories {
         name: "read/categories",
@@ -487,6 +498,7 @@ pub const ROLLBACK_TO_BATCH: template::Statement = template::Statement {
 /// Every statement of this crate.
 pub const ALL: &[&template::Statement] = &[
     &HEAD,
+    &SKIP_THROUGH,
     &CATEGORIES,
     &CATEGORIES_BY_ID,
     &EVENT_TYPES,
@@ -529,6 +541,7 @@ pub const ALL: &[&template::Statement] = &[
 /// Every statement of this crate with its Rust types, for the registry test.
 pub const TYPED: &[typed::Shape] = &[
     typed::Shape::of::<head::Query>(),
+    typed::Shape::of::<skip_through::Query>(),
     typed::Shape::of::<categories::Query>(),
     typed::Shape::of::<categories_by_id::Query>(),
     typed::Shape::of::<event_types::Query>(),

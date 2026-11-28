@@ -18,6 +18,8 @@ use pges_postgres::sql::{
 pub(crate) struct Statements {
     /// `H`, the store's newest position, 0 for an empty log.
     pub(crate) head: Rendered<statement::head::Query>,
+    /// The `skip_through` of a subscription started at `Start::Retained`.
+    pub(crate) skip_through: Rendered<statement::skip_through::Query>,
     /// Category ids by name.
     pub(crate) categories: Rendered<statement::categories::Query>,
     /// Category names by id.
@@ -66,6 +68,7 @@ impl Statements {
 
         Self {
             head: head(store),
+            skip_through: statement::skip_through::Query::render(&values),
             categories: statement::categories::Query::render(&values),
             categories_by_id: statement::categories_by_id::Query::render(&values),
             types: statement::event_types::Query::render(&values),

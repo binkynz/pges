@@ -1,7 +1,8 @@
 -- A page of the log of every category, for a store-wide subscription: rows after the cursor up to the cut.
 --
 -- $1 the cursor, $2 the cut H, $3 the page size, $4 the position through which the reader skips commits
--- retention dropped (0, or the head at creation for a subscription started at Start::Retained).
+-- retention dropped (0, or for a subscription started at Start::Retained the greater of the head and the
+-- highest horizon at creation).
 --
 -- The page is empty when the cursor is below the highest retention horizon above $4 of any category, checked
 -- in the same statement so retention cannot remove rows between a separate check and the read. Rows of

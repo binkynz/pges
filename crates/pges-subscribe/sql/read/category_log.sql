@@ -3,8 +3,8 @@
 -- page touches, not for every leaf of the category.
 --
 -- $1 category id, $2 cursor, $3 the cut H, $4 the page size, $5 the position through which the reader skips
--- commits retention dropped (0 for a subscription, the head at creation for one started at Start::Retained,
--- the largest int8 for a backfill).
+-- commits retention dropped (0 for a subscription, the greater of the head and the highest horizon at
+-- creation for one started at Start::Retained, the largest int8 for a backfill).
 --
 -- The retention check is in the statement: a cursor below it returns an empty page, so retention cannot
 -- remove rows between a separate check and the read. A category whose horizon is above $5 is checked against

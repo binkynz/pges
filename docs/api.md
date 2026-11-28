@@ -1148,8 +1148,9 @@ The first `.categories(..)` takes a `NonEmpty<CategoryName>`, later ones any ite
   every read (schema.md). `Start::Beginning` and `Start::Position(p)` keep that check from the first read: a
   subscription resumed at a position must not skip events after it.
 - `Start::Retained` starts a new read model in a store with retention: it delivers every event retention
-  kept and skips the ones it dropped. The subscription stores the store's newest position at creation
-  (`skip_through`); a category whose horizon is at or below it is read after its start position, and its
+  kept and skips the ones it dropped. The subscription stores the newest position the store had assigned at
+  creation (`skip_through`: the head, or the highest horizon if `prune_log` deleted the newest log row); a
+  category whose horizon is at or below it is read after its start position, and its
   missing commits are skipped. A category whose horizon rises above it (retention dropped events written
   after the subscription was created) is checked against its horizon again. `Start::Position(horizon)` is
   not a substitute: a kept commit can be positioned below the horizon. After `CursorBeforeHorizon`, rebuild

@@ -100,8 +100,8 @@ pub(crate) struct Reader {
     /// commits retention dropped from it are skipped; a category whose horizon is above it is read after
     /// the cursor only if the cursor is not behind the horizon, or the read fails with
     /// [`subscription::SubscribeError::CursorBeforeHorizon`]. `BEGINNING` for a subscription, which must
-    /// not skip events it has not handled; the head at creation for one started at
-    /// [`subscription::Start::Retained`]; `MAX` for a backfill.
+    /// not skip events it has not handled; the greater of the head and the highest horizon at creation for
+    /// one started at [`subscription::Start::Retained`]; `MAX` for a backfill.
     skip_through: position::Position,
 }
 

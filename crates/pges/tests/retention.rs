@@ -265,12 +265,21 @@ async fn subscribers_see_a_deleted_stream_but_not_its_events() -> Result<()> {
     db.cleanup().await
 }
 
-/// A commit of the next leaf can be sequenced before the last commit of the leaf retention drops: its id is
-/// past the leaf's upper bound, but it committed first. Its position is then below the horizon, so a
-/// subscription started at the horizon would never deliver it, although it still exists. Retention records
-/// the start position before it, and a subscription started at `Start::Retained` reads from there.
-#[tokio::test]
-async fn a_subscription_started_at_retained_reads_every_commit_retention_kept() -> Result<()> {
+/// A store whose category kept one commit below its horizon: a commit of the next leaf sequenced before
+/// the last commit of the leaf retention dropped.
+struct KeptBelowHorizon {
+    db: pges_testing::TestDb,
+    pool: PgPool,
+    store: store::Store,
+    admin: admin::Admin,
+    horizon: position::Position,
+    start: position::Position,
+}
+
+/// Writes a commit at the first millisecond of last month and one `dropped_before` (an SQL interval)
+/// before it, sequences the later id first (position 1, then 2), and applies a retention that drops the
+/// leaf of the month before last.
+async fn kept_below_horizon(dropped_before: &str) -> Result<KeptBelowHorizon> {
     let db = pges_testing::TestDb::new().await?;
     let mut conn = db.connect().await?;
     let es = pges::core::store_name!("es");
@@ -303,13 +312,14 @@ async fn a_subscription_started_at_retained_reads_every_commit_retention_kept() 
     config.max_clock_skew = Some(wide);
     let store = store::Store::open(pool.clone(), config).await?;
 
-    // The last millisecond of the month before last, and the first of last month: two commits a
-    // millisecond apart on either side of a leaf bound.
+    // The first millisecond of last month, and `dropped_before` before it: two commits on either side of
+    // a leaf bound.
     let (before, after): (sqlx::types::Uuid, sqlx::types::Uuid) = sqlx::query_as(
         "WITH b AS (SELECT date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
                            - interval '1 month' AS bound)
-         SELECT pges.uuidv7_floor(bound - interval '1 millisecond'), pges.uuidv7_floor(bound) FROM b",
+         SELECT pges.uuidv7_floor(bound - $1::interval), pges.uuidv7_floor(bound) FROM b",
     )
+    .bind(dropped_before)
     .fetch_one(&pool)
     .await?;
     // The later id commits first: the log gives it position 1, and the earlier id position 2.
@@ -375,6 +385,31 @@ async fn a_subscription_started_at_retained_reads_every_commit_retention_kept() 
         .await?;
     assert_eq!(kept, 1, "the commit after the bound is kept");
 
+    Ok(KeptBelowHorizon {
+        db,
+        pool,
+        store,
+        admin,
+        horizon,
+        start,
+    })
+}
+
+/// A commit of the next leaf can be sequenced before the last commit of the leaf retention drops: its id is
+/// past the leaf's upper bound, but it committed first. Its position is then below the horizon, so a
+/// subscription started at the horizon would never deliver it, although it still exists. Retention records
+/// the start position before it, and a subscription started at `Start::Retained` reads from there.
+#[tokio::test]
+async fn a_subscription_started_at_retained_reads_every_commit_retention_kept() -> Result<()> {
+    let KeptBelowHorizon {
+        db,
+        pool,
+        store,
+        horizon,
+        start,
+        ..
+    } = kept_below_horizon("1 millisecond").await?;
+
     let collector = Collector::default();
     let retained = store
         .subscription(pges::subscribe::subscription_name!("retained"))
@@ -402,6 +437,64 @@ async fn a_subscription_started_at_retained_reads_every_commit_retention_kept() 
         .run_pg(backfilled.clone())
         .await?;
     assert_eq!(backfilled.seen(), [Seen::Event(1)]);
+
+    pool.close().await;
+    db.cleanup().await
+}
+
+/// `Admin::prune_log` can delete the store's newest log row, the dropped commit's, so the head falls below
+/// the category's horizon. A subscription started at `Start::Retained` must still skip the dropped commit
+/// rather than fail with `CursorBeforeHorizon`, whose advice is to start at `Start::Retained`.
+#[tokio::test]
+async fn a_subscription_started_at_retained_after_prune_log_removed_the_head() -> Result<()> {
+    let KeptBelowHorizon {
+        db,
+        pool,
+        store,
+        admin,
+        horizon,
+        ..
+    } = kept_below_horizon("1 day").await?;
+    // prune_log deletes no row above the store's coarse mark, which the sequencer writes with its token.
+    pool.execute(
+        "UPDATE pges.stores SET last_position = (SELECT max(last_position) FROM es.log)
+         WHERE schema_name = 'es'",
+    )
+    .await?;
+    let pruned = admin.prune_log(JobEvent::CATEGORY).await?;
+    assert_eq!(pruned.rows, 1, "the dropped commit's log row");
+    let head: i64 = sqlx::query_scalar("SELECT max(last_position) FROM es.log")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(head, 1, "the head is below the horizon {horizon:?}");
+
+    let category = Collector::default();
+    let by_category = store
+        .subscription(pges::subscribe::subscription_name!("retained-category"))
+        .category::<JobEvent>()
+        .start(subscription::Start::Retained)
+        .waker(recheck::Recheck::every(pges::core::interval!(10 ms)))
+        .run(category.clone())
+        .spawn();
+    let all = Collector::default();
+    let store_wide = store
+        .subscription(pges::subscribe::subscription_name!("retained-all"))
+        .all_categories()
+        .start(subscription::Start::Retained)
+        .waker(recheck::Recheck::every(pges::core::interval!(10 ms)))
+        .run(all.clone())
+        .spawn();
+    // A subscription that failed never reaches the position: report its error first.
+    let reached = (
+        wait_for(&by_category, 1).await,
+        wait_for(&store_wide, 1).await,
+    );
+    by_category.shutdown().await?;
+    store_wide.shutdown().await?;
+    reached.0?;
+    reached.1?;
+    assert_eq!(category.seen(), [Seen::Event(1)]);
+    assert_eq!(all.seen(), [Seen::Event(1)]);
 
     pool.close().await;
     db.cleanup().await

@@ -851,8 +851,9 @@ pub enum Start {
     /// Before the first event retention kept: every event that still exists is delivered, and the events
     /// retention dropped are skipped. This is where a new read model starts in a store with retention.
     ///
-    /// The events skipped are those of the categories whose retention horizon is at or below the store's
-    /// newest position when the subscription is created, which covers every drop before it and any drop
+    /// The events skipped are those of the categories whose retention horizon is at or below the newest
+    /// position the store had assigned when the subscription is created (its newest event's, or a newer
+    /// one of an event retention dropped), which covers every drop before it and any drop
     /// of those events while it catches up. A later drop of events written after it was created, while
     /// its cursor is behind them, still fails with [`SubscribeError::CursorBeforeHorizon`].
     Retained,
@@ -1763,9 +1764,23 @@ impl Ctx {
             Start::Now => Ok(strict(self.head().await?)),
             Start::Retained => Ok(StartAt {
                 cursor: position::Position::BEGINNING,
-                skip_through: self.head().await?,
+                skip_through: self.retained_skip_through().await?,
             }),
         }
+    }
+
+    /// The greater of `H` and the highest retention horizon: `Admin::prune_log` can delete the newest log
+    /// row, so `H` alone can be below a horizon.
+    async fn retained_skip_through(&self) -> Result<position::Position, SubscribeError> {
+        let skip_through = self
+            .sql
+            .skip_through
+            .bind(sql::statement::skip_through::Params {})
+            .fetch_one(&self.pool)
+            .await?
+            .skip_through;
+
+        read::to_position(skip_through)
     }
 
     /// `H`, the store's newest position.

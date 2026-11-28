@@ -2154,16 +2154,23 @@ the halt, 43 recovered, 335 after.
   - Running subscriptions keep the horizon check. Which check applies is a property of the reader, not of
     the cursor: a running subscription at a cursor between the start and the horizon has not handled the
     dropped commit at the horizon, and a new one at the same cursor does not care. Each subscription stores
-    `skip_through` with its cursor (0 unless created at `Start::Retained`, then the store's head at
-    creation; a redefine sets it from its start). A category whose horizon is at or below `skip_through` is
-    read after max(cursor, start), its read statement checks the start, and its missing commits are skipped
-    as dropped; a category whose horizon is above it keeps the horizon check. Backfills use the largest
-    position, so they always read from the start (the `read::BeforeHorizon` modes are replaced).
-  - `skip_through` is the head at creation, not the highest horizon: a drop that races the creation, or
-    drops events the subscription had not reached while it catches up, is still of events that existed
-    before it, so it is skipped rather than failing a subscription that never handled them. A drop of
-    events written after the creation, while the cursor is behind them, fails as for any subscription.
-    Stored, because the reader must still know after a restart that it was created this way.
+    `skip_through` with its cursor (0 unless created at `Start::Retained`, then the greater of the store's
+    head and its highest horizon at creation; a redefine sets it from its start, sharded or not). A
+    category whose horizon is at or below `skip_through` is read after max(cursor, start), its read
+    statement checks the start, and its missing commits are skipped as dropped; a category whose horizon is
+    above it keeps the horizon check. Backfills use the largest position, so they always read from the
+    start (the `read::BeforeHorizon` modes are replaced).
+  - `skip_through` covers the head at creation, not only the highest horizon: a drop that races the
+    creation, or drops events the subscription had not reached while it catches up, is still of events
+    that existed before it, so it is skipped rather than failing a subscription that never handled them. A
+    drop of events written after the creation, while the cursor is behind them, fails as for any
+    subscription. Stored, because the reader must still know after a restart that it was created this way.
+  - The head alone can be below a horizon: `Admin::prune_log` can delete the newest log row of an idle
+    store, the dropped commit's, so the head falls below that category's horizon, the category is read
+    strictly, and the new subscription fails at once with `CursorBeforeHorizon`, whose advice is to use
+    `Start::Retained`. So `skip_through` is greatest(head, max(`horizon_position`)), read in one statement
+    (`read/skip_through.sql`). The reasoning above holds: every horizon is the position of a commit written
+    before the statement, so the subscription still skips only drops of events that existed before it.
   - The store-wide read cannot start each category at its own start in one statement. Its log statement
     checks only horizons above `skip_through`, and a missing commit at or below its (skipped) category's
     horizon is dropped and skipped (one `read/horizons.sql` per page with missing commits, only while the
