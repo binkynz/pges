@@ -362,6 +362,112 @@ async fn a_panicking_handler_leaves_the_status_stopped() -> Result<()> {
     f.finish().await
 }
 
+/// Writes two equal keys into a table whose unique constraint is deferred: every COMMIT is refused.
+struct BreaksADeferredConstraint;
+
+impl handler::PgHandler for BreaksADeferredConstraint {
+    async fn handle(
+        &mut self,
+        tx: &mut PgConnection,
+        _batch: &batch::Batch,
+    ) -> Result<(), handler::HandlerError> {
+        sqlx::query("INSERT INTO public.deferred VALUES (1), (1)")
+            .execute(&mut *tx)
+            .await?;
+        Ok(())
+    }
+}
+
+/// A refused COMMIT is the handler's failure: it stops the run with `HandlerFailed`, instead of being retried
+/// for good as a database error.
+#[tokio::test]
+async fn a_refused_commit_is_a_handler_failure() -> Result<()> {
+    let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    jobs(&f, 1).await?;
+    sqlx::query("CREATE TABLE public.deferred (k int UNIQUE DEFERRABLE INITIALLY DEFERRED)")
+        .execute(&f.pool)
+        .await?;
+
+    let error = common::Running::spawn(
+        f.store
+            .subscription(subscription_name!("deferred"))
+            .categories(non_empty![category!("jobs")])
+            .retry_interval(interval!(10 ms))
+            .on_error(retry(2))
+            .run_pg(BreaksADeferredConstraint),
+    )
+    .stopped()
+    .await?;
+    assert!(
+        matches!(&error, subscription::SubscribeError::HandlerFailed { source, .. }
+            if source.to_string().contains("duplicate key")),
+        "{error:?}"
+    );
+    assert_eq!(f.cursor("deferred").await?, Some(0));
+
+    f.finish().await
+}
+
+/// Takes its snapshot in REPEATABLE READ, then records after a pause longer than half the lease, so a side
+/// renewal updates the subscription's row after the snapshot.
+struct RepeatableRead {
+    recorder: Recorder,
+    pause: Duration,
+}
+
+impl handler::PgHandler for RepeatableRead {
+    async fn handle(
+        &mut self,
+        tx: &mut PgConnection,
+        batch: &batch::Batch,
+    ) -> Result<(), handler::HandlerError> {
+        *self.recorder.calls.lock().unwrap() += 1;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("SELECT count(*) FROM public.delivered")
+            .execute(&mut *tx)
+            .await?;
+        tokio::time::sleep(self.pause).await;
+        self.recorder.record(tx, batch).await?;
+        Ok(())
+    }
+}
+
+/// The checkpoint's serialization failure follows the retry policy: the run stops once it runs out of
+/// attempts, instead of retrying the batch for good as a database error.
+#[tokio::test]
+async fn a_checkpoint_serialization_failure_follows_the_retry_policy() -> Result<()> {
+    let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    jobs(&f, 1).await?;
+    let recorder = Recorder::new("repeatable");
+
+    let error = common::Running::spawn(
+        f.store
+            .subscription(subscription_name!("repeatable"))
+            .categories(non_empty![category!("jobs")])
+            .lease(interval!(400 ms))
+            .retry_interval(interval!(10 ms))
+            .on_error(retry(2))
+            .run_pg(RepeatableRead {
+                recorder: recorder.clone(),
+                pause: Duration::from_millis(400),
+            }),
+    )
+    .stopped()
+    .await?;
+    assert!(
+        matches!(&error, subscription::SubscribeError::HandlerFailed { source, .. }
+            if source.to_string().contains("could not serialize")),
+        "{error:?}"
+    );
+    assert_eq!(recorder.calls(), 2, "retried per the policy");
+    assert_eq!(f.cursor("repeatable").await?, Some(0));
+    assert!(f.delivered("repeatable").await?.is_empty());
+
+    f.finish().await
+}
+
 #[tokio::test]
 async fn a_standby_takes_over_from_the_checkpoint() -> Result<()> {
     let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
