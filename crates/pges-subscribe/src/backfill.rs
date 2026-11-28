@@ -772,7 +772,9 @@ impl LaneCtx<'_> {
             let held = match held {
                 Ok(held) => held,
                 // Under REPEATABLE READ or SERIALIZABLE, a lane lock that waited for another run's batch
-                // which then moved the lane fails with 40001, where READ COMMITTED finds no row.
+                // which then moved the lane fails with 40001, where READ COMMITTED finds no row. Every write
+                // to a lane's row (a checkpoint, an advance) moves its cursor, and only another run writes a
+                // lane this run is delivering, so the 40001 always means the lane moved.
                 Err(error) if is_serialization_failure(&error) => None,
                 Err(error) => return Err(error.into()),
             };

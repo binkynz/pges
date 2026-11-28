@@ -2167,13 +2167,17 @@ async fn deliver_pg(
             let _ = tx.rollback().await;
             return Ok(Delivered::LostLease);
         }
-        // Under REPEATABLE READ or SERIALIZABLE, a renewal still in flight from before the batch can commit
-        // after the snapshot: 40001, worth a retry. Classified as the checkpoint's errors are ([`refused`]).
-        Err(error) if is_refused(&error) => {
-            let _ = tx.rollback().await;
-            return Err(Failure::Handler(refused(error)));
+        // The handler has not run, so no error here counts against the retry policy. Under REPEATABLE READ or
+        // SERIALIZABLE, another session's update of the row committed after the snapshot while the hold
+        // waited on its lock (a renewal dropped in flight, an acquire racing a lapsed lease, a redefine) fails
+        // it with 40001. Retried as a database error: after `retry_interval`, the stored cursor and fence are
+        // read again, so a moved fence finds the lease lost and a moved cursor is read on from.
+        Err(error) => {
+            if is_refused(&error) {
+                let _ = tx.rollback().await;
+            }
+            return Err(database(error));
         }
-        Err(error) => return Err(database(error)),
     };
 
     if let Err(error) = handler.handle(&mut tx, batch).await {

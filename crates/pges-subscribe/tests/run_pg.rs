@@ -894,6 +894,93 @@ async fn a_serialization_failure_at_the_commit_follows_the_retry_policy() -> Res
     f.finish().await
 }
 
+/// A serialization failure at the batch's hold (`subscription/hold.sql`), as a REPEATABLE READ or SERIALIZABLE
+/// batch meets when another session updates the subscription's row while the hold waits on its lock (a
+/// renewal dropped in flight, a racing acquire on a lapsed lease, a redefine), is no handler failure: the
+/// handler never ran. The batch is rolled back and retried as after a database error, reading the stored
+/// cursor and fence again, and a one-attempt retry policy still delivers it. The test updates the row's lease
+/// as a renewal does and holds that transaction open until the batch waits on the row lock.
+#[tokio::test]
+async fn a_serialization_failure_at_the_hold_is_not_a_handler_failure() -> Result<()> {
+    let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    let id = jobs(&f, 1).await?;
+    let levels = Arc::new(Mutex::new(Vec::new()));
+
+    let running = common::Running::spawn(
+        f.store
+            .subscription(subscription_name!("hold-serialization"))
+            .categories(non_empty![category!("jobs")])
+            .retry_interval(interval!(10 ms))
+            .waker(recheck::Recheck::every(interval!(5 ms)))
+            .on_error(retry(1))
+            .run_pg(Isolated {
+                recorder: Recorder::new("hold-serialization"),
+                isolation: handler::Isolation::RepeatableRead,
+                pause: Duration::ZERO,
+                levels: levels.clone(),
+            }),
+    );
+    running.wait_position(1).await?;
+
+    // Another session's renewal, committed while the next batch's hold waits on the row lock.
+    let mut renewal = f.pool.begin().await?;
+    sqlx::query(
+        "UPDATE es.subscriptions SET lease_until = lease_until + interval '1 ms'
+         WHERE name = 'hold-serialization'",
+    )
+    .execute(&mut *renewal)
+    .await?;
+    f.append(Cat::Jobs, id, 1).await?;
+    f.sequence_all().await?;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT FROM pg_stat_activity
+                                WHERE datname = current_database() AND wait_event_type = 'Lock'
+                                  AND query LIKE '%FOR NO KEY UPDATE OF subscriptions%')",
+            )
+            .fetch_one(&f.pool)
+            .await?;
+            if waiting {
+                return anyhow::Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .context("the subscription's batch never waited on the renewal")??;
+    renewal.commit().await?;
+
+    if let Err(error) = running.wait_position(2).await {
+        if running.handle.is_finished() {
+            panic!(
+                "the subscription stopped: {:?}",
+                running.handle.join().await
+            );
+        }
+        return Err(error);
+    }
+    assert_eq!(f.cursor("hold-serialization").await?, Some(2));
+    assert_eq!(
+        *levels.lock().unwrap(),
+        ["repeatable read", "repeatable read"],
+        "the handler ran once per batch"
+    );
+    let errors = running.errors();
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("could not serialize")),
+        "the hold met no serialization failure: {errors:?}"
+    );
+    running.handle.shutdown().await?;
+    common::check_delivery(
+        &f.delivered("hold-serialization").await?,
+        &f.expected(&[f.id(Cat::Jobs)]).await?,
+    )?;
+
+    f.finish().await
+}
 /// Records with a short `lock_timeout`, which the COMMIT in its transaction inherits.
 struct ShortLockTimeout {
     recorder: Recorder,

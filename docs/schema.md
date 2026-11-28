@@ -1239,7 +1239,10 @@ cursors twice.
 `crates/pges-subscribe/sql/transaction/begin_*.sql`, or a plain `BEGIN`) and first locks the shard's row,
 fenced and with the crate-version check of the renewal
 (`crates/pges-subscribe/sql/subscription/hold.sql`, `SELECT … FOR NO KEY UPDATE`). No row means the lease
-was lost: the batch is rolled back before the handler runs. Then the handler runs, and the checkpoint moves
+was lost: the batch is rolled back before the handler runs. An error of the lock (40001 under REPEATABLE READ
+or SERIALIZABLE when another session updated the row while the lock waited) rolls the batch back too and is
+retried as a database error, from the stored cursor and fence, without counting as a handler attempt. Then
+the handler runs, and the checkpoint moves
 the cursor and renews the lease from `clock_timestamp()` in the same transaction
 (`crates/pges-subscribe/sql/subscription/checkpoint_held.sql`), then it commits. `run` runs its checkpoint in
 autocommit after the handler (`crates/pges-subscribe/sql/subscription/checkpoint.sql`). Each checkpoint is

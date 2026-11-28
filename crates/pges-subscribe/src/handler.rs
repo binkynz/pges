@@ -73,9 +73,13 @@ pub trait PgHandler: Send {
 /// The isolation level of a [`PgHandler`]'s transaction.
 ///
 /// Any level keeps the batch exactly once. The subscription locks its own row in the transaction before
-/// the handler runs, so a serialization failure comes only from the handler's own tables (or from the
-/// COMMIT), and follows the subscription's [`RetryPolicy`](crate::subscription::RetryPolicy) like any
-/// retryable error.
+/// the handler runs, so once the handler runs a serialization failure comes only from the handler's own
+/// tables (or from the COMMIT), and follows the subscription's
+/// [`RetryPolicy`](crate::subscription::RetryPolicy) like any retryable error. The lock itself can fail with
+/// one under REPEATABLE READ or SERIALIZABLE, when another session updates the row while the lock waits (a
+/// lease renewal still in flight, a takeover, a redefine): the handler has not run, so it does not count
+/// against the policy; it is retried as a database error, after `retry_interval` and from the stored cursor
+/// and fence.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Isolation {
