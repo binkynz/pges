@@ -1888,7 +1888,18 @@ They are ordinary subscribers, so they get leases, checkpoints and backfills for
   `pges-replication`, `pges-watch-proto`, `pges-testing`. `pges-bench` and `pges-examples` are not published.
 - Public API stability: before 1.0, breaking changes bump the minor version (0.1 to 0.2); patch releases
   do not break. `#[non_exhaustive]` on public error enums and config structs so new variants and fields are
-  not breaking. The README's Stability section lists the experimental features.
+  not breaking. The README's Stability section lists the experimental features. Public error types are
+  `Error + Send + Sync + 'static` and the shared handles `Send` (`Sync` where shared by reference); a test
+  (`crates/pges/tests/auto_traits.rs`) holds them to it.
+- Public dependencies: these crates' types appear in the pges API, so a semver-incompatible upgrade of one
+  is a breaking pges release (a minor version before 1.0). sqlx 0.9 (`PgPool`, `PgConnection`, and
+  `From<sqlx::Error>` for the error enums), uuid 1 (`from_uuid`, `as_uuid`), time 0.3
+  (`OffsetDateTime` in `recorded_at`), serde 1 and serde_json 1 (`Snapshotted`, `codec::json::Upcaster`),
+  tokio 1 (`tokio::sync::watch::Receiver` in `Watch::status` and `InprocWaker`), bytes 1
+  (`pges-replication`'s pgoutput and XLogData), prost 0.14 and tonic 0.14 (`pges-watch-proto`, the
+  sequencer's `grpc::WatchService`), and, behind `otel`, opentelemetry 0.33 (`opentelemetry::Context`
+  from `trace_parent` and `to_context`). An application that names these types depends on the same
+  versions.
 
 ## Versioning
 
