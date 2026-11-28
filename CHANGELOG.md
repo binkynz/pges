@@ -38,7 +38,8 @@ The first release: `pges`, `pges-core`, `pges-derive`, `pges-postgres`, `pges-su
   returns the current span's trace context.
 - **Partitions and retention** (`Admin`). Categories partitioned by time (a day or a month per leaf);
   `maintain` creates partitions ahead; retention per category (keep everything, a time window, or a window
-  plus snapshots), log pruning, closed-partition freeze, writer limits.
+  plus snapshots; a window's `keep` is at most `Retention::MAX_KEEP`), log pruning, closed-partition
+  freeze, writer limits.
 - **The sequencer** (`pges-sequencer`). One leader per database, with a lease and standbys, writes a
   gap-free log of positions per store in commit order. Two sources: a logical replication slot (default) or
   an outbox woken by `LISTEN/NOTIFY`. Slot bootstrap and resequence after a lost slot. In-process watch,

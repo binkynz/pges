@@ -645,7 +645,8 @@ knowing, so its `commit` does nothing (sqlx 0.9.1's savepoint begin; design.md, 
     Forever,
     Window { keep: Duration, then: AfterWindow },
     SnapshotAndTruncate { keep: Duration },
-}
+}                                                 // keep is at most Retention::MAX_KEEP (1,000 years of
+                                                  // 365 days); a longer one is KeepTooLong where it is set
 #[non_exhaustive] pub enum AfterWindow { Drop }   // Default Drop; Archive is not built
 #[non_exhaustive] pub struct RetentionConfig {    // RetentionConfig::new(WriterRoles)
     pub writer_roles: limit::WriterRoles,         // each needs a transaction_timeout of at most the
@@ -818,11 +819,12 @@ outcomes are classified after the statement wrote no row.
 | `load::SnapshotError` | `Encode`, `UnknownCategory`, `Database` |
 | `unit_of_work::TransactionError` | `Aborted`, `Database` |
 | `migrate::MigrateError` | `SharedSchemaMissing`, `ChecksumMismatch`, `CrateTooOld`, `OutboxMismatch { store, outbox }`, `Failed`, `Database` |
-| `admin::RegisterCategoryError`, `admin::MaintainError` | `UnsupportedBucket`, `NameTaken { name }`, `Database` |
+| `admin::RegisterCategoryError` | `UnsupportedBucket`, `NameTaken { name }`, `KeepTooLong(Duration)`, `Database` |
+| `admin::MaintainError` | `UnsupportedBucket`, `NameTaken { name }`, `Database` |
 | `admin::ChangeBucketError` | `UnknownCategory`, `NameTaken { name }`, `Database` |
 | `admin::PartitionHeadroomError` | `UnsupportedBucket`, `Database` |
-| `retention::SetRetentionError` | `UnknownCategory`, `Database` |
-| `retention::SetDefaultRetentionError` | `StoreNotFound`, `Database` |
+| `retention::SetRetentionError` | `UnknownCategory`, `KeepTooLong(Duration)`, `Database` |
+| `retention::SetDefaultRetentionError` | `StoreNotFound`, `KeepTooLong(Duration)`, `Database` |
 | `retention::RetentionError` | `SequencerHalted`, `StoreNotFound`, `WriterRole(WriterRoleError)`, `Database` |
 | `retention::PruneLogError` | `UnknownCategory`, `Database` |
 | `freeze::FreezeError` | `StoreNotFound`, `Database` |

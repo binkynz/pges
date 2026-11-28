@@ -255,6 +255,10 @@ by `Admin::apply_retention(&RetentionConfig)`, run on the same schedule as `Admi
 | `Window { keep, then: Drop \| Archive }` | for categories whose streams are short-lived; whole partitions are detached, optionally exported, then dropped; `Archive` is not built |
 | `SnapshotAndTruncate { keep }` | for long-lived streams: before a partition goes, every live stream with commits in it must have a snapshot at or after its last version there |
 
+- `keep` is at most `Retention::MAX_KEEP`, 1,000 years of 365 days. A longer one is refused where it is set
+  (`KeepTooLong`): retention compares a leaf's bound with `now() - keep`, and a `keep` of more than about
+  6,700 years, such as `Duration::MAX` meant as "forever", takes that out of PostgreSQL's timestamp range
+  and would fail every run. `Forever` keeps everything.
 - A leaf is dropped only once it is past `retain_for` plus the clock-skew tolerance, past `max_txn_age`
   plus twice the skew, and fully sequenced (schema.md, Retention). The skew and `max_txn_age` are the
   store's recorded writer limits. Retention refuses to run while the sequencer is halted, and unless every
