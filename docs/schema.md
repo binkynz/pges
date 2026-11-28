@@ -1191,7 +1191,9 @@ integer) modulo the lane count; persisted progress depends on it, so it never ch
   0 rows means another run moved it (`Overtaken`), and the transaction rolls back. Lanes with no events in the
   page are moved in autocommit (`crates/pges-subscribe/sql/backfill/advance.sql`).
 
-- Pages use "Read a category from a cursor" with `$3 = least(H, P)`. Each category is read after its own
+- Pages use "Read a category from a cursor" with `$3 = P`. `P` is at most `H`, which the run read once at its
+  start (`UntilAhead` otherwise), and positions only become visible, never invisible, so pages do not read
+  `H` again. Each category is read after its own
   floor, `$2` = max(the lowest lane cursor, the category's retention horizon): before every page the
   backfill reads its categories' horizons (`crates/pges-subscribe/sql/read/horizons.sql`). Events below a
   horizon are gone, so it skips them instead of failing. The read statement still checks its `$2` against

@@ -697,3 +697,82 @@ impl handler::PgHandler for Overtaking {
         Ok(())
     }
 }
+
+/// A backfill reads `H` once, when it starts: its end is at or below it, so every page reads up to the end
+/// without reading `H` again. Counted as scans of the log partitions' primary keys, which `read/head.sql`
+/// reads backwards; the page statements read `log_by_category`.
+#[tokio::test]
+async fn a_backfill_reads_the_head_once() -> Result<()> {
+    const JOBS: usize = 100;
+    const BATCH: u32 = 10;
+
+    let mut f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    // Write and sequence on a pool of their own, closed before counting, so their scans are reported.
+    let setup = f.db.pool().await?;
+    f.pool = setup.clone();
+    f.store = pges_postgres::store::Store::open(
+        setup.clone(),
+        pges_postgres::store::StoreConfig::new(common::STORE_NAME),
+    )
+    .await?;
+    let job = stream::StreamId::new_v7();
+    for _ in 0..JOBS {
+        f.append(Cat::Jobs, job, 1).await?;
+    }
+    f.sequence_all().await?;
+    let until = common::head(&setup).await?;
+    let expected = expected(&f, &[Cat::Jobs], until).await?;
+    setup.close().await;
+    f.pool = f.db.pool().await?;
+    let before = scans_of_log_keys(&f).await?;
+
+    let reading = f.db.pool().await?;
+    let store = pges_postgres::store::Store::open(
+        reading.clone(),
+        pges_postgres::store::StoreConfig::new(common::STORE_NAME),
+    )
+    .await?;
+    let finished = store
+        .backfill(subscription_name!("head-once"), backfill::Until::Head)
+        .categories(non_empty![category!("jobs")])
+        .batch_size(NonZeroU32::new(BATCH).unwrap())
+        .run_pg(Recorder::new("head-once"))
+        .await?;
+    reading.close().await;
+    let scans = scans_of_log_keys(&f).await? - before;
+
+    assert_eq!(finished.events, JOBS as u64);
+    check(&f, "head-once", &expected).await?;
+    let pages = JOBS as i64 / i64::from(BATCH);
+    assert_eq!(scans, 1, "{scans} reads of H over {pages} pages");
+
+    f.finish().await
+}
+
+/// The index scans of the log partitions' primary keys, once the backends that ran them have exited and
+/// reported them: the same in three reads in a row.
+async fn scans_of_log_keys(f: &Fixture) -> Result<i64> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let (mut previous, mut same) = (-1, 0);
+    loop {
+        let mut conn = f.db.connect().await?;
+        let scans: i64 = sqlx::query_scalar(
+            "SELECT coalesce(sum(idx_scan), 0)::int8 FROM pg_stat_user_indexes
+             WHERE schemaname = 'es' AND relname LIKE 'log\\_%' AND indexrelname LIKE '%\\_pkey'",
+        )
+        .fetch_one(&mut conn)
+        .await?;
+        conn.close().await?;
+        same = if scans == previous { same + 1 } else { 0 };
+        if same == 2 {
+            return Ok(scans);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the scans of the log keys kept changing"
+        );
+
+        previous = scans;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}

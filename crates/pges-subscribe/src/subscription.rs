@@ -1396,10 +1396,10 @@ impl Runner {
                 }
                 match ready? {
                     replica::Ready::Replica => {
-                        reader.read_from(replica.pool(), term.cursor, None).await?
+                        reader.read_from(replica.pool(), term.cursor).await?
                     }
                     replica::Ready::Primary(_permit) => {
-                        reader.read_from(&self.ctx.pool, term.cursor, None).await?
+                        reader.read_from(&self.ctx.pool, term.cursor).await?
                     }
                     replica::Ready::Shutdown => return Ok(Step::Shutdown),
                 }

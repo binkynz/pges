@@ -354,8 +354,10 @@ impl Builder<subscription::Listed> {
                 return Ok(Finished { until, events });
             }
 
+            // `until` is at or below `head`, read above on this pool, so every position up to it is visible:
+            // `H` need not be read again, and a page never reads past `until`.
             let page = reader
-                .read_from(&pool, cursor, Some(until))
+                .read_through(&pool, cursor, until)
                 .await
                 .map_err(BackfillError::from_read)?;
             let cut = page.batch.last_position();

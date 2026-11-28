@@ -201,10 +201,10 @@ impl Reader {
     ) -> Result<Page, subscription::SubscribeError> {
         let pool = self.pool.clone();
 
-        self.read_from(&pool, cursor, None).await
+        self.read_from(&pool, cursor).await
     }
 
-    /// [`Reader::read`] on `pool`, such as a replica's, with `H` lowered to `bound` if it is below.
+    /// [`Reader::read`] on `pool`, such as a replica's.
     ///
     /// A replica replays the primary's commits in order, so what it shows is a prefix of the log and the
     /// merge cut holds there too. Every page statement, for listed categories, the whole store or a shard,
@@ -214,7 +214,6 @@ impl Reader {
         &mut self,
         pool: &PgPool,
         cursor: position::Position,
-        bound: Option<position::Position>,
     ) -> Result<Page, subscription::SubscribeError> {
         let head = self
             .sql
@@ -224,7 +223,19 @@ impl Reader {
             .await?
             .head;
         let head = to_position(head)?;
-        let head = bound.map_or(head, |bound| head.min(bound));
+
+        self.read_through(pool, cursor, head).await
+    }
+
+    /// [`Reader::read_from`] with `head` as `H`, without reading the store's newest position. Every position
+    /// up to `head` must already be visible on `pool`: `head` was read from it earlier, or is below such a
+    /// position. Visibility only grows, so a backfill reads up to its end, which it checked against `H`.
+    pub(crate) async fn read_through(
+        &mut self,
+        pool: &PgPool,
+        cursor: position::Position,
+        head: position::Position,
+    ) -> Result<Page, subscription::SubscribeError> {
         if head <= cursor {
             return Ok(Page {
                 batch: batch::Batch::new(
