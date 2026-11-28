@@ -629,3 +629,49 @@ async fn published(conn: &mut sqlx::PgConnection) -> Result<Vec<String>> {
     .fetch_all(conn)
     .await?)
 }
+
+/// A role with `CREATE` on the database takes the name `pges` before the first migration. As the schema's
+/// owner it could later drop `pges.stores` and put a table of its own in its place, whose trigger would run
+/// as the role creating the next store, a superuser included. The runner creates nothing in a schema that
+/// belongs to another role, whoever runs it; the schema's owner may migrate into it.
+#[tokio::test]
+async fn the_shared_tables_are_not_created_in_a_schema_of_another_role() -> Result<()> {
+    let db = pges_testing::TestDb::new().await?;
+    let mut conn = db.connect().await?;
+    let squatter = format!("{}_squatter", db.name());
+    conn.execute(sqlx::AssertSqlSafe(format!(
+        "DROP PUBLICATION pges; DROP SCHEMA pges CASCADE;
+         CREATE ROLE {squatter}; GRANT CREATE ON DATABASE {database} TO {squatter};
+         SET ROLE {squatter}; CREATE SCHEMA pges; RESET ROLE;",
+        database = db.name()
+    )))
+    .await?;
+
+    let error = run(&mut conn, store_name!("q1")).await.unwrap_err();
+
+    assert!(
+        matches!(&error, migrate::MigrateError::SharedSchemaNotOwned { owner } if *owner == squatter),
+        "{error}"
+    );
+    let tables: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_class WHERE relnamespace = 'pges'::regnamespace",
+    )
+    .fetch_one(&mut conn)
+    .await?;
+    assert_eq!(tables, 0);
+
+    // Its owner migrates into it.
+    conn.execute(sqlx::AssertSqlSafe(format!("SET ROLE {squatter}")))
+        .await?;
+    run_with_outbox(&mut conn, store_name!("q1"), store::Outbox::Enabled).await?;
+    conn.execute("RESET ROLE").await?;
+    assert_eq!(store_names(&mut conn).await?, ["q1"]);
+
+    conn.execute(sqlx::AssertSqlSafe(format!(
+        "DROP SCHEMA q1, pges CASCADE; DROP PUBLICATION IF EXISTS pges;
+         DROP OWNED BY {squatter}; DROP ROLE {squatter}"
+    )))
+    .await?;
+    conn.close().await?;
+    db.cleanup().await
+}

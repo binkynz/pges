@@ -818,7 +818,7 @@ outcomes are classified after the statement wrote no row.
 | `load::LoadError` | `Read(ReadError)`, `SnapshotDecode`, `SnapshotSave(SnapshotError)` |
 | `load::SnapshotError` | `Encode`, `UnknownCategory`, `Database` |
 | `unit_of_work::TransactionError` | `Aborted`, `Database` |
-| `migrate::MigrateError` | `SharedSchemaMissing`, `ChecksumMismatch`, `CrateTooOld`, `OutboxMismatch { store, outbox }`, `Failed`, `Database` |
+| `migrate::MigrateError` | `SharedSchemaMissing`, `SharedSchemaNotOwned { owner }`, `ChecksumMismatch`, `CrateTooOld`, `OutboxMismatch { store, outbox }`, `Failed`, `Database` |
 | `admin::RegisterCategoryError` | `UnsupportedBucket`, `NameTaken { name }`, `KeepTooLong(Duration)`, `Database` |
 | `admin::MaintainError` | `UnsupportedBucket`, `NameTaken { name }`, `Database` |
 | `admin::ChangeBucketError` | `UnknownCategory`, `NameTaken { name }`, `Database` |
