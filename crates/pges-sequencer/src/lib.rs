@@ -94,7 +94,8 @@
 //!
 //! Each batch is one transaction: the fence check, the source's reads (for the outbox, the `DELETE` from
 //! `pending`), and one `INSERT` into each store's `log`. Positions continue from the newest log row of the
-//! store, so the log has no gaps and no duplicates, also across restarts and takeovers. Within a store,
+//! store, or from its coarse high-water mark if `prune_log` removed the newest rows, so the log has no gaps
+//! and no duplicates, also across restarts and takeovers. Within a store,
 //! positions follow source order: the logical source delivers transactions in WAL commit order, and the
 //! outbox orders by `pending.seq`. Both respect causality: if one append could see another's commit, it is
 //! sequenced after it.

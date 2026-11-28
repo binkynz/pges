@@ -923,7 +923,8 @@ the same replication connection afterwards.
 
 **Write**, in one READ COMMITTED transaction: the fence check
 (`crates/pges-sequencer/sql/resequence/hold_fence.sql`; 0 rows: `LeaseLost`); per store, its newest position
-(`crates/pges-sequencer/sql/log/newest.sql`) and the new log rows in chunks of 10 000
+(`crates/pges-sequencer/sql/log/newest.sql`, at least `pges.stores.last_position` from
+`crates/pges-sequencer/sql/log/store.sql`) and the new log rows in chunks of 10 000
 (`crates/pges-sequencer/sql/log/insert.sql`); per store, the first and last position each category got
 (`crates/pges-sequencer/sql/resequence/record_ranges.sql`); then
 `crates/pges-sequencer/sql/transaction/synchronous_commit.sql` and
@@ -969,9 +970,11 @@ checked with a row lock, not an update, so a batch writes no new version of the 
 source's reads and writes (the outbox drain, below), then the log rows of each store with new rows
 (`crates/pges-sequencer/sql/log/insert.sql`).
 
-Positions continue from the store's newest log row, one per event, in source order. A commit already in the
-dedupe window (below) is skipped. A takeover's `UPDATE … SET fence = fence + 1` waits for the in-flight batch
-and fences out every later one.
+Positions continue from the store's newest log row, one per event, in source order; never from below
+`pges.stores.last_position`, because `prune_log` can delete the newest rows (those of commits retention
+dropped) and their positions must not be handed out again. Resequence starts from the same floor. A commit
+already in the dedupe window (below) is skipped. A takeover's `UPDATE … SET fence = fence + 1` waits for the
+in-flight batch and fences out every later one.
 
 A log row needs a log partition. Without one the `INSERT` fails, the batch rolls back (the outbox rows stay
 in `pending`), and the sequencer retries every `retry_interval`, reported as `Status::Recovering`, until
