@@ -1507,9 +1507,9 @@ matching CHECK constraint lets it skip the validation scan. Each attach still in
   guard, a leader that sequenced old backlogged commits and stopped before writing the mark could leave their
   rows as the store's newest; retention drops their leaf, the scan reaches those rows, and `prune_log` deletes
   them; the next term then starts again from the mark and hands their positions to new commits (the outbox
-  source never delivers a drained commit again). Rows above the mark stay until the sequencer next writes it,
-  and are pruned then (`prune_log_keeps_the_rows_above_the_coarse_mark`,
-  `a_log_partition_with_rows_above_the_coarse_mark_stays`,
+  source never delivers a drained commit again). Rows above the mark stay until the sequencer writes the mark
+  above them, which waits until the source has replayed them (Dedupe window, above), and are pruned then
+  (`prune_log_keeps_the_rows_above_the_coarse_mark`, `a_log_partition_with_rows_above_the_coarse_mark_stays`,
   `positions_continue_after_a_crash_before_the_mark_and_prune_log`).
 
   Dropping a whole log partition relies on `retention_scan_from` alone, with no such existence check, which
