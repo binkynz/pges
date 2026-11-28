@@ -1232,10 +1232,10 @@ the lease.
 
 The lock goes when the holder's backend ends. For a client host that vanished, that is when the server finds
 the connection dead, so the lock statement also sets the session's `tcp_keepalives_idle`,
-`tcp_keepalives_interval`, `tcp_keepalives_count` and `tcp_user_timeout` from the lease, local to the
-transaction (`set_config(…, true)` in a CTE of `hold.sql`): about one lease over TCP instead of the
-server's default of about 2 h 11 min. They do nothing over a Unix socket, and `tcp_user_timeout` only
-where the platform has `TCP_USER_TIMEOUT`.
+`tcp_keepalives_interval` and `tcp_keepalives_count` from the lease, local to the transaction
+(`set_config(…, true)` in a CTE of `hold.sql`): about one lease over TCP instead of the server's default of
+about 2 h 11 min. They do nothing over a Unix socket. `backfill/hold.sql` sets the same as for a 15 s lease.
+Not `tcp_user_timeout`: on Linux it also bounds a full receive window, so it dropped a healthy handler that read a large result slower than the lease, on every attempt.
 
 While caught up and idle, while a `run` handler runs and while a failed batch waits for its retry (in
 autocommit, on another pool connection), the instance renews its lease

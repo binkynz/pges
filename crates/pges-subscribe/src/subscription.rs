@@ -476,10 +476,10 @@ impl<S> Builder<S> {
     ///
     /// The lease is what a standby waits out after the holder's process died. A `run_pg` batch's lock goes
     /// with its connection: when the holder's host vanishes without closing it, the server notices only
-    /// when the connection is found dead. The batch's transaction sets the session's TCP keepalives and
-    /// `tcp_user_timeout` from the lease (probes after a third of it, about 5/6 of it in all, at least 4 s)
-    /// so that happens within about one lease over TCP; over a Unix socket they do nothing, and
-    /// `tcp_user_timeout` needs a platform with `TCP_USER_TIMEOUT` (Linux). The lapsed lease of a holder
+    /// when the connection is found dead. The batch's transaction sets the session's TCP keepalives from
+    /// the lease (probes after a third of it, about 5/6 of it in all, at least 4 s) so that happens within
+    /// about one lease over TCP; over a Unix socket they do nothing. A live client's kernel answers the
+    /// probes, however slowly its handler reads. The lapsed lease of a holder
     /// that hangs inside its handler, connected, is not taken over either, as it would not be with a renewal
     /// on the side; `idle_in_transaction_session_timeout` on the role bounds that, at the cost of ending any
     /// handler that pauses longer between statements.
@@ -1188,31 +1188,29 @@ struct Ctx {
     keepalive: Keepalive,
 }
 
-/// TCP keepalive and user timeout settings for the session that holds a subscription's row, so the server
-/// drops a vanished client's backend, and with it the row lock, within about one lease.
+/// TCP keepalive settings for the session that holds a subscription's row or a backfill's lane, so the
+/// server drops a vanished client's backend, and with it the lock, within about one lease. No
+/// `tcp_user_timeout`: on Linux it also bounds a full receive window, and would drop a healthy handler that
+/// reads a large result slowly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Keepalive {
+pub(crate) struct Keepalive {
     /// `tcp_keepalives_idle`, in seconds.
-    idle: i32,
+    pub(crate) idle: i32,
     /// `tcp_keepalives_interval`, in seconds.
-    interval: i32,
+    pub(crate) interval: i32,
     /// `tcp_keepalives_count`.
-    count: i32,
-    /// `tcp_user_timeout`, in milliseconds.
-    user_timeout: i32,
+    pub(crate) count: i32,
 }
 
 impl Keepalive {
     /// Probes after a third of the lease idle, then every sixth, and gives up after 3 unanswered probes:
-    /// about 5/6 of the lease, at least 4 s, since the settings count whole seconds. Unacknowledged data
-    /// gives up after one lease.
-    fn for_lease(lease: Duration) -> Self {
+    /// about 5/6 of the lease, at least 4 s, since the settings count whole seconds.
+    pub(crate) fn for_lease(lease: Duration) -> Self {
         let seconds = |d: Duration| i32::try_from(d.as_secs()).unwrap_or(i32::MAX).max(1);
         Self {
             idle: seconds(lease / 3),
             interval: seconds(lease / 6),
             count: 3,
-            user_timeout: i32::try_from(lease.as_millis()).unwrap_or(i32::MAX).max(1),
         }
     }
 }
@@ -1313,14 +1311,19 @@ pub(crate) async fn unless_ended(
     tx: &mut PgConnection,
     error: handler::HandlerError,
 ) -> Result<handler::HandlerError, sqlx::Error> {
-    if !handler::ended_by_handler(tx).await? {
+    // sqlx ended it (a failed or dropped savepoint begin): no probe needed, and the error says so.
+    let sqlx_ended = !tx.is_in_transaction();
+    if !sqlx_ended && !handler::ended_by_handler(tx).await? {
         return Ok(error);
     }
     let (handler::HandlerError::Transient(after) | handler::HandlerError::Fatal(after)) = error;
+    let after = Some(after);
 
-    Ok(handler::HandlerError::Fatal(Box::new(
-        HandlerEndedTransaction { after: Some(after) },
-    )))
+    Ok(handler::HandlerError::Fatal(if sqlx_ended {
+        Box::new(EndedTransaction { after })
+    } else {
+        Box::new(HandlerEndedTransaction { after })
+    }))
 }
 
 enum Delivered {
@@ -1357,7 +1360,11 @@ pub(crate) struct AbortedTransaction;
     "the handler's transaction ended (a savepoint begin on it failed or was dropped, which rolls back the \
      whole transaction; the handler's statements after it ran in autocommit)"
 )]
-pub(crate) struct EndedTransaction;
+pub(crate) struct EndedTransaction {
+    /// What the handler reported afterwards, if anything.
+    #[source]
+    pub(crate) after: Option<handler::BoxError>,
+}
 
 struct Runner {
     ctx: Ctx,
@@ -1890,7 +1897,6 @@ impl Ctx {
                 keepalives_idle: self.keepalive.idle,
                 keepalives_interval: self.keepalive.interval,
                 keepalives_count: self.keepalive.count,
-                user_timeout: self.keepalive.user_timeout,
             })
             .fetch_optional(&mut *tx)
             .await?;
@@ -2115,7 +2121,7 @@ async fn deliver_pg(
     // statements after the rollback committed on their own: retrying could apply them twice.
     if !tx.is_in_transaction() {
         return Err(Failure::Handler(handler::HandlerError::Fatal(Box::new(
-            EndedTransaction,
+            EndedTransaction { after: None },
         ))));
     }
 

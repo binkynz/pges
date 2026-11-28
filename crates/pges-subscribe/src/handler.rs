@@ -44,11 +44,18 @@ pub type BoxError = Box<dyn error::Error + Send + Sync + 'static>;
 /// passes), and `SET TRANSACTION READ ONLY` passes but makes the checkpoint fail (SQLSTATE 25006), retried
 /// as transient until the attempts run out.
 ///
-/// The transaction holds a savepoint taken by its `BEGIN`, so the handler's statements run in a
-/// subtransaction. Savepoints of its own (`tx.begin()`) are allowed, but a savepoint begin that fails (on an
-/// aborted transaction) or is dropped before it completes makes sqlx roll back the whole transaction; the
-/// handler's statements after it run in autocommit, and may have committed. The subscription sees the
-/// transaction gone, moves no checkpoint, and fails the batch with a fatal error, as after a raw `COMMIT`.
+/// The transaction holds a savepoint taken by its `BEGIN`, `pges_batch`, so the handler's statements run in
+/// a subtransaction: a batch that writes uses two transaction ids, and a handler that opens more than 63
+/// savepoints of its own overflows the backend's subtransaction cache, which makes other sessions' snapshots
+/// look up `pg_subtrans` (SubtransSLRU contention) while it runs. The name is reserved: rolling back to
+/// `pges_batch` or releasing it also releases the lock on the subscription's row early (fencing still
+/// keeps the batch exactly once: a takeover then makes the checkpoint refuse), and releasing it makes any
+/// later failure of the batch fatal, since the subscription can no longer tell its transaction is intact.
+///
+/// Savepoints of its own (`tx.begin()`) are allowed, but a savepoint begin that fails (on an aborted
+/// transaction) or is dropped before it completes makes sqlx roll back the whole transaction; the handler's
+/// statements after it run in autocommit, and may have committed. The subscription sees the transaction
+/// gone, moves no checkpoint, and fails the batch with a fatal error, as after a raw `COMMIT`.
 pub trait PgHandler: Send {
     /// Applies one batch.
     fn handle(

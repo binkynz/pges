@@ -49,8 +49,8 @@ The first release: `pges`, `pges-core`, `pges-derive`, `pges-postgres`, `pges-su
   the lease for the batch, so `run_pg` needs one store connection. `PgHandler::isolation()` picks the
   transaction's level (`handler::Isolation::{Default, ReadCommitted, RepeatableRead, Serializable}`,
   applied in the `BEGIN`; backfills too); a handler cannot change the level with `SET TRANSACTION`. The
-  batch's session gets TCP keepalives and `tcp_user_timeout` from the lease, so a vanished holder's lock
-  goes within about one lease over TCP. A handler that ends the batch's transaction with a raw `COMMIT` or
+  batch's session gets TCP keepalives from the lease (a backfill lane's, as for a 15 s lease), so a
+  vanished holder's lock goes within about one lease over TCP. A handler that ends the batch's transaction with a raw `COMMIT` or
   `ROLLBACK`, whatever it returns, or whose savepoint begin ended it, moves no cursor and fails the run (a
   fatal `HandlerFailed`). Leases and fencing, sharded subscriptions, replica reads with fallback, backfills. Wakers: gRPC
   (default), in-process, `LISTEN/NOTIFY` and poll.

@@ -591,9 +591,10 @@ impl handler::PgHandler for ReadsKeepalives {
     }
 }
 
-/// The session that holds a subscription's row has TCP keepalives and a user timeout derived from the lease
-/// (15 s: probes after 5 s idle, every 2 s, 3 of them; 15000 ms unacknowledged), so the server drops a
-/// vanished client's backend and its lock within about one lease instead of the hours its defaults take.
+/// The session that holds a subscription's row has TCP keepalives derived from the lease (15 s: probes after
+/// 5 s idle, every 2 s, 3 of them), so the server drops a vanished client's backend and its lock within about
+/// one lease instead of the hours its defaults take. `tcp_user_timeout` stays the server's (0, off): it
+/// would drop a healthy handler that reads slowly (`a_handler_reading_slowly_past_the_lease_completes`).
 /// They are local to the batch's transaction: the pooled connection keeps its own settings afterwards. Over
 /// a Unix socket the server ignores them and reports 0.
 #[tokio::test]
@@ -631,7 +632,7 @@ async fn the_holding_session_has_keepalives_from_the_lease() -> Result<()> {
                 count.as_str(),
                 user_timeout.as_str()
             ),
-            ("5", "2", "3", "15000")
+            ("5", "2", "3", "0")
         );
     }
 
@@ -1413,6 +1414,80 @@ async fn the_held_checkpoint_moves_only_a_cursor_it_holds() -> Result<()> {
     assert_eq!((row.in_batch, row.moved), (Some(true), Some(true)));
     tx.rollback().await?;
     assert_eq!(f.cursor("held").await?, Some(2));
+
+    f.finish().await
+}
+
+/// Streams a large result through the batch's transaction and pauses after its first row, as a handler that
+/// does slow work per row would, then records.
+struct SlowReader {
+    recorder: Recorder,
+    pause: Duration,
+    results: Arc<Mutex<Vec<String>>>,
+}
+
+impl handler::PgHandler for SlowReader {
+    async fn handle(
+        &mut self,
+        tx: &mut PgConnection,
+        batch: &batch::Batch,
+    ) -> Result<(), handler::HandlerError> {
+        use futures_util::TryStreamExt as _;
+
+        let read = async {
+            // About 160 MB: far more than the socket buffers hold, so the server blocks sending it.
+            let mut rows = sqlx::query_scalar::<_, String>(
+                "SELECT repeat('x', 8000) FROM generate_series(1, 20000)",
+            )
+            .fetch(&mut *tx);
+            let mut read = 0_usize;
+            while rows.try_next().await?.is_some() {
+                read += 1;
+                if read == 1 {
+                    tokio::time::sleep(self.pause).await;
+                }
+            }
+            Ok::<_, sqlx::Error>(read)
+        }
+        .await;
+        self.results.lock().unwrap().push(format!("{read:?}"));
+        read?;
+        self.recorder.record(tx, batch).await?;
+        Ok(())
+    }
+}
+
+/// A healthy handler that reads a large result slowly, pausing longer than the lease, completes: the
+/// server waits on a full receive window meanwhile, and nothing the batch sets on its session gives up on
+/// that. (`tcp_user_timeout` set to the lease did: on Linux it also bounds zero-window probing, so the
+/// server dropped the connection and every attempt failed.)
+#[tokio::test]
+async fn a_handler_reading_slowly_past_the_lease_completes() -> Result<()> {
+    let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    jobs(&f, 1).await?;
+    let results = Arc::new(Mutex::new(Vec::new()));
+
+    let running = common::Running::spawn(
+        f.store
+            .subscription(subscription_name!("slow-reader"))
+            .categories(non_empty![category!("jobs")])
+            .lease(interval!(2 s))
+            .on_error(retry(1))
+            .run_pg(SlowReader {
+                recorder: Recorder::new("slow-reader"),
+                pause: Duration::from_secs(8),
+                results: results.clone(),
+            }),
+    );
+    let reached = tokio::time::timeout(Duration::from_secs(60), running.wait_position(1)).await;
+    let results = results.lock().unwrap().clone();
+    assert!(
+        matches!(reached, Ok(Ok(_))),
+        "not checkpointed: {reached:?}; reads: {results:?}"
+    );
+    assert_eq!(results, ["Ok(20000)"]);
+    running.stop().await?;
+    assert_eq!(f.delivered("slow-reader").await?.len(), 1);
 
     f.finish().await
 }

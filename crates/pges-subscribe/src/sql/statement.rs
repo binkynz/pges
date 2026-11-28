@@ -225,7 +225,6 @@ pges_postgres::typed_query! {
             keepalives_idle: i32,
             keepalives_interval: i32,
             keepalives_count: i32,
-            user_timeout: i32,
         },
         row { xact: Option<i64> },
     }
@@ -355,7 +354,14 @@ pges_postgres::typed_query! {
     pub BACKFILL_HOLD, mod backfill_hold {
         name: "backfill/hold",
         files: [sql_file!("backfill/hold.sql")],
-        params<'q> { name: &'q str, lane: i16, from: i64 },
+        params<'q> {
+            name: &'q str,
+            lane: i16,
+            from: i64,
+            keepalives_idle: i32,
+            keepalives_interval: i32,
+            keepalives_count: i32,
+        },
         row { xact: Option<i64> },
     }
 }

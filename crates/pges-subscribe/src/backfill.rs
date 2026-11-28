@@ -761,6 +761,9 @@ impl LaneCtx<'_> {
                     name: self.name,
                     lane: lane_id,
                     from: read::to_i64(from),
+                    keepalives_idle: LANE_KEEPALIVE.idle,
+                    keepalives_interval: LANE_KEEPALIVE.interval,
+                    keepalives_count: LANE_KEEPALIVE.count,
                 })
                 .fetch_optional(&mut *tx)
                 .await;
@@ -784,7 +787,9 @@ impl LaneCtx<'_> {
                 // handler's statements after the rollback committed on their own: a retry could apply them
                 // twice.
                 Ok(()) if !tx.is_in_transaction() => {
-                    handler::HandlerError::Fatal(Box::new(subscription::EndedTransaction))
+                    handler::HandlerError::Fatal(Box::new(subscription::EndedTransaction {
+                        after: None,
+                    }))
                 }
                 Ok(()) => {
                     // sqlx does not see a raw COMMIT or ROLLBACK the handler sent: the checkpoint checks it
@@ -860,6 +865,14 @@ impl LaneCtx<'_> {
         }
     }
 }
+
+/// The TCP keepalives of a lane batch's session: as for a subscription with the default 15 s lease (probes
+/// after 5 s idle, every 2 s, 3 of them).
+const LANE_KEEPALIVE: subscription::Keepalive = subscription::Keepalive {
+    idle: 5,
+    interval: 2,
+    count: 3,
+};
 
 fn is_serialization_failure(error: &sqlx::Error) -> bool {
     error

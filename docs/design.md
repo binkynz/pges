@@ -1127,14 +1127,19 @@ the halt, 43 recovered, 335 after.
     worse than before: a new holder took over after one lease, and only a handler whose rows the zombie
     transaction had locked then blocked (an insert-only projection failed over in 15 s). So the batch's
     transaction sets the session's `tcp_keepalives_idle` (a third of the lease), `tcp_keepalives_interval`
-    (a sixth), `tcp_keepalives_count` (3) and `tcp_user_timeout` (the lease), user-settable and local to the
-    transaction (`set_config(…, true)` in the lock statement, no extra round trip): a vanished client's
-    backend ends within about one lease (5/6 of it, at least 4 s, since keepalives count whole seconds;
-    `tcp_user_timeout` covers data sent and not acknowledged, where keepalives do not probe). Not covered:
-    Unix sockets (ignored, though a local client rarely vanishes without its kernel closing the socket);
-    `tcp_user_timeout` on platforms without `TCP_USER_TIMEOUT` (the server logs and ignores it); a TCP
-    proxy or pooler between client and server, which keeps answering the server's probes (the proxy needs
-    its own timeouts). Not tested end to end: a userspace proxy such as `pges_testing::Proxy` answers the
+    (a sixth) and `tcp_keepalives_count` (3), user-settable and local to the transaction (`set_config(…,
+    true)` in the lock statement, no extra round trip): a vanished client's backend ends within about one
+    lease (5/6 of it, at least 4 s, since keepalives count whole seconds). Its backend is idle in
+    transaction with nothing unacknowledged, which is when keepalives probe; a live client's kernel answers
+    them however slowly the handler reads. Backfill lane locks set the same as for a 15 s lease. Rejected:
+    `tcp_user_timeout` from the lease (the first version of this fix). On Linux it also bounds probing a
+    full receive window, so a healthy handler that streamed a large result and paused longer than the lease
+    lost its connection on every attempt and never completed
+    (`a_handler_reading_slowly_past_the_lease_completes`). Not covered: Unix sockets (ignored, though a
+    local client rarely vanishes without its kernel closing the socket); a vanished host while the backend
+    is blocked sending (data unacknowledged, so no keepalive probes; the server's `tcp_user_timeout` or the
+    kernel's retransmission limit, about 15 min on Linux, apply); a TCP proxy or pooler between client and
+    server, which keeps answering the server's probes (the proxy needs its own timeouts). Not tested end to end: a userspace proxy such as `pges_testing::Proxy` answers the
     probes too, so the test only checks the settings on the holding session. A holder that hangs inside its
     handler, connected, keeps the shard, as its side renewal kept it before. `idle_in_transaction_session_timeout`
     bounds a holder stuck between statements (and a vanished one, over any transport), but the server then
@@ -1176,8 +1181,13 @@ the halt, 43 recovered, 335 after.
     back: it works in an aborted transaction and fails (25P01 or 3B001) once the batch's transaction is
     gone, and then the failure is fatal, keeping the handler's error as its source. The cost: one statement
     on a failure path only, and the handler's statements (and the row lock) run in a subtransaction, which
-    gets its own xid when it writes. That is one subtransaction per batch, far from the 64 that overflow a
-    snapshot's cache. A transaction sqlx ended itself (a failed or dropped savepoint begin of the
+    gets its own xid when it writes, so a writing batch uses two. That is one subtransaction per batch, but
+    with it more than 63 savepoints of the handler's own (that write) overflow the backend's cache of 64
+    subtransaction ids, after which other sessions' snapshots look up `pg_subtrans` (SubtransSLRU) while the
+    batch runs. `pges_batch`
+    is reserved: a handler that rolls back to it or releases it releases the row lock early (fencing keeps
+    exactly once: a takeover makes the checkpoint refuse), and one that releases it makes a later failure
+    fatal. A transaction sqlx ended itself (a failed or dropped savepoint begin of the
     handler's) is fatal too now, for the same reason: the handler's statements after it ran in autocommit.
 - Sequencer polish (2026-11-25):
   - `Status::Halted(Arc<str>)` is set for every error `run()` returns: persisted halts, `RunError::Halted`
