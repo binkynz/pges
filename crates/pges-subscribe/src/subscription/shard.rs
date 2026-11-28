@@ -378,7 +378,8 @@ struct Wake {
 }
 
 /// A shard's waker: resolves on every call of the subscription's waker that resolved since its last call,
-/// and whenever the latest high-water mark is past `known`.
+/// and whenever the latest high-water mark is past `known`. Once the subscription's task is gone it never
+/// resolves.
 struct Fanned {
     woken: watch::Receiver<Wake>,
     seen: u64,
@@ -390,12 +391,18 @@ impl waker::Waker for Fanned {
         known: &high_water::HighWater,
     ) -> Result<high_water::HighWater, waker::WakeError> {
         let seen = self.seen;
-        let wake = self
+        let Ok(wake) = self
             .woken
             .wait_for(|wake| wake.generation > seen || waker::has_passed(&wake.high, known))
             .await
-            .map_err(|_| waker::WakeError::Closed)?
-            .clone();
+            .map(|wake| wake.clone())
+        else {
+            // `fan_out` never ends, so its sender is gone only once `run` was dropped (its task aborted, as in
+            // a crash). Dropping `run` drops the `JoinSet`, which only asks the shards' tasks to stop: one
+            // that is being polled meanwhile finishes that poll. Failing here would show the instance as
+            // recovering from an error while it goes away; waiting lets the task be cancelled.
+            return std::future::pending().await;
+        };
         self.seen = wake.generation;
 
         match wake.error {
@@ -555,5 +562,22 @@ mod tests {
         assert!(waker::Waker::changed(&mut fanned, &known).await.is_err());
         // The same error is not reported twice.
         assert!(waker::Waker::changed(&mut fanned, &known).await.is_ok());
+    }
+
+    /// A shard's task can still be polled after the subscription's task was aborted: it must not report the
+    /// fan-out's channel closing as an error.
+    #[tokio::test]
+    async fn fanned_wakers_wait_once_the_fan_out_is_gone() {
+        let (wakes, woken) = watch::channel(Wake::default());
+        let mut fanned = Fanned { woken, seen: 0 };
+        let known = high_water::HighWater::new(at(5), Vec::new(), None);
+        drop(wakes);
+
+        let waiting = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            waker::Waker::changed(&mut fanned, &known),
+        )
+        .await;
+        assert!(waiting.is_err(), "{waiting:?}");
     }
 }

@@ -369,6 +369,10 @@ connection idle in transaction for 18 minutes, blocking renewals, a heartbeat an
 fixes it (design.md, Decided, sqlx 0.9.1); `Crashable` keeps its own pool because a crash closes
 connections. Both failing seeds
 are saved in `crates/pges-subscribe/tests/shard.proptest-regressions`, so every run replays them first.
+A third seed there caught a crash race: aborting an instance dropped its waker fan-out while a shard's task
+was still being polled, and that shard reported `the waker's source closed` as a recovered error (about one
+run in 20 replayed it). A shard's waker now waits once the fan-out is gone
+(`fanned_wakers_wait_once_the_fan_out_is_gone`).
 
 **Cancellation.** `pges_testing::cancel` drops a future at each of its await points and checks what it left
 behind. `drop_at_every_await(pool, make)` builds a fresh future with `make` and runs it for N = 1, 2, 3, …
