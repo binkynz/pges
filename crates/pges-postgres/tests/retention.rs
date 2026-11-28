@@ -1072,21 +1072,8 @@ async fn prune_log_keeps_the_rows_above_the_coarse_mark() -> Result<()> {
     f.finish().await
 }
 
-/// Truncates `stream` up to `floor` as retention does, raising its floor and then dropping `leaf`, while
-/// `read` waits between reading the stream's head and fetching its first page (held there by a lock on
-/// `commits_jobs`). Returns what `read` returned.
-async fn truncate_during<T: Send + 'static>(
-    f: &Fixture,
-    stream: stream::StreamId,
-    floor: i64,
-    leaf: &str,
-    read: impl Future<Output = T> + Send + 'static,
-) -> Result<T> {
-    let mut tx = f.pool.begin().await?;
-    tx.execute("LOCK TABLE es.commits_jobs IN ACCESS EXCLUSIVE MODE")
-        .await?;
-    let reading = tokio::spawn(read);
-    let mut waiting = false;
+/// Whether a session of the test's database waits for a lock within five seconds.
+async fn lock_waited_for(f: &Fixture) -> Result<bool> {
     for _ in 0..500 {
         let blocked: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM pg_stat_activity
@@ -1095,12 +1082,37 @@ async fn truncate_during<T: Send + 'static>(
         .fetch_one(&f.pool)
         .await?;
         if blocked > 0 {
-            waiting = true;
-            break;
+            return Ok(true);
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(waiting, "the read never waited for its page");
+
+    Ok(false)
+}
+
+/// Truncates `stream` up to `floor` as retention does, raising its floor and then dropping `leaf`, while
+/// `read` waits between reading the stream's head and fetching its first page (held there by a lock on
+/// `commits_jobs`). With `snapshot` (the append of the stream's head and the state there), first saves that
+/// snapshot, for the truncation to rely on. Returns what `read` returned.
+async fn truncate_during<T: Send + 'static>(
+    f: &Fixture,
+    stream: stream::StreamId,
+    floor: i64,
+    leaf: &str,
+    snapshot: Option<(&append::AppendResult, &Job)>,
+    read: impl Future<Output = T> + Send + 'static,
+) -> Result<T> {
+    let mut tx = f.pool.begin().await?;
+    tx.execute("LOCK TABLE es.commits_jobs IN ACCESS EXCLUSIVE MODE")
+        .await?;
+    let reading = tokio::spawn(read);
+    assert!(
+        lock_waited_for(f).await?,
+        "the read never waited for its page"
+    );
+    if let Some((head, state)) = snapshot {
+        save_snapshot(&mut tx, stream, head, state).await?;
+    }
     sqlx::query("UPDATE es.streams SET floor_version = $2 WHERE stream_id = $1")
         .bind(stream.as_uuid())
         .bind(floor)
@@ -1145,13 +1157,9 @@ async fn a_read_that_retention_truncates_midway_fails_as_truncated() -> Result<(
     // A load whose first version is gone.
     let store = f.store.clone();
     let leaf = f.leaf(3).await?;
-    let loaded = truncate_during(
-        &f,
-        job,
-        1,
-        &leaf,
-        async move { store.load::<Job>(job).await },
-    )
+    let loaded = truncate_during(&f, job, 1, &leaf, None, async move {
+        store.load::<Job>(job).await
+    })
     .await?;
     match loaded {
         Err(load::LoadError::Read(read::ReadError::Truncated { floor, .. })) => {
@@ -1163,7 +1171,7 @@ async fn a_read_that_retention_truncates_midway_fails_as_truncated() -> Result<(
     // A read of a stream whose every version is gone.
     let store = f.store.clone();
     let leaf = f.leaf(2).await?;
-    let read = truncate_during(&f, short, 1, &leaf, async move {
+    let read = truncate_during(&f, short, 1, &leaf, None, async move {
         store
             .read_stream::<JobEvent>(short, version::Version::FIRST)
             .try_collect::<Vec<_>>()
@@ -1194,38 +1202,16 @@ async fn snapshot_during(
     tx.execute("LOCK TABLE es.snapshots IN ACCESS EXCLUSIVE MODE")
         .await?;
     let loading = tokio::spawn(load);
-    let mut waiting = false;
-    for _ in 0..500 {
-        let blocked: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_stat_activity
-             WHERE datname = current_database() AND wait_event_type = 'Lock'",
-        )
-        .fetch_one(&f.pool)
-        .await?;
-        if blocked > 0 {
-            waiting = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert!(waiting, "the load never waited for the snapshot");
+    assert!(
+        lock_waited_for(f).await?,
+        "the load never waited for the snapshot"
+    );
 
     let at = f.id_now();
     let appended = f
         .job(stream, head.expected(), at, JobEvent::assigned())
         .await?;
-    sqlx::query(
-        "INSERT INTO es.snapshots (version, stream_id, commit_id, category_id, state_version, format, state)
-         SELECT $2, $1, $3, category_id, 1, 1, $4 FROM es.categories WHERE name = 'jobs'
-         ON CONFLICT (stream_id) DO UPDATE
-         SET version = EXCLUDED.version, commit_id = EXCLUDED.commit_id, state = EXCLUDED.state",
-    )
-    .bind(stream.as_uuid())
-    .bind(appended.last_version().to_i64())
-    .bind(appended.commit_id.as_uuid())
-    .bind(serde_json::to_vec(state)?)
-    .execute(&mut *tx)
-    .await?;
+    save_snapshot(&mut tx, stream, &appended, state).await?;
     if let Some((floor, leaf)) = truncate {
         sqlx::query("UPDATE es.streams SET floor_version = $2 WHERE stream_id = $1")
             .bind(stream.as_uuid())
@@ -1240,6 +1226,29 @@ async fn snapshot_during(
     tx.commit().await?;
 
     Ok(loading.await?)
+}
+
+/// Saves `state` as `stream`'s snapshot at the version and commit of `head`, as `save_snapshot` writes it.
+async fn save_snapshot(
+    tx: &mut sqlx::PgConnection,
+    stream: stream::StreamId,
+    head: &append::AppendResult,
+    state: &Job,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO es.snapshots (version, stream_id, commit_id, category_id, state_version, format, state)
+         SELECT $2, $1, $3, category_id, 1, 1, $4 FROM es.categories WHERE name = 'jobs'
+         ON CONFLICT (stream_id) DO UPDATE
+         SET version = EXCLUDED.version, commit_id = EXCLUDED.commit_id, state = EXCLUDED.state",
+    )
+    .bind(stream.as_uuid())
+    .bind(head.last_version().to_i64())
+    .bind(head.commit_id.as_uuid())
+    .bind(serde_json::to_vec(state)?)
+    .execute(tx)
+    .await?;
+
+    Ok(())
 }
 
 /// A snapshot saved between a `load_snapshotted`'s head read and its snapshot read is above the head's
@@ -1335,6 +1344,159 @@ async fn a_snapshot_saved_during_a_load_of_a_truncated_stream_is_used() -> Resul
             Err(error) => {
                 panic!("load_snapshotted of the stream truncated during the load: {error:?}")
             }
+        }
+
+        f.finish().await
+    })
+    .await?
+}
+
+/// Retention can save a snapshot, raise the floor above where a `load_snapshotted`'s replay starts and drop
+/// those versions after the load read the head and the snapshot, and before its replay fetched them. The load
+/// must start again from the new snapshot, not fail as truncated. Seen in the invariants harness as
+/// `Truncated` from a writer's `load_snapshotted` while retention ran.
+#[tokio::test]
+async fn a_load_that_retention_truncates_during_its_replay_starts_again() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let mut f = Fixture::new().await?;
+        let (stale, fresh) = (stream::StreamId::new_v7(), stream::StreamId::new_v7());
+        let at = f.id_at(3, 2).await?;
+        let created = f
+            .job(
+                stale,
+                version::ExpectedVersion::NoStream,
+                at,
+                JobEvent::created("stale"),
+            )
+            .await?;
+        let loaded = f.store.load_snapshotted::<Job>(stale).await?;
+        f.store.save_snapshot(&loaded).await?;
+        let at = f.id_at(2, 2).await?;
+        let assigned = f
+            .job(stale, created.expected(), at, JobEvent::assigned())
+            .await?;
+        let at = f.id_now();
+        let stale_head = f
+            .job(stale, assigned.expected(), at, JobEvent::assigned())
+            .await?;
+        let at = f.id_at(3, 3).await?;
+        let created = f
+            .job(
+                fresh,
+                version::ExpectedVersion::NoStream,
+                at,
+                JobEvent::created("fresh"),
+            )
+            .await?;
+        let at = f.id_now();
+        let fresh_head = f
+            .job(fresh, created.expected(), at, JobEvent::assigned())
+            .await?;
+
+        // The load starts from the snapshot at version 1. A snapshot at version 3 is saved, and version 2
+        // dropped, before the replay reads it.
+        let store = f.store.clone();
+        let want = Job {
+            titles: vec!["stale".into()],
+            assignments: 2,
+        };
+        let leaf = f.leaf(2).await?;
+        let snapshot = Some((&stale_head, &want));
+        let loaded = truncate_during(&f, stale, 2, &leaf, snapshot, async move {
+            store.load_snapshotted::<Job>(stale).await
+        })
+        .await?;
+        match loaded {
+            Ok(loaded) => {
+                assert_eq!(loaded.version(), Some(v(3)));
+                assert_eq!(loaded.state(), &want);
+            }
+            Err(error) => panic!("load_snapshotted from a snapshot below the new floor: {error:?}"),
+        }
+
+        // The load has no snapshot and replays from the start. A snapshot at version 2 is saved, and
+        // version 1 dropped, before the replay reads it.
+        let store = f.store.clone();
+        let want = Job {
+            titles: vec!["fresh".into()],
+            assignments: 1,
+        };
+        let leaf = f.leaf(3).await?;
+        let snapshot = Some((&fresh_head, &want));
+        let loaded = truncate_during(&f, fresh, 1, &leaf, snapshot, async move {
+            store.load_snapshotted::<Job>(fresh).await
+        })
+        .await?;
+        match loaded {
+            Ok(loaded) => {
+                assert_eq!(loaded.version(), Some(v(2)));
+                assert_eq!(loaded.state(), &want);
+            }
+            Err(error) => panic!("load_snapshotted replaying from the start: {error:?}"),
+        }
+
+        f.finish().await
+    })
+    .await?
+}
+
+/// `delete_stream` deletes the snapshot in the transaction that marks the stream deleted. A deletion that
+/// commits between a `load_snapshotted`'s head read and its snapshot read leaves a truncated stream without
+/// a snapshot: the load fails with `StreamDeleted`, as for a stream deleted before it, not with `Truncated`.
+#[tokio::test]
+async fn a_load_of_a_truncated_stream_deleted_meanwhile_fails_as_deleted() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let mut f = Fixture::new().await?;
+        let job = stream::StreamId::new_v7();
+        let at = f.id_at(3, 2).await?;
+        let created = f
+            .job(
+                job,
+                version::ExpectedVersion::NoStream,
+                at,
+                JobEvent::created("doomed"),
+            )
+            .await?;
+        let at = f.id_now();
+        f.job(job, created.expected(), at, JobEvent::assigned())
+            .await?;
+        let loaded = f.store.load_snapshotted::<Job>(job).await?;
+        f.store.save_snapshot(&loaded).await?;
+        sqlx::query("UPDATE es.streams SET floor_version = 1 WHERE stream_id = $1")
+            .bind(job.as_uuid())
+            .execute(&f.pool)
+            .await?;
+        let leaf = f.leaf(3).await?;
+        f.pool
+            .execute(sqlx::AssertSqlSafe(format!(
+                "ALTER TABLE es.commits_jobs DETACH PARTITION es.{leaf}; DROP TABLE es.{leaf}"
+            )))
+            .await?;
+
+        // Held between its head read and its snapshot read by a lock on `snapshots`, while the stream is
+        // marked deleted and its snapshot deleted, as delete_stream does.
+        let mut tx = f.pool.begin().await?;
+        tx.execute("LOCK TABLE es.snapshots IN ACCESS EXCLUSIVE MODE")
+            .await?;
+        let store = f.store.clone();
+        let loading = tokio::spawn(async move { store.load_snapshotted::<Job>(job).await });
+        assert!(
+            lock_waited_for(&f).await?,
+            "the load never waited for the snapshot"
+        );
+        sqlx::query("UPDATE es.streams SET state = 2, stream_key = NULL WHERE stream_id = $1")
+            .bind(job.as_uuid())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM es.snapshots WHERE stream_id = $1")
+            .bind(job.as_uuid())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        match loading.await? {
+            Err(load::LoadError::Read(read::ReadError::StreamDeleted(id))) => assert_eq!(id, job),
+            other => panic!("expected StreamDeleted, got {other:?}"),
         }
 
         f.finish().await
