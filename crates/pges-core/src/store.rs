@@ -21,6 +21,7 @@ pub const DEFAULT_MAX_TXN_AGE: Duration = Duration::from_secs(3600);
 ///
 /// Names match `^[a-z][a-z0-9_]{0,39}$`, because they are interpolated into SQL unquoted, and are not a
 /// schema PostgreSQL or pges reserves: `pges`, `public`, `information_schema`, or one starting with `pg_`.
+/// For the same reason they are not an SQL keyword that cannot name a schema, such as `select` or `user`.
 ///
 /// Write a literal name with [`store_name!`](crate::store_name), which checks it at compile time. Parse a
 /// name read at run time with [`StoreName::parse`].
@@ -111,6 +112,9 @@ pub enum StoreNameError {
     /// starting with `pg_`.
     #[error("store name is reserved: pges, public, information_schema and pg_* are other schemas")]
     Reserved,
+    /// The name is an SQL keyword that cannot name a schema without quotes, such as `select` or `user`.
+    #[error("store name is a reserved SQL keyword")]
+    Keyword,
 }
 
 /// A [`StoreName`](crate::store::StoreName) from a literal, checked at compile time.
@@ -139,7 +143,7 @@ macro_rules! store_name {
             #[allow(clippy::panic)]
             false => ::core::panic!(
                 "invalid store name: it must match ^[a-z][a-z0-9_]{{0,39}}$ and not be pges, public, \
-                 information_schema or start with pg_"
+                 information_schema, a reserved SQL keyword, or start with pg_"
             ),
         };
 
@@ -171,6 +175,112 @@ impl fmt::Display for StoreId {
 
 const RESERVED: [&str; 3] = ["pges", "public", "information_schema"];
 
+/// PostgreSQL 18's reserved keywords and those that cannot name a type or function (`pg_get_keywords()`
+/// with `catcode` `R` or `T`): neither can name a schema unquoted.
+const KEYWORDS: [&str; 101] = [
+    "all",
+    "analyse",
+    "analyze",
+    "and",
+    "any",
+    "array",
+    "as",
+    "asc",
+    "asymmetric",
+    "authorization",
+    "binary",
+    "both",
+    "case",
+    "cast",
+    "check",
+    "collate",
+    "collation",
+    "column",
+    "concurrently",
+    "constraint",
+    "create",
+    "cross",
+    "current_catalog",
+    "current_date",
+    "current_role",
+    "current_schema",
+    "current_time",
+    "current_timestamp",
+    "current_user",
+    "default",
+    "deferrable",
+    "desc",
+    "distinct",
+    "do",
+    "else",
+    "end",
+    "except",
+    "false",
+    "fetch",
+    "for",
+    "foreign",
+    "freeze",
+    "from",
+    "full",
+    "grant",
+    "group",
+    "having",
+    "ilike",
+    "in",
+    "initially",
+    "inner",
+    "intersect",
+    "into",
+    "is",
+    "isnull",
+    "join",
+    "lateral",
+    "leading",
+    "left",
+    "like",
+    "limit",
+    "localtime",
+    "localtimestamp",
+    "natural",
+    "not",
+    "notnull",
+    "null",
+    "offset",
+    "on",
+    "only",
+    "or",
+    "order",
+    "outer",
+    "overlaps",
+    "placing",
+    "primary",
+    "references",
+    "returning",
+    "right",
+    "select",
+    "session_user",
+    "similar",
+    "some",
+    "symmetric",
+    "system_user",
+    "table",
+    "tablesample",
+    "then",
+    "to",
+    "trailing",
+    "true",
+    "union",
+    "unique",
+    "user",
+    "using",
+    "variadic",
+    "verbose",
+    "when",
+    "where",
+    "window",
+    "with",
+];
+
 pub(crate) const fn validate(name: &str) -> Result<(), StoreNameError> {
     match category::validate_identifier(name) {
         Ok(()) => {}
@@ -195,6 +305,15 @@ pub(crate) const fn validate(name: &str) -> Result<(), StoreNameError> {
         let reserved = RESERVED[i].as_bytes();
         if bytes.len() == reserved.len() && starts_with(bytes, reserved) {
             return Err(StoreNameError::Reserved);
+        }
+        i += 1;
+    }
+
+    let mut i = 0;
+    while i < KEYWORDS.len() {
+        let keyword = KEYWORDS[i].as_bytes();
+        if bytes.len() == keyword.len() && starts_with(bytes, keyword) {
+            return Err(StoreNameError::Keyword);
         }
         i += 1;
     }
@@ -255,6 +374,32 @@ mod tests {
                 Err(StoreNameError::Reserved),
                 "{name}"
             );
+        }
+    }
+
+    /// Store names go into SQL unquoted, so a reserved keyword fails every statement: `CREATE SCHEMA select`
+    /// is a syntax error.
+    #[test]
+    fn rejects_reserved_keywords() {
+        for name in [
+            "select",
+            "user",
+            "table",
+            "order",
+            "analyse",
+            "authorization",
+            "verbose",
+        ] {
+            assert_eq!(StoreName::new(name), Err(StoreNameError::Keyword), "{name}");
+            assert_eq!(
+                StoreName::parse(name),
+                Err(StoreNameError::Keyword),
+                "{name}"
+            );
+        }
+        // Unreserved and column-name keywords are valid schema names.
+        for name in ["action", "data", "name", "between", "values"] {
+            assert!(StoreName::new(name).is_ok(), "{name}");
         }
     }
 

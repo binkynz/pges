@@ -1,4 +1,4 @@
-error[E0080]: evaluation panicked: invalid store name: it must match ^[a-z][a-z0-9_]{0,39}$ and not be pges, public, information_schema or start with pg_
+error[E0080]: evaluation panicked: invalid store name: it must match ^[a-z][a-z0-9_]{0,39}$ and not be pges, public, information_schema, a reserved SQL keyword, or start with pg_
  --> tests/ui/invalid_store_name.rs:3:36
   |
 3 | const RESERVED: store::StoreName = pges_core::store_name!("pg_catalog");
