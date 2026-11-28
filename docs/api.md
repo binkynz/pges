@@ -1519,6 +1519,11 @@ Contract for any source, built in or custom:
   `dedupe_tail` ids of each store, except the log rows above that mark, which stay until the source has
   replayed them (schema.md, Sequencer batch). A source that replays further back than its token needs
   `dedupe_tail` at least as large as that span.
+- A replay delivers the commits it repeats in the order they were delivered before, and before any commit
+  not delivered before. The built-in sources do (the logical source replays in WAL commit order; the outbox
+  source never replays). The sequencer relies on it to keep the rows above the mark deduplicated: once a
+  commit not delivered before arrives, or a replayed row arrives, the rows delivered before it count as
+  replayed. A source that breaks this order is deduplicated only by `dedupe_tail`.
 
 | Source | Feature | How | Needs | Trade-offs |
 |---|---|---|---|---|
