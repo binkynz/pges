@@ -470,6 +470,63 @@ async fn a_dropped_category_registration_leaves_no_transaction_open() -> Result<
     f.finish().await
 }
 
+/// An `append_many` in a unit of work, dropped after it wrote part of its batch, fails the unit of work: its
+/// commit must not keep the streams already written and leave out the rest. The second stream's last commit
+/// id is ahead of the batch's generated one, so the batch writes the first stream, then locks the second and
+/// sends it again with a new id.
+#[tokio::test]
+async fn a_dropped_append_many_in_a_unit_of_work_commits_all_or_nothing() -> Result<()> {
+    let f = Fixture::new().await?;
+    let events = [JobEvent::assigned()];
+
+    for polls in 1.. {
+        let (fresh, ahead) = (stream::StreamId::new_v7(), stream::StreamId::new_v7());
+        f.store
+            .append(
+                ahead,
+                version::ExpectedVersion::NoStream,
+                &[JobEvent::created("a")],
+            )
+            .commit_id(commit_id_ahead(Duration::from_secs(2)))
+            .await?;
+
+        let mut work = f.store.begin().await?;
+        let batch = work
+            .append_many([
+                append::AppendEntry::new(fresh, version::ExpectedVersion::Any, &events),
+                append::AppendEntry::new(ahead, version::ExpectedVersion::Any, &events),
+            ])
+            .into_future();
+        let done = cancel::poll_then_drop(batch, polls).await?;
+        let committed = work.commit().await;
+
+        let mut conn = f.pool.acquire().await?;
+        let fresh_written: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM es.streams WHERE stream_id = $1")
+                .bind(fresh.as_uuid())
+                .fetch_one(&mut *conn)
+                .await?;
+        let ahead_version: i64 =
+            sqlx::query_scalar("SELECT version FROM es.streams WHERE stream_id = $1")
+                .bind(ahead.as_uuid())
+                .fetch_one(&mut *conn)
+                .await?;
+        drop(conn);
+        assert_eq!(
+            fresh_written == 1,
+            ahead_version == 2,
+            "after {polls} polls (commit: {committed:?}), the batch was committed in part: \
+             fresh written {fresh_written}, ahead at version {ahead_version}"
+        );
+        if let Some(result) = done {
+            assert_eq!(result?.len(), 2);
+            committed?;
+            break;
+        }
+    }
+    f.finish().await
+}
+
 fn commit_id_ahead(offset: Duration) -> commit::CommitId {
     let at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap() + offset;
     let ts = uuid::Timestamp::from_unix(uuid::NoContext, at.as_secs(), at.subsec_nanos());

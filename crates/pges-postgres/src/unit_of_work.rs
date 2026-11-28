@@ -17,9 +17,9 @@ use crate::{append, error, sql, store};
 /// its own statements and puts the transaction's previous value back after them.
 ///
 /// After an append fails in a way that aborts or partly writes the transaction (a database error, a
-/// duplicate or skewed commit id, or any [`UnitOfWork::append_many`] failure), or a statement of the caller's
-/// through [`UnitOfWork::conn`] fails, [`UnitOfWork::commit`] rolls back and fails with
-/// [`TransactionError::Aborted`]. PostgreSQL itself would turn that COMMIT into a ROLLBACK and report
+/// duplicate or skewed commit id, or any [`UnitOfWork::append_many`] that fails or is dropped before it
+/// completes), or a statement of the caller's through [`UnitOfWork::conn`] fails, [`UnitOfWork::commit`]
+/// rolls back and fails with [`TransactionError::Aborted`]. PostgreSQL itself would turn that COMMIT into a ROLLBACK and report
 /// success. Conflicts from [`UnitOfWork::append`] write nothing and leave the unit of work usable.
 ///
 /// Savepoints on [`UnitOfWork::conn`] (`conn.begin()`) are allowed, but a savepoint begin that fails (on an
