@@ -1738,7 +1738,11 @@ and a level-triggered waker given `H` would fire again at once.
 - `PollWaker` reads at once, then waits `interval`, doubling up to `max_interval`, and resets after it fires.
 - `waker::recheck::Recheck` (no feature) is a plain timer: `Recheck::every(interval)`, `Default` 500 ms. A
   subscription without a waker uses `Recheck::default()`. It is the only way to set the recheck interval,
-  so the interval cannot be set and then ignored next to another waker.
+  so the interval cannot be set and then ignored next to another waker. It keeps its deadline across calls
+  dropped before it fires (a lease renewal, or another waker in `Wakers` firing first), so it fires about once
+  per interval even when renewals or a push waker come more often: within `Wakers`, at most one extra log
+  read per interval. A call made after the deadline passed (after a batch that took longer than the interval)
+  returns at once.
 - `NotifyWaker` (`wake-notify`) listens on `pges_<store schema name>` through sqlx's `PgListener` on one
   connection, opened on the first call, of the store's pool (or of the pool given to `with_separate_pool`, for
   example when the store's pool sits behind a pooler in transaction mode, where LISTEN does not work). It
