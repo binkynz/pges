@@ -243,7 +243,7 @@
 //!   parent context (`trace_parent()`). It turns on the `otel` features of `pges-core`, `pges-postgres` and,
 //!   with `subscribe`, `pges-subscribe`.
 //!
-//! [`core`] and [`postgres`] are always available. Applications also depend on `sqlx` 0.8 for pools and
+//! [`core`] and [`postgres`] are always available. Applications also depend on `sqlx` 0.9 for pools and
 //! connections.
 //!
 //! # The derive's path to `pges-core`
