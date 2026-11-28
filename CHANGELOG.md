@@ -17,8 +17,8 @@ The first release: `pges`, `pges-core`, `pges-derive`, `pges-postgres`, `pges-su
   `Store::open` or the `migrate` functions. Appends to a stream with an expected version, in one statement;
   `append_many` for several streams in one transaction; `UnitOfWork` for appends alongside the caller's own
   statements. Crate-generated, time-ordered commit ids make a retried append idempotent. A unit of work
-  whose `append_many` failed or was dropped before it completed (it may have written part of its batch)
-  refuses to commit, with `TransactionError::Aborted`.
+  whose `append_many` failed or was dropped before it completed (it may have written part of its batch),
+  or whose `append` was dropped before it completed, refuses to commit, with `TransactionError::Aborted`.
 - **Reads and aggregates.** Stream reads, `load` of an `Aggregate`, snapshots (`load_snapshotted`,
   `save_snapshot`), stream deletion.
 - **Events** (`pges-core`, `pges-derive`). `#[derive(Event)]` gives each variant a stable type name and a

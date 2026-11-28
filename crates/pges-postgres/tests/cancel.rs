@@ -527,6 +527,89 @@ async fn a_dropped_append_many_in_a_unit_of_work_commits_all_or_nothing() -> Res
     f.finish().await
 }
 
+/// An append in a unit of work, dropped while the server runs its statement, which then raises (a duplicate
+/// commit id), leaves that error unread on the connection, and sqlx returns it at the next statement. The
+/// unit of work counts as failed while the append runs, so its commit rolls back and fails with `Aborted`,
+/// not with that stale error.
+///
+/// Another transaction holds the same commit id uncommitted, so the append waits on it, and is dropped while
+/// it waits; that transaction then commits, and the append's statement raises.
+#[tokio::test]
+async fn a_unit_of_work_append_dropped_before_it_raised_fails_with_aborted() -> Result<()> {
+    let f = Fixture::new().await?;
+    let pool = f.db.pool().await?;
+    let store =
+        store::Store::open(pool.clone(), store::StoreConfig::new(common::STORE_NAME)).await?;
+    let mut side = f.db.connect().await?;
+    let (taken, first, second) = (
+        stream::StreamId::new_v7(),
+        stream::StreamId::new_v7(),
+        stream::StreamId::new_v7(),
+    );
+    let created = [JobEvent::created("a")];
+    let none = version::ExpectedVersion::NoStream;
+    let commit_id = commit::CommitId::generate();
+
+    let mut holder = store.begin().await?;
+    holder
+        .append(taken, none, &created)
+        .commit_id(commit_id)
+        .await?;
+    let mut uow = store.begin().await?;
+    uow.append(first, none, &created).await?;
+    {
+        let append = uow
+            .append(second, none, &created)
+            .commit_id(commit_id)
+            .into_future();
+        let completed = tokio::time::timeout(Duration::from_secs(1), append).await;
+        assert!(completed.is_err(), "the append did not wait for the holder");
+    }
+    wait_until_activity(&mut side, "wait_event_type = 'Lock'").await?;
+    holder.commit().await?;
+    wait_until_activity(&mut side, "state = 'idle in transaction (aborted)'").await?;
+
+    let error = uow.commit().await.unwrap_err();
+    assert!(
+        matches!(error, unit_of_work::TransactionError::Aborted),
+        "{error:?}"
+    );
+    let ids = [first.as_uuid(), second.as_uuid()];
+    let written: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM es.streams WHERE stream_id = ANY($1)")
+            .bind(&ids[..])
+            .fetch_one(&mut side)
+            .await?;
+    assert_eq!(written, 0, "the failed unit of work wrote nothing");
+
+    side.close().await?;
+    pool.close().await;
+    f.finish().await
+}
+
+/// Waits until another connection to the database matches `condition` in `pg_stat_activity`.
+async fn wait_until_activity(conn: &mut PgConnection, condition: &str) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let query = format!(
+        "SELECT EXISTS (SELECT FROM pg_stat_activity
+                        WHERE datname = current_database() AND pid <> pg_backend_pid() AND {condition})"
+    );
+
+    loop {
+        let found: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(query.as_str()))
+            .fetch_one(&mut *conn)
+            .await?;
+        if found {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "no connection with {condition}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 fn commit_id_ahead(offset: Duration) -> commit::CommitId {
     let at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap() + offset;
     let ts = uuid::Timestamp::from_unix(uuid::NoContext, at.as_secs(), at.subsec_nanos());

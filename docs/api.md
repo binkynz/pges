@@ -568,7 +568,9 @@ set `append_routing` to `AppendRouting::Streams`.
   unusable. `commit()` then rolls back and returns `TransactionError::Aborted` (also when
   that rollback fails, for example on a lost connection; `Aborted` carries no source), because
   PostgreSQL would silently turn the COMMIT into a ROLLBACK. Conflicts from a single append write nothing
-  and leave the unit of work usable. A failed statement of the caller's through `uow.conn()` also makes
+  and leave the unit of work usable. A single append dropped before it completes also makes `commit()`
+  return `Aborted`: its statement may still raise, and sqlx would return that error at the next statement
+  (or the statement may have written the commit). A failed statement of the caller's through `uow.conn()` also makes
   `commit()` roll back and return `Aborted`: once `conn()` was called (and always in a wrapped unit of
   work's `finish()`), it first runs `SELECT 1` and treats SQLSTATE 25P02 as aborted. sqlx does not expose
   the transaction status the server reports, so that costs one round trip; a unit of work that only appends
