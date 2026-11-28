@@ -514,7 +514,8 @@ the saved snapshot. Appends lock the row `FOR NO KEY UPDATE`, which does not con
 - The save names the stream's partition of `streams` (`{stream_table}`), as a routed append does, whenever
   the store knows its partitions, also when the appends fall back to `streams` because of the statement
   cache: it runs unprepared (sqlx `persistent(false)`), so one statement per partition costs no cache
-  entries, only a parse and a plan per save. It takes 6 relation locks (`snapshots`, its partition, their
+  entries, only a parse and a plan per save, and two round trips instead of one (sqlx sends Parse and
+  Describe, then Bind and Execute). It takes 6 relation locks (`snapshots`, its partition, their
   keys, the stream's partition of `streams` and its key) under `force_generic_plan` too. A store that does
   not route goes through `streams`: an unprepared statement gets a custom plan, which prunes to the stream's
   partition, except under `force_generic_plan`, where it locks every partition (64 at 64).

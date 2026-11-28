@@ -4,7 +4,8 @@
 -- A save from a load made before delete_stream would otherwise store the deleted state again. The stream's
 -- row is locked FOR KEY SHARE, which conflicts with the FOR UPDATE lock delete_stream takes first: a deletion
 -- in progress makes the save wait and then see the stream deleted, and a save in progress makes the deletion
--- wait, then delete its snapshot. Appends lock the row FOR NO KEY UPDATE and do not wait for it.
+-- wait, then delete its snapshot. Appends lock the row FOR NO KEY UPDATE and do not wait for it; only the
+-- FOR UPDATE locks of a single append's retry and append_many's locked step wait for a save in progress.
 --
 -- {stream_table} is the hash partition of streams that holds $2 when the store routes appends, so no plan has
 -- partitions to prune: through streams, a generic plan locks every partition. The save runs unprepared, so
