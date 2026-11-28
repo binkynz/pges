@@ -853,7 +853,8 @@ stream partitions), `create_store(conn, &StoreName, &StoreDefinition)`,
 `pges-subscribe`. The entry point is the extension trait `subscription::StoreExt`, which gives `Store` a
 `subscription(name)` and a `backfill(name, until)` method; `subscription::Builder::new(&store, name)` and
 `backfill::Builder::new(&store, name, until)` are the same. Through the facade it is
-`pges::subscribe::subscription::StoreExt`.
+`pges::subscribe::subscription::StoreExt`. It is sealed (implemented for `Store` only), so it can gain
+methods in a minor version.
 
 ```rust
 use pges_core::{category, interval, non_empty};

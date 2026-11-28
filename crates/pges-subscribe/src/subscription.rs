@@ -24,8 +24,9 @@ mod shard;
 
 /// Starts subscriptions and backfills from a [`store::Store`]:
 /// `store.subscription(subscription_name!("jobs-board.v3"))`,
-/// `store.backfill(subscription_name!("jobs-board.v3.assignee"), until)`.
-pub trait StoreExt {
+/// `store.backfill(subscription_name!("jobs-board.v3.assignee"), until)`. Sealed: implemented for
+/// [`store::Store`] only.
+pub trait StoreExt: sealed::Store {
     /// A subscription named `name`, to configure and run. See [`Builder`].
     fn subscription(&self, name: SubscriptionName) -> Builder<NoScope>;
 
@@ -271,6 +272,10 @@ mod sealed {
 
     impl Sealed for super::Listed {}
     impl Sealed for super::AllCategories {}
+
+    pub trait Store {}
+
+    impl Store for super::store::Store {}
 }
 
 /// Configures a subscription. Choose its categories first ([`Builder::category`], [`Builder::categories_of`],
