@@ -376,6 +376,32 @@ async fn slot_errors_carry_sqlstate() -> Result<()> {
     f.finish().await
 }
 
+/// PostgreSQL allows slot names that start with a digit, and so does `SlotName`; unquoted, the replication
+/// command scanner reads the leading digits as a number and the command is a syntax error.
+#[tokio::test]
+async fn slot_names_starting_with_a_digit_work_in_every_command() -> Result<()> {
+    let mut f = Fixture::new().await?;
+    f.slot = name::SlotName::new(format!("0_{}", f.db.name()))?;
+    let mut connection = f.replication().await?;
+    connection
+        .create_slot(&f.slot, connection::Failover::Disabled)
+        .await?;
+    connection
+        .alter_slot_failover(&f.slot, connection::Failover::Enabled)
+        .await?;
+
+    f.append(&mut 0).await?;
+    let mut stream = connection.start(&f.start_options()).await?;
+    read_until_commits(&mut stream, 1).await?;
+    let mut connection = stream.stop().await?;
+
+    connection
+        .drop_slot(&f.slot, connection::DropWait::NoWait)
+        .await?;
+    connection.close().await?;
+    f.finish().await
+}
+
 #[tokio::test]
 async fn alter_slot_failover_turns_it_on_and_off() -> Result<()> {
     let mut f = Fixture::new().await?;
