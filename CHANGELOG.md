@@ -45,7 +45,12 @@ The first release: `pges`, `pges-core`, `pges-derive`, `pges-postgres`, `pges-su
   returns as an `Arc<RunError>`.
 - **Subscriptions** (`pges-subscribe`). Ordered reads over listed categories or the whole store, with a
   plain integer cursor. `run_pg` delivers exactly once inside the projection's transaction; `run` at least
-  once. Leases and fencing, sharded subscriptions, replica reads with fallback, backfills. Wakers: gRPC
+  once. A `run_pg` batch's transaction locks its subscription's row before the handler runs, and the lock is
+  the lease for the batch, so `run_pg` needs one store connection. `PgHandler::isolation()` picks the
+  transaction's level (`handler::Isolation::{Default, RepeatableRead, Serializable}`, applied in the
+  `BEGIN`; backfills too); a handler cannot `SET TRANSACTION` itself. A handler that ends the batch's
+  transaction with a raw `COMMIT` or `ROLLBACK` moves no cursor and fails the run (a fatal
+  `HandlerFailed`). Leases and fencing, sharded subscriptions, replica reads with fallback, backfills. Wakers: gRPC
   (default), in-process, `LISTEN/NOTIFY` and poll.
 - **Logical replication client** (`pges-replication`): replication connections, the pgoutput subset the
   sequencer needs, standby status, optional TLS through rustls.

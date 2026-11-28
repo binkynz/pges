@@ -228,8 +228,8 @@ pges_postgres::typed_query! {
 }
 
 pges_postgres::typed_query! {
-    /// Moves a shard's cursor at the end of a `run_pg` batch and renews its lease, fenced, if it runs in the
-    /// batch's transaction.
+    /// Moves a shard's cursor at the end of a `run_pg` batch and renews its lease, fenced, if the cursor is
+    /// still at `from` and it runs in the batch's transaction.
     pub CHECKPOINT_HELD, mod checkpoint_held {
         name: "subscription/checkpoint_held",
         files: [sql_file!("subscription/checkpoint_held.sql")],
@@ -240,6 +240,7 @@ pges_postgres::typed_query! {
             fence: i64,
             xact: i64,
             lease: PgInterval,
+            from: i64,
         },
         row { in_batch: Option<bool>, moved: Option<bool> },
     }

@@ -1093,13 +1093,15 @@ the halt, 43 recovered, 335 after.
   - In `run_pg`, an ERROR the server returns for the checkpoint or the COMMIT (a deferred constraint, a
     serialization failure) is the handler's failure. It certainly rolled the batch back, so it follows the
     `RetryPolicy` instead of being retried for good as a database error. It is `Transient`, not classified
-    like `HandlerError::from(sqlx::Error)`: a lock or statement timeout (55P03, 57014, likelier now that the
-    checkpoint waits on a lost COMMIT's row lock) or a read-only transaction during a failover (25006) is no
+    like `HandlerError::from(sqlx::Error)`: a lock or statement timeout (55P03, 57014) or a read-only
+    transaction during a failover (25006) is no
     fault of the batch and would otherwise stop the subscription, while the empty-advance checkpoint retries
     the same errors. Class 23 (integrity) and 22 (data exception), which fail every attempt the same way,
     are `Fatal`. A FATAL error or a lost connection may hide a commit and stays a database error, so the
-    stored cursor is read again. (2026-11-28; the side renewal that made a REPEATABLE READ handler's
-    checkpoint fail with 40001 is gone, see `run_pg` holds the subscription row, below.)
+    stored cursor is read again. The lock on the subscription's row that begins the batch classifies its
+    errors the same way. (2026-11-28; the side renewal that made a REPEATABLE READ handler's checkpoint fail
+    with 40001 is gone, see `run_pg` holds the subscription row, below, so a serialization failure now comes
+    from the handler's own tables, mostly at the COMMIT.)
   - Fatal errors release the lease, so a standby takes over at once (and probably meets the same error).
   - `Start` applies only when the row is created and on redefine. Empty advances (a cut with no events) are
     checkpointed in autocommit without calling the handler.
@@ -1126,7 +1128,11 @@ the halt, 43 recovered, 335 after.
     its side renewal kept it before.
   - Lock waits: acquire never waits (SKIP LOCKED). Redefine waits for the running batch, then bumps the fence.
     A dropped renewal from before the batch can still be on the server when the lock runs; READ COMMITTED
-    waits for it, the higher levels fail once with 40001 and retry.
+    waits for it, the higher levels fail once with 40001 and retry. A lost COMMIT of an earlier batch still
+    in flight is met the same way. Under READ COMMITTED the lock (fenced, not checking the cursor) then
+    takes the moved row, and the checkpoint's compare-and-set on the cursor (`position = <the cursor the
+    instance holds>`, as in the other checkpoints) finds it moved, so the stale batch rolls back instead of
+    applying twice.
   - Performance: one more statement per batch (the lock, a primary-key lookup; it takes the lock the
     checkpoint's UPDATE took anyway), and no side renewals or second connection: `run_pg` needs one store
     connection, not two. The checkpoint always writes `lease_until` (same row version as the cursor).

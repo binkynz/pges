@@ -1204,9 +1204,10 @@ fenced and with the crate-version check of the renewal
 was lost: the batch is rolled back before the handler runs. Then the handler runs, and the checkpoint moves
 the cursor and renews the lease from `clock_timestamp()` in the same transaction
 (`crates/pges-subscribe/sql/subscription/checkpoint_held.sql`), then it commits. `run` runs its checkpoint in
-autocommit after the handler. It is fenced and moves the cursor only from where the instance holds it: 0 rows
-means the lease was lost or the stored cursor moved, and the instance reads the stored cursor again to tell
-which (`crates/pges-subscribe/sql/subscription/checkpoint.sql`). When less than half the lease is left, the
+autocommit after the handler (`crates/pges-subscribe/sql/subscription/checkpoint.sql`). Each checkpoint is
+fenced and moves the cursor only from where the instance holds it: 0 rows means the lease was lost or the
+stored cursor moved, `run_pg` rolls the batch back, and the instance reads the stored cursor again to tell
+which. When less than half the lease is left, the
 checkpoint also renews it (`crates/pges-subscribe/sql/subscription/checkpoint_renew.sql`), which is also
 refused once a migration dropped support for the crate (Migrations). The stored cursor then has not moved and
 the fence is in place, so a refused checkpoint that finds both where the instance holds them ends the term as
@@ -1230,7 +1231,9 @@ After any retried error (database or waker) the subscriber reads the stored curs
 (`crates/pges-subscribe/sql/subscription/cursor.sql`), because a COMMIT whose reply was lost may have moved
 it. No row means the fence moved on, and the instance stands down. Such a COMMIT can also become visible only
 after that read (the client saw the error while the server still finished it); the next checkpoint then finds
-the cursor moved, waiting on the COMMIT's row lock if it is still in flight, and the batch rolls back.
+the cursor moved, and the batch rolls back. If the COMMIT is still in flight, `run`'s checkpoint waits on its
+row lock, and `run_pg`'s batch waits at its lock on the row (`hold.sql` only checks the fence, so it locks
+the moved row), runs the handler, and its checkpoint finds the cursor moved.
 
 An instance of a sharded subscription records itself in `subscription_members` every `min(acquire_interval,
 lease / 2)` and counts the live instances, itself included
