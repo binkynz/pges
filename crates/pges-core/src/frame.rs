@@ -186,8 +186,8 @@ fn decode_v1(payload: &[u8], event_count: u16) -> Result<Frame<'_>, FrameError> 
 
     let mut events = Vec::with_capacity(usize::from(event_count));
     for _ in 0..event_count {
-        let type_id = read_varint(&mut rest)?;
-        let schema_version = read_varint(&mut rest)?;
+        let type_id = read_varint(&mut rest, "event_type_id")?;
+        let schema_version = read_varint(&mut rest, "schema_version")?;
         let data = take(&mut rest, "data_len")?;
         events.push(FrameEvent {
             type_id: EventTypeId(u32::try_from(type_id).map_err(|_| FrameError::OutOfRange {
@@ -214,17 +214,20 @@ fn write_varint(out: &mut Vec<u8>, value: usize) {
     prost::encoding::encode_varint(value as u64, out);
 }
 
-fn read_varint(rest: &mut &[u8]) -> Result<u64, FrameError> {
-    if rest.is_empty() {
+/// Reads a varint: `Truncated` if the payload ends inside it, `OutOfRange` if it does not fit a u64.
+fn read_varint(rest: &mut &[u8], field: &'static str) -> Result<u64, FrameError> {
+    // A varint is at most 10 bytes; it ends at the first byte without the continuation bit.
+    if rest.iter().take(10).all(|byte| byte & 0x80 != 0) && rest.len() < 10 {
         return Err(FrameError::Truncated);
     }
 
-    prost::encoding::decode_varint(rest).map_err(|_| FrameError::Truncated)
+    prost::encoding::decode_varint(rest).map_err(|_| FrameError::OutOfRange { field })
 }
 
 /// Reads a varint length and then that many bytes.
 fn take<'a>(rest: &mut &'a [u8], field: &'static str) -> Result<&'a [u8], FrameError> {
-    let len = usize::try_from(read_varint(rest)?).map_err(|_| FrameError::OutOfRange { field })?;
+    let len =
+        usize::try_from(read_varint(rest, field)?).map_err(|_| FrameError::OutOfRange { field })?;
     if rest.remaining() < len {
         return Err(FrameError::Truncated);
     }
@@ -323,6 +326,41 @@ mod tests {
             Err(FrameError::OutOfRange {
                 field: "schema_version"
             })
+        ));
+    }
+
+    #[test]
+    fn a_varint_that_overflows_is_out_of_range() {
+        // Eleven continuation bytes: no u64 fits, however many bytes follow.
+        let mut payload = vec![0xff; 11];
+        payload.push(0);
+
+        assert!(matches!(
+            decode(Format::V1, &payload, 1),
+            Err(FrameError::OutOfRange {
+                field: "metadata_len"
+            })
+        ));
+
+        // Ten bytes whose last sets bits above 64.
+        let mut payload = vec![0, 1];
+        payload.extend_from_slice(&[0xff; 9]);
+        payload.push(0x7f);
+        payload.extend_from_slice(&[1, b'x']);
+
+        assert!(matches!(
+            decode(Format::V1, &payload, 1),
+            Err(FrameError::OutOfRange {
+                field: "schema_version"
+            })
+        ));
+    }
+
+    #[test]
+    fn a_varint_cut_short_is_truncated() {
+        assert!(matches!(
+            decode(Format::V1, &[0, 1, 0x80], 1),
+            Err(FrameError::Truncated)
         ));
     }
 
