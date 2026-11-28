@@ -1335,6 +1335,10 @@ the halt, 43 recovered, 335 after.
   - Create runs once per name (`NOT EXISTS`, no `ON CONFLICT`); shard 0 is in every definition, so two
     concurrent creates conflict as a whole.
   - The waker is shared through one fan-out task per instance, which keeps the level-triggered contract.
+    The fan-out never ends, so its channel closes only when the instance's task is dropped (aborted, as
+    in a crash). A shard's task can still finish a poll then, since dropping a `JoinSet` only asks its tasks
+    to stop; a shard's waker waits instead of failing with `WakeError::Closed`, or the instance would show
+    `Recovering` while it goes away.
   - Backfill progress lives in a `backfills` table, one row per lane, not in `subscriptions`: lanes need
     several cursors under one fixed definition, and `subscriptions` would share the live subscriptions'
     namespace and lease model. Per-stream rows would mean millions of rows.
