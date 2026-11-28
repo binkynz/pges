@@ -1144,7 +1144,11 @@ cursors twice.
 after the handler. It is fenced and moves the cursor only from where the instance holds it: 0 rows means the
 lease was lost or the stored cursor moved, `run_pg` rolls the batch back, and the instance reads the stored
 cursor again to tell which (`crates/pges-subscribe/sql/subscription/checkpoint.sql`). When less than half the
-lease is left, the checkpoint also renews it (`crates/pges-subscribe/sql/subscription/checkpoint_renew.sql`).
+lease is left, the checkpoint also renews it (`crates/pges-subscribe/sql/subscription/checkpoint_renew.sql`),
+which is also refused once a migration dropped support for the crate (Migrations). The stored cursor then has
+not moved and the fence is in place, so a refused checkpoint that finds both where the instance holds them
+ends the term as a lost lease, which checks the scopes; reading on from the same cursor would read the same
+page and be refused again, forever. This holds for an empty page that only moves the cursor as well.
 
 While caught up and idle, while a handler runs and while a failed batch waits for its retry (in autocommit, on
 another pool connection), the instance renews its lease (`crates/pges-subscribe/sql/subscription/renew.sql`),
