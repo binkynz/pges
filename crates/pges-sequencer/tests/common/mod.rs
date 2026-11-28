@@ -355,7 +355,7 @@ pub fn fast() -> sequencer::SequencerConfig {
     let mut config = sequencer::SequencerConfig::default();
     config.lease = sequencer::Lease::with_renew(interval!(800 ms), interval!(200 ms)).unwrap();
     config.acquire_interval = interval!(50 ms);
-    config.token_interval = Duration::from_millis(100);
+    config.token_interval = sequencer::TokenInterval::Every(interval!(100 ms));
     config.retry_interval = interval!(50 ms);
     config
 }

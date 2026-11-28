@@ -165,8 +165,8 @@ pub struct SequencerConfig {
     /// How often a standby tries to acquire the lease. Default 1 s.
     pub acquire_interval: interval::Interval,
     /// How often the resume token and the coarse high-water marks are stored. A restart replays at most
-    /// about this much. Default 1 s; zero stores them with every batch.
-    pub token_interval: Duration,
+    /// about this much. Default [`TokenInterval::Every`] 1 s.
+    pub token_interval: TokenInterval,
     /// Pause before retrying after an error. Default 1 s.
     pub retry_interval: interval::Interval,
     /// How many ids of each store's commits the dedupe window keeps beyond those sequenced since the last
@@ -188,13 +188,41 @@ impl Default for SequencerConfig {
             batch_size: NonZeroUsize::new(1000).unwrap_or(NonZeroUsize::MIN),
             lease: Lease::DEFAULT,
             acquire_interval: interval!(1 s),
-            token_interval: Duration::from_secs(1),
+            token_interval: TokenInterval::default(),
             retry_interval: interval!(1 s),
             dedupe_tail: 1024,
             leader: None,
             #[cfg(feature = "watch-notify")]
             notify: Notify::Enabled,
         }
+    }
+}
+
+/// How often a [`Sequencer`] stores the source's resume token and the coarse high-water marks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum TokenInterval {
+    /// With every batch: a restart replays nothing already sequenced, at the cost of a write per batch.
+    EveryBatch,
+    /// Once this long has passed since the last store, in the next batch or alone when idle. A restart
+    /// replays at most about this much.
+    Every(interval::Interval),
+}
+
+impl TokenInterval {
+    /// How long after the last store the next is due: zero for [`TokenInterval::EveryBatch`].
+    fn period(self) -> Duration {
+        match self {
+            Self::EveryBatch => Duration::ZERO,
+            Self::Every(interval) => interval.get(),
+        }
+    }
+}
+
+impl Default for TokenInterval {
+    /// Every second.
+    fn default() -> Self {
+        Self::Every(interval!(1 s))
     }
 }
 
@@ -703,7 +731,11 @@ async fn sequence<S: source::Source>(
         // A token interval too long for an `Instant` never comes due.
         let persist_at = leader
             .is_dirty()
-            .then(|| leader.persisted_at.checked_add(ctx.config.token_interval))
+            .then(|| {
+                leader
+                    .persisted_at
+                    .checked_add(ctx.config.token_interval.period())
+            })
             .flatten();
         let wake = tokio::select! {
             biased;
@@ -784,8 +816,8 @@ async fn batch<S: source::Source>(
         let touched = leader.logs.write(&mut tx, &batch.commits).await?;
         leader.latest = Some(batch.token);
 
-        let persist_now =
-            leader.is_dirty() && leader.persisted_at.elapsed() >= ctx.config.token_interval;
+        let persist_now = leader.is_dirty()
+            && leader.persisted_at.elapsed() >= ctx.config.token_interval.period();
         if persist_now && !store_token(kind, fence, &mut tx, leader).await? {
             tx.rollback().await?;
             return Ok(None);

@@ -1062,8 +1062,8 @@ The resume token and the high-water marks are not written per batch:
   commit_ts)` in each batch transaction; on restart, read `pg_replication_origin_progress($slot, true)`. The
   token then commits atomically with the log rows. Needs the origin functions granted to the sequencer role,
   which some managed services do not allow.
-- **Token, option (b): coarse** (built; the default). Once `token_interval` (default 1 s; zero means every
-  batch) has passed since the last stored token, in the batch transaction:
+- **Token, option (b): coarse** (built; the default). Once `token_interval` (default 1 s;
+  `TokenInterval::EveryBatch` stores it with every batch) has passed since the last stored token, in the batch transaction:
   `crates/pges-sequencer/sql/transaction/synchronous_commit.sql` (the source confirms the slot once this
   commits; flushing it also flushes every earlier batch), `crates/pges-sequencer/sql/lease/store_token.sql` (0
   rows: fenced, roll back), then, per store whose marks moved,

@@ -25,6 +25,7 @@ use sqlx::{Executor, PgConnection, PgPool};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+use pges_core::interval;
 use pges_sequencer::{sequencer, source};
 
 use common::{Fixture, Kind, Load, Running};
@@ -74,7 +75,7 @@ async fn logical_killed_before_the_log_commit() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn logical_killed_between_the_log_commit_and_the_ack() -> Result<()> {
     let mut case = Case::new(Point::BeforeAck, 3, Takeover::Restart);
-    case.token_interval = Duration::ZERO;
+    case.token_interval = sequencer::TokenInterval::EveryBatch;
     crash_case(Kind::Logical, case).await
 }
 
@@ -94,7 +95,7 @@ async fn logical_killed_between_the_ack_and_the_next_batch() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn logical_killed_before_the_log_commit_replays_from_an_old_token() -> Result<()> {
     let mut case = Case::new(Point::BeforeCommit, 5, Takeover::Restart);
-    case.token_interval = Duration::from_secs(3600);
+    case.token_interval = sequencer::TokenInterval::Every(interval!(1 h));
     crash_case(Kind::Logical, case).await
 }
 
@@ -108,9 +109,9 @@ fn case() -> impl Strategy<Value = Case> {
         1..5_usize,
         prop_oneof![Just(Takeover::Restart), Just(Takeover::Standby)],
         prop_oneof![
-            Just(Duration::ZERO),
-            Just(Duration::from_millis(30)),
-            Just(Duration::from_secs(3600)),
+            Just(sequencer::TokenInterval::EveryBatch),
+            Just(sequencer::TokenInterval::Every(interval!(30 ms))),
+            Just(sequencer::TokenInterval::Every(interval!(1 h))),
         ],
         1..8_usize,
     )
@@ -118,8 +119,10 @@ fn case() -> impl Strategy<Value = Case> {
             let mut case = Case::new(point, at, takeover);
             // Without a stored token nothing is acked, so an ack point would never be reached.
             case.token_interval = match point {
-                Point::BeforeAck | Point::AfterAck if token_interval > Duration::from_secs(1) => {
-                    Duration::from_millis(30)
+                Point::BeforeAck | Point::AfterAck
+                    if token_interval == sequencer::TokenInterval::Every(interval!(1 h)) =>
+                {
+                    sequencer::TokenInterval::Every(interval!(30 ms))
                 }
                 _ => token_interval,
             };
@@ -175,7 +178,7 @@ struct Case {
     /// Which occurrence of the point stops the sequencer, from 1.
     at: usize,
     takeover: Takeover,
-    token_interval: Duration,
+    token_interval: sequencer::TokenInterval,
     batch_size: NonZeroUsize,
 }
 
@@ -185,7 +188,7 @@ impl Case {
             point,
             at,
             takeover,
-            token_interval: Duration::from_millis(30),
+            token_interval: sequencer::TokenInterval::Every(interval!(30 ms)),
             batch_size: NonZeroUsize::new(4).unwrap(),
         }
     }

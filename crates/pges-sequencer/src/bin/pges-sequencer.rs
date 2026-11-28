@@ -191,7 +191,7 @@ struct Args {
     /// How often the resume token and the coarse high-water marks are stored; 0s stores them with every
     /// batch.
     #[arg(long, env = "PGES_TOKEN_INTERVAL", default_value = "1s", value_parser = token_interval)]
-    token_interval: Duration,
+    token_interval: sequencer::TokenInterval,
 
     /// Pause before retrying after an error.
     #[arg(long, env = "PGES_RETRY_INTERVAL", default_value = "1s", value_parser = interval_arg)]
@@ -1004,14 +1004,17 @@ fn interval_arg(text: &str) -> Result<interval::Interval, String> {
     interval::Interval::try_from(duration).map_err(|error| format!("{text:?}: {error}"))
 }
 
-/// A [`duration`] from 0 to 30 days.
-fn token_interval(text: &str) -> Result<Duration, String> {
+/// A [`duration`] from 1 ms to 30 days, or zero for every batch.
+fn token_interval(text: &str) -> Result<sequencer::TokenInterval, String> {
     let duration = duration(text)?;
-    if duration > interval::Interval::MAX.get() {
-        return Err(format!("{text:?} is longer than 30 days"));
+    if duration.is_zero() {
+        return Ok(sequencer::TokenInterval::EveryBatch);
     }
 
-    Ok(duration)
+    let every =
+        interval::Interval::try_from(duration).map_err(|error| format!("{text:?}: {error}"))?;
+
+    Ok(sequencer::TokenInterval::Every(every))
 }
 
 /// `0.0.0.0:50051`, `[::1]:50051` or `localhost:50051`: a socket address, or a host name and a port.
@@ -1101,7 +1104,7 @@ mod tests {
                 .unwrap()
                 .sequencer
                 .token_interval,
-            Duration::ZERO
+            sequencer::TokenInterval::EveryBatch
         );
     }
 

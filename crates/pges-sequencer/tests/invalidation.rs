@@ -79,7 +79,7 @@ async fn invalidate(container: &ContainerAsync<Postgres>) -> Result<()> {
 
     // The token is never stored, so the slot is never confirmed past the first commit and falls behind.
     let mut config = common::fast();
-    config.token_interval = Duration::from_secs(3600);
+    config.token_interval = sequencer::TokenInterval::Every(pges_core::interval!(1 h));
     let running = f.start(config).await?;
     running.wait_leading().await?;
     let (phase, phases) = watch::channel(Phase::BeforeResequence);

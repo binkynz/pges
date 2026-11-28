@@ -895,7 +895,11 @@ fn sequencer_config(rng: &mut Rng) -> sequencer::SequencerConfig {
     config.lease = sequencer::Lease::with_renew(interval!(500 ms), interval!(100 ms)).unwrap();
     config.acquire_interval = interval!(20 ms);
     config.retry_interval = interval!(30 ms);
-    config.token_interval = Duration::from_millis([0, 30, 200][rng.below(3) as usize]);
+    config.token_interval = [
+        sequencer::TokenInterval::EveryBatch,
+        sequencer::TokenInterval::Every(interval!(30 ms)),
+        sequencer::TokenInterval::Every(interval!(200 ms)),
+    ][rng.below(3) as usize];
     config.batch_size = std::num::NonZeroUsize::new(rng.range(1, 64) as usize).unwrap();
     config
 }
