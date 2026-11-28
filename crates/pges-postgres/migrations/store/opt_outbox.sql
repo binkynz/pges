@@ -42,8 +42,12 @@ CREATE TABLE pending (
 --
 -- NOTIFY makes every committing transaction that sent one take a server-wide lock, held until its commit is
 -- done, so such commits are serialised. That is the cost of a wake-up without polling.
+--
+-- search_path is pinned as in pges/0001_init.sql: `enqueued` is the trigger's transition table, which needs no
+-- schema.
 CREATE FUNCTION notify_pending() RETURNS trigger
   LANGUAGE plpgsql
+  SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
   IF EXISTS (SELECT 1 FROM enqueued) THEN

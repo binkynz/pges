@@ -87,6 +87,10 @@ The first release: `pges`, `pges-core`, `pges-derive`, `pges-postgres`, `pges-su
   one-source-kind trigger, so a role that can only connect cannot block migrations or store creation; the
   advisory key `hashtext('pges.migrate')` guards only the first shared migration. Every role that can
   connect is still trusted for availability (docs/schema.md, Roles): revoke `CONNECT` from `PUBLIC`.
+- **Pinned `search_path`** (`pges-postgres`). The functions the migrations create (`pges.check_commit_id`,
+  `pges.uuidv7_floor`, `pges.check_one_source_kind`, the outbox trigger's `notify_pending`) set
+  `search_path = pg_catalog, pg_temp` and qualify what they reference, so a caller's `search_path` or a
+  function another role creates in `public` cannot change what they call. None is `SECURITY DEFINER`.
 
 ### Stability
 
