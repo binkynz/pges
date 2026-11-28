@@ -362,6 +362,114 @@ async fn a_lost_commit_of_the_locked_append_is_deduplicated() -> Result<()> {
     f.finish().await
 }
 
+/// An `append_many` committed, but its reply was lost with the connection, and the retry on a new connection
+/// came after the commit ids had left the clock skew tolerance (a failover takes longer than the default
+/// 5 s). The retry still finds the batch written and returns it as deduplicated, as a single append does:
+/// a commit id at or below its stream's last one is not checked against the clock.
+#[tokio::test]
+async fn a_batch_whose_reply_is_lost_is_deduplicated_after_the_skew() -> Result<()> {
+    let f = Fixture::new().await?;
+    let proxy = proxy::Proxy::start(pges_testing::server().await?).await?;
+    let (pool, _) = proxied_store(&f, &proxy).await?;
+    let skew = Duration::from_millis(200);
+    let mut config = store::StoreConfig::new(common::STORE_NAME);
+    config.max_clock_skew = Some(skew);
+    let s = store::Store::open(pool.clone(), config).await?;
+    // Prepares the batch statement on the proxied connection, so the held batch is sent whole.
+    s.append_many([append::AppendEntry::new(
+        stream::StreamId::new_v7(),
+        version::ExpectedVersion::NoStream,
+        &[JobEvent::created("warm-up")],
+    )])
+    .await?;
+    let (first, second) = (stream::StreamId::new_v7(), stream::StreamId::new_v7());
+
+    // A deferred trigger makes the COMMIT wait for an advisory lock the test holds, so the reply is held at
+    // the proxy exactly when the COMMIT runs.
+    let mut setup = f.db.connect().await?;
+    sqlx::raw_sql(
+        "CREATE FUNCTION hold_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           PERFORM pg_advisory_xact_lock(4242);
+           RETURN NULL;
+         END $$;
+         CREATE CONSTRAINT TRIGGER hold_commit AFTER INSERT ON es.commits
+           DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION hold_commit();",
+    )
+    .execute(&mut setup)
+    .await?;
+    let mut holder = f.db.connect().await?;
+    sqlx::query("SELECT pg_advisory_lock(4242)")
+        .execute(&mut holder)
+        .await?;
+
+    let appending = {
+        let s = s.clone();
+        tokio::spawn(async move {
+            s.append_many([
+                append::AppendEntry::new(
+                    first,
+                    version::ExpectedVersion::NoStream,
+                    &[JobEvent::created("a")],
+                ),
+                append::AppendEntry::new(
+                    second,
+                    version::ExpectedVersion::NoStream,
+                    &[JobEvent::created("b"), JobEvent::assigned()],
+                ),
+            ])
+            .await
+        })
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE datname = current_database() AND query = 'COMMIT' AND wait_event = 'advisory'",
+        )
+        .fetch_one(&f.pool)
+        .await?;
+        if waiting == 1 {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            bail!("the batch never reached its COMMIT");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    proxy.hold(proxy::Direction::ToClient);
+    sqlx::query("SELECT pg_advisory_unlock(4242)")
+        .execute(&mut holder)
+        .await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while commits_of(&f.pool, first).await? == 0 {
+        if tokio::time::Instant::now() > deadline {
+            bail!("the batch never committed");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(skew * 3).await;
+    proxy.drop_connections();
+    proxy.release();
+
+    let results = appending.await??;
+    assert_eq!(results.len(), 2);
+    assert!(
+        results
+            .iter()
+            .all(|r| r.outcome == append::Outcome::Deduplicated),
+        "{results:?}"
+    );
+    assert_eq!(results[1].versions, v(1)..=v(2));
+    assert_eq!(commits_of(&f.pool, first).await?, 1);
+    assert_eq!(commits_of(&f.pool, second).await?, 1);
+
+    holder.close().await?;
+    setup.close().await?;
+    pool.close().await;
+    f.finish().await
+}
+
 fn commit_id_ahead(offset: Duration) -> commit::CommitId {
     let at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
