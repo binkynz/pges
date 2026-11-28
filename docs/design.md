@@ -1100,10 +1100,19 @@ the halt, 43 recovered, 335 after.
     fault of the batch and would otherwise stop the subscription, while the empty-advance checkpoint retries
     the same errors. Class 23 (integrity) and 22 (data exception), which fail every attempt the same way,
     are `Fatal`. A FATAL error or a lost connection may hide a commit and stays a database error, so the
-    stored cursor is read again. The lock on the subscription's row that begins the batch classifies its
-    errors the same way. (2026-11-28; the side renewal that made a REPEATABLE READ handler's checkpoint fail
-    with 40001 is gone, see `run_pg` holds the subscription row, below, so a serialization failure now comes
-    from the handler's own tables, mostly at the COMMIT.)
+    stored cursor is read again. (2026-11-28; the side renewal that made a REPEATABLE READ handler's
+    checkpoint fail with 40001 is gone, see `run_pg` holds the subscription row, below, so once the handler
+    runs a serialization failure comes from the handler's own tables, mostly at the COMMIT.)
+  - Any error of the lock on the subscription's row that begins a `run_pg` batch is a database error, not
+    the handler's: the handler has not run, so it does not count against the `RetryPolicy`. Under
+    REPEATABLE READ or SERIALIZABLE the lock fails with 40001 when another session updated the row while it
+    waited (a renewal dropped in flight, an acquire racing a lapsed lease, a redefine). The batch rolls back,
+    and after `retry_interval` the stored cursor and fence are read again, as after any database error: a
+    moved fence ends the term, a moved cursor is read on from. Before, the lock classified its errors as the
+    checkpoint's, and a one-attempt policy stopped the run with `HandlerFailed` and no handler call
+    (`a_serialization_failure_at_the_hold_is_not_a_handler_failure`). Each retry waits `retry_interval`, so
+    a lock that keeps failing cannot spin; one that fails for good (a permission revoked) recovers forever,
+    as any database error does. (2026-11-28.)
   - Fatal errors release the lease, so a standby takes over at once (and probably meets the same error).
   - `Start` applies only when the row is created and on redefine. Empty advances (a cut with no events) are
     checkpointed in autocommit without calling the handler.
@@ -1149,7 +1158,8 @@ the halt, 43 recovered, 335 after.
     so the crate does not set it; operators may, on the role, above their handlers' longest pause.
   - Lock waits: acquire never waits (SKIP LOCKED). Redefine waits for the running batch, then bumps the fence.
     A dropped renewal from before the batch can still be on the server when the lock runs; READ COMMITTED
-    waits for it, the higher levels fail once with 40001 and retry. A lost COMMIT of an earlier batch still
+    waits for it, the higher levels fail once with 40001 and retry as a database error, without using an
+    attempt of the `RetryPolicy`. A lost COMMIT of an earlier batch still
     in flight is met the same way. Under READ COMMITTED the lock (fenced, not checking the cursor) then
     takes the moved row, and the checkpoint's compare-and-set on the cursor (`position = <the cursor the
     instance holds>`, as in the other checkpoints) finds it moved, so the stale batch rolls back instead of

@@ -52,7 +52,10 @@ The first release: `pges`, `pges-core`, `pges-derive`, `pges-postgres`, `pges-su
   transaction's level (`handler::Isolation::{Default, ReadCommitted, RepeatableRead, Serializable}`,
   applied in the `BEGIN`; backfills too); a handler cannot change the level with `SET TRANSACTION`. The
   batch's session gets TCP keepalives from the lease (a backfill lane's, as for a 15 s lease), so a
-  vanished holder's lock goes within about one lease over TCP. A handler that ends the batch's transaction with a raw `COMMIT` or
+  vanished holder's lock goes within about one lease over TCP. An error at the row lock, before the handler
+  runs (such as a serialization failure under REPEATABLE READ when another session updated the row while
+  the lock waited), is retried as a database error from the stored cursor and fence, without using an
+  attempt of the `RetryPolicy`. A handler that ends the batch's transaction with a raw `COMMIT` or
   `ROLLBACK`, whatever it returns, or whose savepoint begin ended it, moves no cursor and fails the run (a
   fatal `HandlerFailed`). Leases and fencing, sharded subscriptions, replica reads with fallback, backfills. Wakers: gRPC
   (default), in-process, `LISTEN/NOTIFY` and poll.

@@ -1074,12 +1074,15 @@ The first `.categories(..)` takes a `NonEmpty<CategoryName>`, later ones any ite
   a read-only transaction during a failover), except an integrity constraint violation or a data exception
   (SQLSTATE class 23 or 22, such as a deferred unique constraint), which fails every attempt the same way
   and is fatal. A lost connection or a FATAL error may hide a commit, and stays a database error. Any
-  isolation level works: nothing updates the subscription's row during the handler, so a serialization
-  failure comes only from the handler's own tables or the COMMIT. An error the row lock gets before the
-  handler runs (40001 under REPEATABLE READ behind a renewal still in flight, a lock timeout) is classified
-  the same way and counts as one of the batch's attempts, although the handler was not called. A backfill
-  lane's lock that fails with 40001 (it waited for another run that moved the lane) is `Overtaken`, as at
-  READ COMMITTED.
+  isolation level works: nothing updates the subscription's row during the handler, so once the handler
+  runs a serialization failure comes only from the handler's own tables or the COMMIT. An error the row
+  lock gets before the handler runs (40001 under REPEATABLE READ or SERIALIZABLE when another session
+  updated the row while the lock waited: a renewal still in flight, an acquire racing a lapsed lease, a
+  redefine; or a lock timeout) does not count against the `RetryPolicy`, since the handler was not called:
+  the batch rolls back and is retried as a database error (`State::Recovering`, after `retry_interval`),
+  reading the stored cursor and fence again, so a moved fence ends the term and a moved cursor is read on
+  from. A backfill lane's lock that fails with 40001 (it waited for another run that moved the lane) is
+  `Overtaken`, as at READ COMMITTED: every write to a lane's row moves its cursor.
 - Category names are checked against `categories` at start (`UnknownCategory`). The requested categories are
   compared with `subscriptions.category_ids`; a mismatch fails with
   `SubscribeError::DefinitionChanged { stored, requested }` unless `.redefine(Start::…)` is given. A changed
