@@ -142,8 +142,17 @@ own statements in `crates/pges-postgres/sql/migrate/`.
   `xmax` looked up in `pg_locks` (`crates/pges-postgres/sql/migrate/lock_holder.sql`); for the advisory lock,
   its key in `pg_locks` (`crates/pges-postgres/sql/migrate/bootstrap_holder.sql`); the role from
   `pg_stat_activity`. Both views show these columns to every role. A run that finds every migration applied
-  takes no lock. Store migrations run with `SET LOCAL search_path` set to the store, so
-  their SQL uses unqualified names.
+  takes no lock.
+- Store migrations run with `SET LOCAL search_path` set to the store (and `pg_temp` last), so their SQL uses
+  unqualified names.
+- Every function the migrations create (`pges.check_one_source_kind`, `pges.uuidv7_floor`,
+  `pges.check_commit_id`, `<store>.notify_pending`) sets `search_path = pg_catalog, pg_temp` and names pges
+  objects with their schema, so neither a caller's `search_path` nor a function or operator another role
+  creates in `public` changes what it calls. The shared migration runs under the same `search_path` (`SET
+  LOCAL` at its top), because `uuidv7_floor`'s SQL-standard body is bound when it is created. None is
+  `SECURITY DEFINER`: each runs with its caller's privileges. The pinned setting costs a GUC save and restore
+  per call (`check_commit_id` runs once per appended commit) and stops `uuidv7_floor` from being inlined; it
+  is still folded to a constant for constant arguments, which is what partition bounds use.
 - Every `run_shared` (so every `migrate::run` and auto-migrating `Store::open`) first refuses a schema `pges` that belongs to another role than `current_user`
   (`crates/pges-postgres/sql/migrate/shared_schema_owner.sql`, `MigrateError::SharedSchemaNotOwned`), a
   superuser or a member of the owner's role included: a schema's owner may drop any table in it and put its

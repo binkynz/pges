@@ -2079,6 +2079,11 @@ the halt, 43 recovered, 335 after.
     `SET ROLE`). Trade-off: tries are not fair (a waiter may be overtaken), and a freed lock is noticed up to
     250 ms late; both are irrelevant for migrations and maintenance.
   - `Store::open` migrates with the default wait; `migrate::run` takes a `MigrateConfig` for another.
+- Functions the migrations create pin `search_path = pg_catalog, pg_temp` (2026-11-28; schema.md,
+  Migrations). Without it, `pges.check_commit_id` resolved `uuid_extract_version` through its caller's path,
+  so a function in `public` could stand in for it and accept ids that are not UUIDv7. The cost is a GUC save
+  and restore per call, once per appended commit (about 0.1 µs: 200k calls took 162 ms instead of 140 ms), and `uuidv7_floor` is no longer inlined (constant
+  arguments still fold, so partition bounds are unchanged).
 
 ## Open decisions
 

@@ -2,6 +2,14 @@
 -- Shared objects, once per database. Applied by the crate's migration runner inside one transaction,
 -- holding pg_advisory_xact_lock(hashtext('pges.migrate')), which stands for the migration lock until
 -- pges.scopes exists; later migrations lock the scope's row in pges.scopes instead.
+--
+-- Functions pin search_path to pg_catalog, pg_temp and name every pges object with its schema, so neither a
+-- caller's search_path nor an object another role creates in public (a function or operator with the same
+-- name and a better-matching signature) changes what they call. pg_temp comes last, so a temporary object
+-- never shadows a built-in. The migration itself runs with the same search_path, because a function with a
+-- SQL-standard body (uuidv7_floor) is bound when it is created, not when it is called.
+
+SET LOCAL search_path = pg_catalog, pg_temp;
 
 CREATE SCHEMA IF NOT EXISTS pges;
 
@@ -52,6 +60,7 @@ CREATE TABLE pges.stores (
 -- only roles with UPDATE on pges.scopes can hold it. SQLSTATE PGE02 maps to MigrateError::OutboxMismatch.
 CREATE FUNCTION pges.check_one_source_kind() RETURNS trigger
   LANGUAGE plpgsql
+  SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
   PERFORM 1 FROM pges.scopes WHERE scope = 'pges' FOR UPDATE;
@@ -85,7 +94,8 @@ INSERT INTO pges.sequencer DEFAULT VALUES;
 -- values with an explicit offset ('2026-12-01 00:00:00+00'); a bare literal is read in the session TimeZone.
 CREATE FUNCTION pges.uuidv7_floor(ts timestamptz) RETURNS uuid
   LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
-  RETURN (lpad(to_hex(floor(extract(epoch FROM ts) * 1000)::int8), 12, '0')
+  SET search_path = pg_catalog, pg_temp
+  RETURN (pg_catalog.lpad(pg_catalog.to_hex(pg_catalog.floor(EXTRACT(epoch FROM ts) * 1000)::int8), 12, '0')
           || '70008000000000000000')::uuid;
 
 -- Rejects a client commit id that is not a UUIDv7 (SQLSTATE 22023), or whose timestamp is more than `tol`
@@ -93,12 +103,14 @@ CREATE FUNCTION pges.uuidv7_floor(ts timestamptz) RETURNS uuid
 -- append statements. statement_timestamp(), not now(), so a long UnitOfWork does not drift.
 CREATE FUNCTION pges.check_commit_id(id uuid, tol interval) RETURNS uuid
   LANGUAGE plpgsql STABLE PARALLEL SAFE
+  SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
-  IF uuid_extract_version(id) IS DISTINCT FROM 7 THEN
+  IF pg_catalog.uuid_extract_version(id) IS DISTINCT FROM 7 THEN
     RAISE EXCEPTION 'commit id % is not a UUIDv7', id USING ERRCODE = '22023';
   END IF;
-  IF uuid_extract_timestamp(id) NOT BETWEEN statement_timestamp() - tol AND statement_timestamp() + tol THEN
+  IF pg_catalog.uuid_extract_timestamp(id)
+       NOT BETWEEN pg_catalog.statement_timestamp() - tol AND pg_catalog.statement_timestamp() + tol THEN
     RAISE EXCEPTION 'commit id % is outside the clock skew tolerance %', id, tol USING ERRCODE = 'PGE01';
   END IF;
   RETURN id;
