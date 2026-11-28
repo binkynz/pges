@@ -498,6 +498,37 @@ fn unit_variants_round_trip_as_an_empty_object() {
     assert_eq!(closed.type_name(), "chain.closed");
 }
 
+/// `Self` in a field's type is the event enum, as anywhere else in the enum's definition. The children
+/// are stored by the enum's own serde derive.
+#[derive(Debug, Clone, PartialEq, Event, Serialize, Deserialize)]
+#[event(category = "tree")]
+enum TreeEvent {
+    #[event(name = "tree.grown")]
+    Grown { children: Vec<Self> },
+    #[event(name = "tree.leaf")]
+    Leaf,
+}
+
+#[test]
+fn self_in_a_field_type_names_the_enum() {
+    let grown = TreeEvent::Grown {
+        children: vec![
+            TreeEvent::Leaf,
+            TreeEvent::Grown {
+                children: Vec::new(),
+            },
+        ],
+    };
+
+    let data = encode(&grown);
+
+    assert_eq!(data, br#"{"children":["Leaf",{"Grown":{"children":[]}}]}"#);
+    assert_eq!(
+        decode::<TreeEvent>("tree.grown", 1, &data),
+        event::Decoded::Event(grown)
+    );
+}
+
 /// Every serde field attribute the derive accepts, each written and read back.
 #[derive(Debug, Clone, PartialEq, Event)]
 #[event(category = "jobs")]

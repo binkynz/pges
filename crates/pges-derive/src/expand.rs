@@ -1,7 +1,7 @@
 //! Generates the `Event` impl.
 
-use proc_macro2::{Span, TokenStream};
-use quote::{format_ident, quote};
+use proc_macro2::{Span, TokenStream, TokenTree};
+use quote::{ToTokens as _, format_ident, quote};
 
 use crate::input;
 
@@ -17,7 +17,7 @@ pub(crate) fn event_impl(event: &input::EventEnum) -> TokenStream {
     let helpers = event
         .variants
         .iter()
-        .map(|variant| serde_helpers(krate, variant));
+        .map(|variant| serde_helpers(krate, ident, variant));
     let type_name_arms = event.variants.iter().map(|variant| {
         let pattern = wildcard_pattern(variant);
         let name = &variant.name;
@@ -154,7 +154,11 @@ fn field_bindings(fields: &[input::StructField]) -> Vec<syn::Ident> {
 
 /// A struct variant's fields as a borrowed struct to encode and an owned struct to decode, so the stored
 /// shape is the object of the fields, whatever the Rust variant is called.
-fn serde_helpers(krate: &syn::Path, variant: &input::EventVariant) -> TokenStream {
+fn serde_helpers(
+    krate: &syn::Path,
+    event: &syn::Ident,
+    variant: &input::EventVariant,
+) -> TokenStream {
     let input::Shape::Struct(fields) = &variant.shape else {
         return TokenStream::new();
     };
@@ -163,7 +167,11 @@ fn serde_helpers(krate: &syn::Path, variant: &input::EventVariant) -> TokenStrea
     let decode = decode_helper(variant);
     let serde = serde_crate(krate);
     let field_idents: Vec<&syn::Ident> = fields.iter().map(|field| &field.ident).collect();
-    let field_types: Vec<&syn::Type> = fields.iter().map(|field| &field.ty).collect();
+    // Inside the helpers `Self` would name the helper, not the event enum.
+    let field_types: Vec<TokenStream> = fields
+        .iter()
+        .map(|field| replace_self(field.ty.to_token_stream(), event))
+        .collect();
     let field_attrs: Vec<&Vec<syn::Attribute>> =
         fields.iter().map(|field| &field.serde_attrs).collect();
     let lifetime = if fields.is_empty() {
@@ -262,4 +270,25 @@ fn decode_arm(
     };
 
     quote! { (#name, #versions) => #construct }
+}
+
+/// `tokens` with every `Self` replaced by `event`.
+fn replace_self(tokens: TokenStream, event: &syn::Ident) -> TokenStream {
+    tokens
+        .into_iter()
+        .map(|token| match token {
+            TokenTree::Ident(ident) if ident == "Self" => {
+                let mut event = event.clone();
+                event.set_span(ident.span());
+                TokenTree::Ident(event)
+            }
+            TokenTree::Group(group) => {
+                let mut replaced =
+                    proc_macro2::Group::new(group.delimiter(), replace_self(group.stream(), event));
+                replaced.set_span(group.span());
+                TokenTree::Group(replaced)
+            }
+            other => other,
+        })
+        .collect()
 }
