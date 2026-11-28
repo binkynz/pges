@@ -744,7 +744,8 @@ a type id not yet loaded.
 `subscriptions.category_ids` is `'{}'`.
 
 - The log page, checked against the highest horizon above `skip_through` (`$4`) of any category:
-  `crates/pges-subscribe/sql/read/log.sql`.
+  `crates/pges-subscribe/sql/read/log.sql`. While the cursor is below `skip_through`, the same page without
+  the rows at or below their category's start: `crates/pges-subscribe/sql/read/log_retained.sql`.
 - For each category in the page, its commits by id: `crates/pges-subscribe/sql/read/commits.sql`.
 - For the commits missing from the fetch, on the primary, those `deleted_commits` records:
   `crates/pges-subscribe/sql/read/deleted_commits.sql`.
@@ -760,8 +761,14 @@ a type id not yet loaded.
 - `coalesce` lets a store with no categories pass the check.
 - A cursor behind the highest horizon of any category raises `CursorBeforeHorizon`, except horizons at or
   below `skip_through` (`Start::Retained`): a missing commit of such a category at or below its horizon was
-  dropped and its log row is skipped. Rows below such a category's start are read and skipped one by one;
-  the statement cannot start each category at its own start.
+  dropped and its log row is skipped.
+- Rows at or below their category's start name dropped commits. While the cursor is below `skip_through`,
+  `log_retained.sql` leaves them out in the statement (a correlated lookup of the row's category in the
+  small `categories` table per row scanned), so a page holds rows that may still have a commit. Otherwise
+  each `$3` dead rows took a page of its own: the log read, the commit fetch, the `deleted_commits` and
+  horizon lookups, and a checkpoint (`prune_log` may not have deleted them yet). It still walks the log's
+  primary key in position order. Past `skip_through` no row after the cursor is at or below a start, and a
+  subscription with `skip_through` 0 never uses it, so `log.sql` and its plan are unchanged for them.
 - A commit missing from the fetch that `deleted_commits` records was deleted by `delete_stream`, and its log
   row is skipped. The page's cut still comes from the log rows, so skipped rows move the cursor.
 - The client keys fetched commits and the `deleted_commits` records by (category, commit id), like the

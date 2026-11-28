@@ -477,9 +477,14 @@ impl Reader {
         cursor: position::Position,
         head: position::Position,
     ) -> Result<Page, subscription::SubscribeError> {
-        let log = self
-            .sql
-            .read_log
+        // Below `skip_through`, the rows at or below a category's start name dropped commits, and the
+        // retained variant leaves them out. Past it, no row after the cursor is at or below a start.
+        let read_log = if cursor < self.skip_through {
+            &self.sql.read_log_retained
+        } else {
+            &self.sql.read_log
+        };
+        let log = read_log
             .bind(statement::read_log::Params {
                 after: to_i64(cursor),
                 head: to_i64(head),

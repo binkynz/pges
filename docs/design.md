@@ -2171,10 +2171,14 @@ the halt, 43 recovered, 335 after.
     `Start::Retained`. So `skip_through` is greatest(head, max(`horizon_position`)), read in one statement
     (`read/skip_through.sql`). The reasoning above holds: every horizon is the position of a commit written
     before the statement, so the subscription still skips only drops of events that existed before it.
-  - The store-wide read cannot start each category at its own start in one statement. Its log statement
-    checks only horizons above `skip_through`, and a missing commit at or below its (skipped) category's
-    horizon is dropped and skipped (one `read/horizons.sql` per page with missing commits, only while the
-    cursor is below `skip_through`). It may read dead rows below a category's start one page at a time.
+  - The store-wide read cannot seek to each category's start in one index scan. Its log statement checks
+    only horizons above `skip_through`, and a missing commit at or below its (skipped) category's horizon is
+    dropped and skipped (one `read/horizons.sql` per page with missing commits, only while the cursor is
+    below `skip_through`). While the cursor is below `skip_through` it uses a variant
+    (`read/log_retained.sql`) that also leaves out rows at or below their category's start, one lookup in
+    `categories` per row scanned, so dead rows `prune_log` has not deleted yet cost no pages of their own.
+    It is a separate statement rather than a `$4 > 0` branch in `read/log.sql`, so the strict statement,
+    its generic plan and its cost stay as they were.
   - API: `Start::Retained` (new variant; `Start` is `#[non_exhaustive]`), `DroppedLeaf::start`. Unchanged:
     `CursorBeforeHorizon { category, cursor, horizon }`; its advice is now "rebuild from
     `Start::Retained`", since no position is a correct strict start. `Start::Beginning` keeps the strict

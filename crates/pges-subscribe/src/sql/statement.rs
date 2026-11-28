@@ -102,6 +102,16 @@ pges_postgres::typed_query! {
 }
 
 pges_postgres::typed_query! {
+    /// A page of the log of every category without the rows at or below their category's start position,
+    /// for a reader that skips dropped commits.
+    pub READ_LOG_RETAINED, mod read_log_retained {
+        name: "read/log_retained",
+        files: [sql_file!("read/log_retained.sql")],
+        like read_log,
+    }
+}
+
+pges_postgres::typed_query! {
     /// Which of some commits `delete_stream` deleted.
     pub DELETED_COMMITS, mod deleted_commits {
         name: "read/deleted_commits",
@@ -505,6 +515,7 @@ pub const ALL: &[&template::Statement] = &[
     &HORIZONS,
     &HIGHEST_HORIZON,
     &READ_LOG,
+    &READ_LOG_RETAINED,
     &DELETED_COMMITS,
     &READ_CATEGORY_LOG,
     &FETCH_COMMITS,
@@ -548,6 +559,7 @@ pub const TYPED: &[typed::Shape] = &[
     typed::Shape::of::<horizons::Query>(),
     typed::Shape::of::<highest_horizon::Query>(),
     typed::Shape::of::<read_log::Query>(),
+    typed::Shape::of::<read_log_retained::Query>(),
     typed::Shape::of::<deleted_commits::Query>(),
     typed::Shape::of::<read_category_log::Query>(),
     typed::Shape::of::<fetch_commits::Query>(),

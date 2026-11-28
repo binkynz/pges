@@ -2,7 +2,7 @@
 --
 -- $1 the cursor, $2 the cut H, $3 the page size, $4 the position through which the reader skips commits
 -- retention dropped (0, or for a subscription started at Start::Retained the greater of the head and the
--- highest horizon at creation).
+-- highest horizon at creation; such a reader uses read/log_retained.sql while its cursor is below it).
 --
 -- The page is empty when the cursor is below the highest retention horizon above $4 of any category, checked
 -- in the same statement so retention cannot remove rows between a separate check and the read. Rows of

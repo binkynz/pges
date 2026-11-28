@@ -34,6 +34,9 @@ pub(crate) struct Statements {
     pub(crate) read_category_log: Rendered<statement::read_category_log::Query>,
     /// A page of the log of every category, checked against the highest retention horizon.
     pub(crate) read_log: Rendered<statement::read_log::Query>,
+    /// The same page without the rows at or below their category's start position, for a reader that skips
+    /// dropped commits while its cursor is below `skip_through`.
+    pub(crate) read_log_retained: Rendered<statement::read_log::Query>,
     /// Which of some commits `delete_stream` deleted.
     pub(crate) deleted_commits: Rendered<statement::deleted_commits::Query>,
     /// Creates every shard row of the subscription unless the subscription exists.
@@ -76,6 +79,7 @@ impl Statements {
             highest_horizon: statement::highest_horizon::Query::render(&values),
             read_category_log: statement::read_category_log::Query::render(&values),
             read_log: statement::read_log::Query::render(&values),
+            read_log_retained: Rendered::variant::<statement::read_log_retained::Query>(&values),
             deleted_commits: statement::deleted_commits::Query::render(&values),
             create: statement::create::Query::render(&values),
             acquire: statement::acquire::Query::render(&values),
