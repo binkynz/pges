@@ -12,7 +12,7 @@
 
 mod common;
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
 use sqlx::{PgPool, postgres::PgPoolOptions};
@@ -232,12 +232,14 @@ async fn start_expecting_halt(f: &Fixture) -> Result<common::Running> {
 }
 
 fn assert_ahead(
-    result: &Result<(), sequencer::RunError>,
+    result: &Result<(), Arc<sequencer::RunError>>,
     slot: &str,
     token: lsn::Lsn,
     confirmed: lsn::Lsn,
 ) {
-    let Err(sequencer::RunError::Source(source::SourceError::Halt(error))) = result else {
+    let Err(sequencer::RunError::Source(source::SourceError::Halt(error))) =
+        result.as_ref().map_err(|error| &**error)
+    else {
         panic!("expected a halt, got {result:?}");
     };
     assert_eq!(

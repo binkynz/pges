@@ -116,7 +116,9 @@ async fn invalidate(container: &ContainerAsync<Postgres>) -> Result<()> {
     // finds the slot invalidated when it reopens, records the halt and stops.
     let watch = running.watch.clone();
     let result = running.result().await;
-    let Err(sequencer::RunError::Source(source::SourceError::Halt(error))) = &result else {
+    let Err(sequencer::RunError::Source(source::SourceError::Halt(error))) =
+        result.as_ref().map_err(|error| &**error)
+    else {
         panic!("expected a halt, got {result:?}");
     };
     assert_eq!(
@@ -127,10 +129,10 @@ async fn invalidate(container: &ContainerAsync<Postgres>) -> Result<()> {
         })
     );
     let status = watch.status().borrow().clone();
-    let sequencer::Status::Halted(reason) = &status else {
+    let sequencer::Status::Halted(error) = &status else {
         panic!("the status is {status:?}, not Halted");
     };
-    assert!(reason.contains("wal_removed"), "{reason}");
+    assert!(error.to_string().contains("wal_removed"), "{error}");
     let (halted, released): (Option<String>, bool) =
         sqlx::query_as("SELECT halted, lease_until IS NULL FROM pges.sequencer")
             .fetch_one(&mut conn)
@@ -146,7 +148,7 @@ async fn invalidate(container: &ContainerAsync<Postgres>) -> Result<()> {
     let again = f.start(common::fast()).await?;
     let result = again.result().await;
     assert!(
-        matches!(&result, Err(sequencer::RunError::Halted(reason)) if *reason == halted),
+        matches!(result.as_ref().map_err(|error| &**error), Err(sequencer::RunError::Halted(reason)) if *reason == halted),
         "{result:?}"
     );
     let invalidated: Option<String> = sqlx::query_scalar(

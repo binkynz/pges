@@ -93,9 +93,10 @@ impl<S: source::Source> Sequencer<S> {
     /// Fails with the [`RunError`]s that need an operator: [`RunError::Halted`],
     /// [`RunError::SourceMismatch`], a fatal, halting or invalid [`source::SourceError`],
     /// [`RunError::UnknownStore`], [`RunError::InvalidStoreName`] and [`RunError::PositionOverflow`]. The
-    /// status then becomes [`Status::Halted`]; after a shutdown it becomes [`Status::Stopped`]. When the
-    /// future is dropped before it returns (a panic, an aborted task), it becomes [`Status::Abandoned`].
-    pub async fn run<F>(self, shutdown: F) -> Result<(), RunError>
+    /// status then becomes [`Status::Halted`] with the same error, which is why it is returned in an
+    /// [`Arc`]; after a shutdown it becomes [`Status::Stopped`]. When the future is dropped before it returns
+    /// (a panic, an aborted task), it becomes [`Status::Abandoned`].
+    pub async fn run<F>(self, shutdown: F) -> Result<(), Arc<RunError>>
     where
         F: Future<Output = ()> + Send,
     {
@@ -133,9 +134,10 @@ impl<S: source::Source> Sequencer<S> {
         };
         #[cfg(not(feature = "watch-notify"))]
         let result = sequencing.await;
+        let result = result.map_err(Arc::new);
         ending.status = match &result {
             Ok(()) => Status::Stopped,
-            Err(error) => Status::Halted(error.to_string().into()),
+            Err(error) => Status::Halted(Arc::clone(error)),
         };
 
         result
@@ -289,10 +291,10 @@ pub enum Status {
     Leading(Fence),
     /// Retrying after an error; it keeps its lease if it can renew it in time.
     Recovering(Arc<RunError>),
-    /// [`Sequencer::run`] returned the [`RunError`] with this text: sequencing stopped on an error that needs
-    /// an operator. Alert on it. If the source halted (for example its replication slot was lost),
+    /// [`Sequencer::run`] returned this [`RunError`]: sequencing stopped on an error that needs an operator.
+    /// Alert on it. If the source halted (for example its replication slot was lost),
     /// `pges.sequencer.halted` holds the reason, and every sequencer refuses to start until it is cleared.
-    Halted(Arc<str>),
+    Halted(Arc<RunError>),
     /// [`Sequencer::run`] returned after a shutdown. A leader released its lease, so a standby takes over at
     /// once.
     Stopped,

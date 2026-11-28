@@ -365,7 +365,7 @@ pub struct Running {
     pub watch: watch::Watch,
     pub pool: PgPool,
     stop: Option<oneshot::Sender<()>>,
-    task: JoinHandle<Result<(), sequencer::RunError>>,
+    task: JoinHandle<Result<(), Arc<sequencer::RunError>>>,
     errors: Arc<Mutex<Vec<String>>>,
 }
 
@@ -483,16 +483,16 @@ impl Running {
     }
 
     /// The run's result, once it ended by itself. Checks that the status says how it ended: `Halted` with
-    /// the error's text, or `Stopped`.
-    pub async fn result(self) -> Result<(), sequencer::RunError> {
+    /// the same error, or `Stopped`.
+    pub async fn result(self) -> Result<(), Arc<sequencer::RunError>> {
         let result = tokio::time::timeout(Duration::from_secs(30), self.task)
             .await
             .expect("sequencer did not end")
             .expect("sequencer task panicked");
         match (&result, &*self.watch.status().borrow()) {
             (Ok(()), sequencer::Status::Stopped) => {}
-            (Err(error), sequencer::Status::Halted(reason)) => {
-                assert_eq!(**reason, *error.to_string());
+            (Err(error), sequencer::Status::Halted(halted)) => {
+                assert!(Arc::ptr_eq(error, halted), "{error} is not {halted}");
             }
             (result, status) => panic!("run returned {result:?}, but the status is {status:?}"),
         }

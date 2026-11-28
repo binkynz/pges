@@ -152,7 +152,9 @@ async fn resequence_recovers_the_commits_of_a_dropped_slot() -> Result<()> {
 
     let halting = f.start(common::fast()).await?;
     let result = halting.result().await;
-    let Err(sequencer::RunError::Source(source::SourceError::Halt(error))) = &result else {
+    let Err(sequencer::RunError::Source(source::SourceError::Halt(error))) =
+        result.as_ref().map_err(|error| &**error)
+    else {
         panic!("expected a halt, got {result:?}");
     };
     assert!(
@@ -231,7 +233,9 @@ async fn resequence_sequences_commits_from_before_the_first_slot() -> Result<()>
 
     let halting = f.start(common::fast()).await?;
     let result = halting.result().await;
-    let Err(sequencer::RunError::Source(source::SourceError::Halt(error))) = &result else {
+    let Err(sequencer::RunError::Source(source::SourceError::Halt(error))) =
+        result.as_ref().map_err(|error| &**error)
+    else {
         panic!("expected a halt, got {result:?}");
     };
     assert!(

@@ -916,7 +916,7 @@ struct Seq {
     watch: pges_sequencer::watch::Watch,
     pool: PgPool,
     stop: oneshot::Sender<()>,
-    task: JoinHandle<Result<(), sequencer::RunError>>,
+    task: JoinHandle<Result<(), Arc<sequencer::RunError>>>,
     errors: Arc<Mutex<Vec<String>>>,
 }
 
@@ -1043,7 +1043,7 @@ trait SeqRun: Send {
     fn run(
         self: Box<Self>,
         shutdown: std::pin::Pin<Box<dyn Future<Output = ()> + Send>>,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), sequencer::RunError>> + Send>>;
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), Arc<sequencer::RunError>>> + Send>>;
 }
 
 impl<S: pges_sequencer::source::Source + 'static> SeqRun for sequencer::Sequencer<S> {
@@ -1054,7 +1054,7 @@ impl<S: pges_sequencer::source::Source + 'static> SeqRun for sequencer::Sequence
     fn run(
         self: Box<Self>,
         shutdown: std::pin::Pin<Box<dyn Future<Output = ()> + Send>>,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), sequencer::RunError>> + Send>> {
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), Arc<sequencer::RunError>>> + Send>> {
         Box::pin(sequencer::Sequencer::run(*self, shutdown))
     }
 }

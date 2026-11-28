@@ -40,7 +40,8 @@ The first release: `pges`, `pges-core`, `pges-derive`, `pges-postgres`, `pges-su
   gap-free log of positions per store in commit order. Two sources: a logical replication slot (default) or
   an outbox woken by `LISTEN/NOTIFY`. Slot bootstrap and resequence after a lost slot. In-process watch,
   `NOTIFY` after each batch, and a gRPC watch server with optional TLS. A `pges-sequencer` binary (feature
-  `bin`).
+  `bin`). A run that stops on an error ends in `Status::Halted` holding that error, which `run` also
+  returns as an `Arc<RunError>`.
 - **Subscriptions** (`pges-subscribe`). Ordered reads over listed categories or the whole store, with a
   plain integer cursor. `run_pg` delivers exactly once inside the projection's transaction; `run` at least
   once. Leases and fencing, sharded subscriptions, replica reads with fallback, backfills. Wakers: gRPC
