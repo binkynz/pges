@@ -41,6 +41,10 @@ pub mod json {
     /// the shape of `T`. With no upcasters it behaves like [`decode`]. Fails with
     /// [`event::CodecError::Decode`] when the data is not JSON, an upcaster fails, or the upcast value is not
     /// a valid `T`.
+    ///
+    /// With upcasters the data goes through [`serde_json::Value`], which keeps integers beyond 64 bits as
+    /// floats (losing precision) and keeps the last of duplicate keys. Data at the current version is read
+    /// directly, so there a duplicate key is an error, as in [`decode`].
     pub fn decode_upcast<T: DeserializeOwned>(
         type_name: &str,
         schema_version: event::SchemaVersion,
