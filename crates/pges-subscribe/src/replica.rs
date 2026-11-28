@@ -4,8 +4,12 @@
 //!
 //! Before each read from the replica, the subscription waits until the replica has replayed the WAL
 //! position (LSN) that the waker reported with its high-water mark: the sequencer's WAL insert position after
-//! the batch committed, so the replica then shows that batch's log rows and every commit they name. A waker
-//! that carries no LSN (a poll waker, or no waker at all) makes the subscription read the primary's current
+//! the batch committed, so the replica then shows that batch's log rows and every commit they name. That LSN
+//! is a hint: a `NOTIFY` can be sent by any role, so when the replica has not replayed it at the first check,
+//! the subscription lowers it to the primary's current WAL insert position (one short statement) and never
+//! waits past that. A forged LSN therefore neither stalls the subscription nor sends it to the fallback.
+//!
+//! A waker that carries no LSN (a poll waker, or no waker at all) makes the subscription read the primary's current
 //! WAL insert position instead, one short statement on the store's pool. Checkpoints, leases and `run_pg`
 //! transactions stay on the primary.
 //!
@@ -127,6 +131,10 @@ struct Fallback {
 enum Target {
     /// Ask the primary for its WAL insert position.
     Primary,
+    /// A waker's LSN. It is a claim (any role can send a `NOTIFY`), so a replica that has not replayed it
+    /// waits only up to the primary's insert position, never past it.
+    Hint(lsn::Lsn),
+    /// A position the primary reported.
     At(lsn::Lsn),
     /// The replica has replayed everything the subscription was told about.
     Reached,
@@ -150,8 +158,11 @@ impl Reader {
     /// The waker fired with `lsn`. Without one, the next read first asks the primary for its position.
     pub(crate) fn woken(&mut self, lsn: Option<lsn::Lsn>) {
         self.target = match (lsn, self.target) {
-            (Some(lsn), Target::At(earlier)) => Target::At(lsn.max(earlier)),
-            (Some(lsn), Target::Primary | Target::Reached) => Target::At(lsn),
+            (Some(lsn), Target::At(earlier)) if lsn <= earlier => Target::At(earlier),
+            (Some(lsn), Target::At(earlier) | Target::Hint(earlier)) => {
+                Target::Hint(lsn.max(earlier))
+            }
+            (Some(lsn), Target::Primary | Target::Reached) => Target::Hint(lsn),
             (None, _) => Target::Primary,
         };
     }
@@ -171,16 +182,11 @@ impl Reader {
         primary: &PgPool,
         shutdown: &mut (impl Future<Output = ()> + Unpin),
     ) -> Result<Ready, subscription::SubscribeError> {
-        let target = match self.target {
+        let mut target = match self.target {
             Target::Reached => return Ok(Ready::Replica),
-            Target::At(lsn) => lsn,
+            Target::At(lsn) | Target::Hint(lsn) => lsn,
             Target::Primary => {
-                let offset = sql::statement::insert_lsn::Query::fixed()
-                    .bind(sql::statement::insert_lsn::Params {})
-                    .fetch_one(primary)
-                    .await?
-                    .offset;
-                let lsn = lsn::Lsn::new(u64::try_from(offset).unwrap_or(0));
+                let lsn = insert_lsn(primary).await?;
                 self.target = Target::At(lsn);
                 lsn
             }
@@ -193,6 +199,13 @@ impl Reader {
                 Ok((Replayed::Primary, _)) => return Ok(self.reached()),
                 Ok((Replayed::At(replayed), layout)) if replayed >= layout.record_end(target) => {
                     return Ok(self.reached());
+                }
+                // Checked only once the replica is behind it, so a real notice costs no round trip to the
+                // primary when the replica has kept up.
+                Ok((Replayed::At(_), _)) if matches!(self.target, Target::Hint(_)) => {
+                    target = target.min(insert_lsn(primary).await?);
+                    self.target = Target::At(target);
+                    continue;
                 }
                 Ok((Replayed::At(_), _)) => {}
                 Err(_) if self.fallback.is_some() => {}
@@ -257,6 +270,17 @@ impl Reader {
 
         Ok((replayed, layout))
     }
+}
+
+/// The primary's WAL insert position.
+async fn insert_lsn(primary: &PgPool) -> Result<lsn::Lsn, sqlx::Error> {
+    let offset = sql::statement::insert_lsn::Query::fixed()
+        .bind(sql::statement::insert_lsn::Params {})
+        .fetch_one(primary)
+        .await?
+        .offset;
+
+    Ok(lsn::Lsn::new(u64::try_from(offset).unwrap_or(0)))
 }
 
 /// The WAL page and segment sizes of the replica's cluster (`wal_block_size`, `wal_segment_size`).
