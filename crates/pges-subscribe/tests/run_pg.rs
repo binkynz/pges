@@ -362,6 +362,62 @@ async fn a_panicking_handler_leaves_the_status_stopped() -> Result<()> {
     f.finish().await
 }
 
+/// Records, ends its transaction with a raw `ROLLBACK` or `COMMIT`, which sqlx does not see, and returns
+/// `Ok`.
+struct EndsItsTransaction {
+    recorder: Recorder,
+    end: &'static str,
+}
+
+impl handler::PgHandler for EndsItsTransaction {
+    async fn handle(
+        &mut self,
+        tx: &mut PgConnection,
+        batch: &batch::Batch,
+    ) -> Result<(), handler::HandlerError> {
+        *self.recorder.calls.lock().unwrap() += 1;
+        self.recorder.record(tx, batch).await?;
+        sqlx::query(sqlx::AssertSqlSafe(self.end))
+            .execute(&mut *tx)
+            .await?;
+        Ok(())
+    }
+}
+
+/// A raw `ROLLBACK` in the handler undoes its writes, and a raw `COMMIT` commits them alone; either way the
+/// checkpoint would run in autocommit. It moves nothing, and the run stops at once with `HandlerFailed`.
+#[tokio::test]
+async fn a_handler_that_ends_its_transaction_is_not_checkpointed() -> Result<()> {
+    let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    jobs(&f, 2).await?;
+
+    for (name, end, delivered) in [("rolled-back", "ROLLBACK", 0), ("committed", "COMMIT", 2)] {
+        let recorder = Recorder::new(name);
+        let error = common::Running::spawn(
+            f.store
+                .subscription(subscription::SubscriptionName::new(name).unwrap())
+                .categories(non_empty![category!("jobs")])
+                .on_error(retry(3))
+                .run_pg(EndsItsTransaction {
+                    recorder: recorder.clone(),
+                    end,
+                }),
+        )
+        .stopped()
+        .await?;
+        assert!(
+            matches!(&error, subscription::SubscribeError::HandlerFailed { source, .. }
+                if source.to_string().contains("ended the batch's transaction")),
+            "{end}: {error:?}"
+        );
+        assert_eq!(recorder.calls(), 1, "{end}: misuse is not retried");
+        assert_eq!(f.cursor(name).await?, Some(0), "{end}");
+        assert_eq!(f.delivered(name).await?.len(), delivered, "{end}");
+    }
+
+    f.finish().await
+}
+
 /// Writes two equal keys into a table whose unique constraint is deferred: every COMMIT is refused.
 struct BreaksADeferredConstraint;
 

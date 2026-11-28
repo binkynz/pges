@@ -1254,6 +1254,13 @@ A dead instance's member row and leases lapse after the lease, and the others ta
 - A renewal from before a `run_pg` batch can still be on the server when the batch's lock runs (one dropped
   in flight). Under READ COMMITTED the lock waits for it; under REPEATABLE READ or SERIALIZABLE its commit
   after the snapshot fails the lock with 40001, which is retried like any serialization failure.
+- The lock returns the transaction's id (`pg_current_xact_id()`, which assigns one), and the checkpoint
+  moves the cursor only if `pg_current_xact_id_if_assigned()` still equals it, computed before its UPDATE
+  can assign a new one. A handler that sent a raw `COMMIT` or `ROLLBACK` ended the batch's transaction
+  behind sqlx's back, so the checkpoint would otherwise run in autocommit (or in a transaction the handler
+  began) and move the cursor past writes that rolled back or committed alone. It returns `in_batch` false
+  instead, and the batch fails as a fatal handler error. A savepoint's subtransaction keeps the top-level
+  id, so savepoints pass.
 - A 25P02 from the checkpoint means the handler left the transaction aborted (a statement failed and the
   handler ignored the error). PostgreSQL would turn the COMMIT into a ROLLBACK, so the batch is rolled back
   and counted as a transient handler failure, never as handled. No extra `SELECT 1` is needed, unlike
@@ -1270,8 +1277,13 @@ integer) modulo the lane count; persisted progress depends on it, so it never ch
   definition and the lane cursors (`crates/pges-subscribe/sql/backfill/lanes.sql`).
 - For `Until::Subscription`, `P` is the subscription's cursor, the lowest of its live shards
   (`crates/pges-subscribe/sql/backfill/subscription.sql`).
-- A lane's checkpoint runs in the handler's transaction (`crates/pges-subscribe/sql/backfill/checkpoint.sql`);
-  0 rows means another run moved it (`Overtaken`), and the transaction rolls back. Lanes with no events in the
+- A lane's transaction begins at the handler's isolation level and first locks the lane's row if its cursor
+  is still where the run read it, returning the transaction's id
+  (`crates/pges-subscribe/sql/backfill/hold.sql`); no row means another run moved it (`Overtaken`), before
+  the handler runs. The checkpoint runs in the handler's transaction
+  (`crates/pges-subscribe/sql/backfill/checkpoint.sql`), and checks that id as `run_pg`'s does: `in_batch`
+  false means the handler ended the transaction itself, a fatal handler error; `moved` false means another
+  run moved the lane (`Overtaken`), and the transaction rolls back. Lanes with no events in the
   page are moved in autocommit (`crates/pges-subscribe/sql/backfill/advance.sql`).
 
 - Pages use "Read a category from a cursor" with `$3 = P`. `P` is at most `H`, which the run read once at its

@@ -1042,6 +1042,12 @@ The first `.categories(..)` takes a `NonEmpty<CategoryName>`, later ones any ite
   batch again; make the effect idempotent.
 - A handler that leaves its transaction aborted is detected (25P02 at the checkpoint), rolled back, and
   counted as a transient failure, because the failed statement may have been a serialization failure.
+- A handler that ends the transaction itself with a raw `COMMIT` or `ROLLBACK` (sqlx does not see it, so
+  `is_in_transaction()` still says yes) is detected by the checkpoint, which checks it runs in the
+  transaction the batch began (the id the row lock returned, `pg_current_xact_id()`). Nothing is
+  checkpointed, and the run stops with `HandlerFailed` (fatal: the handler's writes may already have
+  committed, so a retry could apply them twice). The same holds for a backfill's lanes. It costs no extra
+  statement in `run_pg`, and one per lane batch in a backfill (its lane lock).
 - An error the server reports (severity ERROR) for the checkpoint or the COMMIT, such as a deferred
   constraint or a serialization failure, rolled the batch back for sure. It counts as the handler's
   failure and follows the `RetryPolicy`, so a batch that can never commit stops the run with
