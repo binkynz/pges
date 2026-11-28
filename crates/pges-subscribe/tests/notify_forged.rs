@@ -103,6 +103,84 @@ async fn a_forged_notice_from_an_unprivileged_role_does_not_spin_a_subscription(
     Ok(())
 }
 
+/// Transactions the test database has committed so far, as the statistics last flushed. Idle backends flush
+/// theirs late (up to 10 s), so only a large difference means anything: a spin commits about 10,000 a second.
+async fn transactions(pool: &sqlx::PgPool) -> Result<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT xact_commit FROM pg_stat_database WHERE datname = current_database()",
+    )
+    .fetch_one(pool)
+    .await?)
+}
+
+/// In a sharded subscription one task waits on the waker for every shard. A forged huge position must
+/// neither make the shards read in a loop nor hide the notices that follow it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forged_notice_neither_spins_nor_silences_a_sharded_subscription() -> Result<()> {
+    let f = Fixture::new(pges_postgres::store::Outbox::Enabled).await?;
+    let sequencer = common::Sequencer::start(&f).await?;
+    let calls = Arc::new(AtomicU64::new(0));
+    let running = common::Running::spawn(
+        f.store
+            .subscription(subscription_name!("forged_sharded"))
+            .categories(non_empty![category!("jobs")])
+            .sharded(pges_subscribe::shards!(2))
+            // Longer than the test waits: only a notice can wake the shards in time.
+            .max_idle(pges_core::interval!(60 s))
+            .waker(Counting {
+                inner: notify::NotifyWaker::new(&f.store),
+                calls: calls.clone(),
+            })
+            .run_pg(Recorder::new("forged_sharded")),
+    );
+    f.append(Cat::Jobs, stream::StreamId::new_v7(), 1).await?;
+    running.wait_position(1).await?;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let before = (calls.load(Ordering::Relaxed), transactions(&f.pool).await?);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let idle = (
+        calls.load(Ordering::Relaxed) - before.0,
+        transactions(&f.pool).await? - before.1,
+    );
+
+    f.pool
+        .execute("NOTIFY pges_es, '1;9223372036854775807;;*'")
+        .await?;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let before = (calls.load(Ordering::Relaxed), transactions(&f.pool).await?);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let forged = (
+        calls.load(Ordering::Relaxed) - before.0,
+        transactions(&f.pool).await? - before.1,
+    );
+
+    f.append(Cat::Jobs, stream::StreamId::new_v7(), 1).await?;
+    let reached = tokio::time::timeout(Duration::from_secs(10), running.wait_position(2)).await;
+    let position = running.handle.status().position;
+
+    running.stop().await?;
+    sequencer.stop().await?;
+    f.finish().await?;
+
+    assert!(
+        forged.0 <= idle.0 + 5,
+        "after one forged notice the waker was called {} times in 1.5 s (idle: {})",
+        forged.0,
+        idle.0
+    );
+    assert!(
+        forged.1 <= idle.1 + 1000,
+        "after one forged notice the database committed {} transactions in 1.5 s (idle: {})",
+        forged.1,
+        idle.1
+    );
+    assert!(
+        matches!(reached, Ok(Ok(()))),
+        "a real append after a forged notice was not delivered within 10 s: still at {position:?}"
+    );
+    Ok(())
+}
+
 /// A forged notice's LSN becomes the WAL position a replica subscription waits for. No replica ever replays
 /// it, so without a fallback the subscription stops delivering.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
