@@ -1973,6 +1973,15 @@ the halt, 43 recovered, 335 after.
   - `pges.check_commit_id` refuses ids that are not UUIDv7 (22023). The CHECK constraints over several
     columns are named (`<table>_<purpose>`) instead of PostgreSQL's `<table>_check`.
 
+- Listed reads fetch commits only up to the merge cut (2026-11-28; schema.md, Read a category from a cursor):
+  every category's log page is read first, then the cut, then the commits of the rows at or below it. Before,
+  each category fetched its whole page's payloads and the rows above the cut were dropped, so with skewed
+  rates a sparse category fetched up to `batch_size` payloads per page to deliver a few. A category with no
+  row at or below the cut runs no fetch. The delivered sequence is unchanged. The one difference is when a
+  missing commit above the cut is noticed: retention that drops it between the statements is now found by
+  the next page's horizon check instead of this page's re-check, which is the same outcome as retention that
+  lands just after the fetch, a schedule the old code already allowed.
+
 ## Open decisions
 
 - Multi-tenancy: a tenant column only, or LIST sub-partitioning.

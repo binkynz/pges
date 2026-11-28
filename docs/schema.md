@@ -572,10 +572,14 @@ In two steps:
 1. A page of the category's log, with the horizon checked in the same statement:
    `crates/pges-subscribe/sql/read/category_log.sql` (`$1` the category id, `$2` the cursor, `$3` `H`, `$4`
    the page size). `log_by_category` covers it as an index-only scan.
-2. The page's commits by id from the category's own partition: `crates/pges-subscribe/sql/read/commits.sql`
-   (`commit_id = ANY($1)`), or `crates/pges-subscribe/sql/read/commits_sharded.sql` for a shard. A custom
-   plan prunes the time leaves to those holding the ids, so planning, locks and execution do not grow with
-   the leaves.
+2. The commits of the page's rows at or below the merge cut (below), by id from the category's own
+   partition: `crates/pges-subscribe/sql/read/commits.sql` (`commit_id = ANY($1)`), or
+   `crates/pges-subscribe/sql/read/commits_sharded.sql` for a shard. A custom plan prunes the time leaves to
+   those holding the ids, so planning, locks and execution do not grow with the leaves. Every category's log
+   page is read before any fetch, so the cut is known: rows above it are read again by the next page, and
+   fetching their payloads would be wasted (with category rates of 100:1 and a full page of the busy
+   category, the sparse one would fetch up to `$4` payloads to deliver about 1% of them). A category with no
+   row at or below the cut runs no fetch.
 
 - The one-statement form looked each commit up in a `LATERAL` subquery with `LIMIT 1`. Its plan covered every
   time leaf: at 1000 daily leaves about 20 ms of custom planning, 5 ms of execution and 2000–3000 locks per
@@ -608,10 +612,11 @@ each has its own snapshot and its own `LIMIT`. The client:
 1. Reads `H`, the store's newest position, 0 for an empty log (`crates/pges-subscribe/sql/read/head.sql`). The
    sequencer writes log rows in order, one transaction at a time, so every position at or below `H` is already
    visible. If `H` is at or below the cursor, no category is read.
-2. Runs each category's query with `$3 = H`, each against that category's horizon.
+2. Runs each category's log query with `$3 = H`, each against that category's horizon.
 3. Lets `cut` be the smallest last row position over the categories that returned exactly `LIMIT` rows, or
    `H` if none did.
-4. Emits only rows at or below `cut` and sets `Batch::last_position = cut`. When `cut = H` this can advance
+4. Fetches the commits of the rows at or below `cut` only, emits them and sets
+   `Batch::last_position = cut`. When `cut = H` this can advance
    the cursor with no rows.
 
 A single query with `category_id = ANY(…)` cannot return rows in position order from the index and would
