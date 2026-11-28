@@ -5,6 +5,7 @@ use anyhow::Result;
 /// A CA, a server certificate it signed for `localhost` and `127.0.0.1`, one it signed for another host, a
 /// client certificate it signed, and an unrelated CA, all PEM.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Pki {
     /// The CA that signed the server and client certificates.
     pub ca: String,

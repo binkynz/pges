@@ -321,6 +321,12 @@ impl Drop for TestDb {
     }
 }
 
+impl std::fmt::Debug for Server {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Server").finish_non_exhaustive()
+    }
+}
+
 impl std::fmt::Debug for TestDb {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TestDb")
