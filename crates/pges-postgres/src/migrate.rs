@@ -8,9 +8,11 @@
 //! - the outbox of a store created with [`store::Outbox::Enabled`], scope `<store>.outbox` ([`OUTBOX`],
 //!   applied by [`run_store`] when it creates the store).
 //!
-//! Every migration runs in its own transaction holding `pg_advisory_xact_lock(hashtext('pges.migrate'))`,
-//! so concurrent runners apply each migration once. Store migrations run with `SET LOCAL search_path` set to
-//! the store, so their SQL uses unqualified names. A migration that was already applied is compared with the
+//! Every migration runs in its own transaction holding the migration lock, a row lock on the `pges` row of
+//! `pges.scopes` (before the shared schema exists, the advisory lock `hashtext('pges.migrate')`), so
+//! concurrent runners apply each migration once. A run waits for the lock for at most
+//! [`MigrateConfig::lock_wait`] in all, then fails with [`MigrateError::LockTimeout`]. Store migrations
+//! run with `SET LOCAL search_path` set to the store, so their SQL uses unqualified names. A migration that was already applied is compared with the
 //! embedded text by its SHA-256 checksum; an edited migration fails with [`MigrateError::ChecksumMismatch`].
 //!
 //! Migrations are expand/contract: a database migrated by a newer release stays usable by older releases
@@ -23,16 +25,35 @@ use futures_util::future::BoxFuture;
 use sha2::{Digest, Sha256};
 use sqlx::{Connection, Executor, PgConnection};
 
-use pges_core::store as core_store;
+use pges_core::{interval, store as core_store};
 
 use crate::{
-    error,
+    error, lock,
     sql::{statement, template, typed::Query as _},
     store,
 };
 
 /// The scope name of the shared `pges` schema.
 pub const SHARED_SCOPE: &str = "pges";
+
+/// How the runner applies migrations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MigrateConfig {
+    /// How long one run ([`run_shared`], [`run_store`] or [`run`]) waits in all for the migration lock
+    /// while another session holds it, before it fails with [`MigrateError::LockTimeout`]. Default
+    /// [`lock::DEFAULT_WAIT`] (60 s). A run that finds every migration applied takes no lock and never
+    /// waits.
+    pub lock_wait: interval::Interval,
+}
+
+impl Default for MigrateConfig {
+    fn default() -> Self {
+        Self {
+            lock_wait: lock::DEFAULT_WAIT,
+        }
+    }
+}
 
 /// One embedded migration.
 #[derive(Debug, Clone, Copy)]
@@ -134,11 +155,20 @@ pub(crate) fn outbox_scope(store: &core_store::StoreName) -> String {
 /// dropped future rolls back. On a connection already inside a transaction, each is a savepoint instead, and a
 /// future dropped while one begins rolls back the caller's whole transaction without its `Transaction`
 /// knowing, so its commit does nothing.
-pub fn run_shared(conn: &mut PgConnection) -> BoxFuture<'_, Result<(), MigrateError>> {
-    Box::pin(run_shared_inner(conn))
+pub fn run_shared<'a>(
+    conn: &'a mut PgConnection,
+    config: &MigrateConfig,
+) -> BoxFuture<'a, Result<(), MigrateError>> {
+    Box::pin(run_shared_inner(
+        conn,
+        lock::Deadline::after(config.lock_wait),
+    ))
 }
 
-async fn run_shared_inner(conn: &mut PgConnection) -> Result<(), MigrateError> {
+async fn run_shared_inner(
+    conn: &mut PgConnection,
+    deadline: lock::Deadline,
+) -> Result<(), MigrateError> {
     ensure_shared_schema_owned(conn).await?;
     let latest = latest_version(SHARED);
     let applied = applied_migrations(conn, SHARED_SCOPE)
@@ -150,7 +180,7 @@ async fn run_shared_inner(conn: &mut PgConnection) -> Result<(), MigrateError> {
 
     for migration in SHARED {
         let mut tx = conn.begin().await.map_err(MigrateError::database)?;
-        lock(&mut tx).await?;
+        lock(&mut tx, &deadline).await?;
 
         let applied = applied_migrations(&mut tx, SHARED_SCOPE)
             .await
@@ -196,14 +226,21 @@ pub fn run_store<'a>(
     conn: &'a mut PgConnection,
     name: &'a core_store::StoreName,
     definition: &'a store::StoreDefinition,
+    config: &MigrateConfig,
 ) -> BoxFuture<'a, Result<(), MigrateError>> {
-    Box::pin(run_store_inner(conn, name, definition))
+    Box::pin(run_store_inner(
+        conn,
+        name,
+        definition,
+        lock::Deadline::after(config.lock_wait),
+    ))
 }
 
 async fn run_store_inner(
     conn: &mut PgConnection,
     store_name: &core_store::StoreName,
     definition: &store::StoreDefinition,
+    deadline: lock::Deadline,
 ) -> Result<(), MigrateError> {
     let scope = store_name.as_str();
 
@@ -214,13 +251,13 @@ async fn run_store_inner(
             .map_err(MigrateError::database)?;
         if is_current(scope, STORE, &applied)? {
             ensure_supported(conn, scope, latest).await?;
-            return run_outbox(conn, store_name).await;
+            return run_outbox(conn, store_name, &deadline).await;
         }
     }
 
     for migration in STORE {
         let mut tx = conn.begin().await.map_err(MigrateError::database)?;
-        lock(&mut tx).await?;
+        lock(&mut tx, &deadline).await?;
 
         if !store_exists(&mut tx, scope).await? {
             create_store(&mut tx, store_name, definition, migration).await?;
@@ -242,7 +279,7 @@ async fn run_store_inner(
         tx.commit().await.map_err(MigrateError::database)?;
     }
 
-    run_outbox(conn, store_name).await
+    run_outbox(conn, store_name, &deadline).await
 }
 
 /// Checks the applied [`OUTBOX`] migrations of a store with the outbox and applies the missing ones. A store
@@ -250,6 +287,7 @@ async fn run_store_inner(
 async fn run_outbox(
     conn: &mut PgConnection,
     store_name: &core_store::StoreName,
+    deadline: &lock::Deadline,
 ) -> Result<(), MigrateError> {
     let scope = outbox_scope(store_name);
     let latest = latest_version(OUTBOX);
@@ -265,7 +303,7 @@ async fn run_outbox(
 
     for migration in OUTBOX {
         let mut tx = conn.begin().await.map_err(MigrateError::database)?;
-        lock(&mut tx).await?;
+        lock(&mut tx, deadline).await?;
 
         let applied = applied_migrations(&mut tx, &scope)
             .await
@@ -284,7 +322,7 @@ async fn run_outbox(
     Ok(())
 }
 
-/// Runs [`run_shared`], then [`run_store`].
+/// Runs [`run_shared`], then [`run_store`]. [`MigrateConfig::lock_wait`] bounds both together.
 ///
 /// Run it on a connection outside a transaction. Each migration then runs in a transaction of its own, which a
 /// dropped future rolls back. On a connection already inside a transaction, each is a savepoint instead, and a
@@ -294,10 +332,12 @@ pub fn run<'a>(
     conn: &'a mut PgConnection,
     name: &'a core_store::StoreName,
     definition: &'a store::StoreDefinition,
+    config: &MigrateConfig,
 ) -> BoxFuture<'a, Result<(), MigrateError>> {
+    let deadline = lock::Deadline::after(config.lock_wait);
     Box::pin(async move {
-        run_shared(conn).await?;
-        run_store(conn, name, definition).await
+        run_shared_inner(conn, deadline).await?;
+        run_store_inner(conn, name, definition, deadline).await
     })
 }
 
@@ -367,6 +407,10 @@ pub enum MigrateError {
         /// The database error.
         source: error::DbError,
     },
+    /// The migration lock stayed taken by another session for longer than [`MigrateConfig::lock_wait`].
+    /// The migrations applied before the wait stay applied; running it again continues.
+    #[error(transparent)]
+    LockTimeout(lock::LockTimeout),
     /// The runner's own queries failed.
     #[error(transparent)]
     Database(error::DbError),
@@ -594,14 +638,75 @@ async fn ensure_shared_schema_owned(conn: &mut PgConnection) -> Result<(), Migra
     }
 }
 
-async fn lock(conn: &mut PgConnection) -> Result<(), MigrateError> {
-    statement::migrate_lock::Query::fixed()
-        .bind(statement::migrate_lock::Params {})
-        .execute(conn)
-        .await
-        .map_err(MigrateError::database)?;
+/// Takes the migration lock for the rest of the transaction, trying until `deadline`.
+async fn lock(conn: &mut PgConnection, deadline: &lock::Deadline) -> Result<(), MigrateError> {
+    let mut pause = lock::FIRST_PAUSE;
+    loop {
+        if try_lock(conn).await.map_err(MigrateError::database)? {
+            return Ok(());
+        }
+        if deadline.passed() {
+            let holder = lock_holder(conn).await.map_err(MigrateError::database)?;
+            return Err(MigrateError::LockTimeout(lock::LockTimeout {
+                lock: lock::Lock::Migration,
+                waited: deadline.wait(),
+                holder,
+            }));
+        }
 
-    Ok(())
+        deadline.pause(&mut pause).await;
+    }
+}
+
+/// Tries the migration lock once: the `pges` row of `pges.scopes`, which only roles with `UPDATE` on the
+/// table can lock. Before the first shared migration created the table, an advisory lock stands for it; the
+/// row is then locked too if the table exists by the time the advisory lock is taken, so a runner never holds
+/// only the advisory lock while another holds the row.
+async fn try_lock(conn: &mut PgConnection) -> Result<bool, sqlx::Error> {
+    if !scopes_table_exists(conn).await? {
+        let locked = statement::migrate_bootstrap_lock::Query::fixed()
+            .bind(statement::migrate_bootstrap_lock::Params {})
+            .fetch_one(&mut *conn)
+            .await?
+            .pg_try_advisory_xact_lock;
+        if !locked || !scopes_table_exists(conn).await? {
+            return Ok(locked);
+        }
+    }
+
+    let row = statement::migrate_lock::Query::fixed()
+        .bind(statement::migrate_lock::Params {})
+        .fetch_optional(conn)
+        .await?;
+
+    Ok(row.is_some())
+}
+
+/// The session holding the migration lock, if PostgreSQL shows one.
+async fn lock_holder(conn: &mut PgConnection) -> Result<Option<lock::LockHolder>, sqlx::Error> {
+    let row = if scopes_table_exists(conn).await? {
+        statement::migrate_lock_holder::Query::fixed()
+            .bind(statement::migrate_lock_holder::Params {})
+            .fetch_optional(conn)
+            .await?
+            .map(|row| (row.pid, row.role))
+    } else {
+        statement::migrate_bootstrap_holder::Query::fixed()
+            .bind(statement::migrate_bootstrap_holder::Params {})
+            .fetch_optional(conn)
+            .await?
+            .map(|row| (row.pid, row.role))
+    };
+
+    Ok(row.and_then(|(pid, role)| lock::LockHolder::from_row(pid, role)))
+}
+
+async fn scopes_table_exists(conn: &mut PgConnection) -> Result<bool, sqlx::Error> {
+    Ok(statement::scopes_table_exists::Query::fixed()
+        .bind(statement::scopes_table_exists::Params {})
+        .fetch_one(conn)
+        .await?
+        .exists)
 }
 
 /// Applied migrations of a scope by version, with their checksums. Empty before the shared schema exists.

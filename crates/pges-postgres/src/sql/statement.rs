@@ -404,13 +404,64 @@ crate::typed_query! {
 }
 
 crate::typed_query! {
-    /// Takes the migration lock.
+    /// Tries to take the migration lock: the `pges` row of `pges.scopes`.
     pub MIGRATE_LOCK, mod migrate_lock {
         name: "migrate/lock",
         files: [sql_file!("migrate/lock.sql")],
         params {},
         row {
-            pg_advisory_xact_lock: (),
+            scope: String,
+        },
+    }
+}
+
+crate::typed_query! {
+    /// Tries to take the advisory lock that stands for the migration lock before the shared schema exists.
+    pub MIGRATE_BOOTSTRAP_LOCK, mod migrate_bootstrap_lock {
+        name: "migrate/bootstrap_lock",
+        files: [sql_file!("migrate/bootstrap_lock.sql")],
+        params {},
+        row {
+            pg_try_advisory_xact_lock: bool,
+        },
+    }
+}
+
+crate::typed_query! {
+    /// Whether `pges.scopes` exists.
+    pub SCOPES_TABLE_EXISTS, mod scopes_table_exists {
+        name: "migrate/scopes_table_exists",
+        files: [sql_file!("migrate/scopes_table_exists.sql")],
+        params {},
+        row {
+            exists: bool as "?column?",
+        },
+    }
+}
+
+crate::typed_query! {
+    /// The session holding the migration lock.
+    pub MIGRATE_LOCK_HOLDER, mod migrate_lock_holder {
+        name: "migrate/lock_holder",
+        files: [sql_file!("migrate/lock_holder.sql")],
+        params {},
+        row {
+            pid: Option<i32>,
+            role: Option<String>,
+        },
+    }
+}
+
+crate::typed_query! {
+    /// The session holding the advisory lock that stands for the migration lock before the shared schema
+    /// exists.
+    pub MIGRATE_BOOTSTRAP_HOLDER, mod migrate_bootstrap_holder {
+        name: "migrate/bootstrap_holder",
+        files: [sql_file!("migrate/bootstrap_holder.sql")],
+        params {},
+        row {
+            pid: Option<i32>,
+            role: Option<String>,
         },
     }
 }
@@ -605,7 +656,7 @@ crate::typed_query! {
 }
 
 crate::typed_query! {
-    /// Takes a store's maintenance lock.
+    /// Tries to take a store's maintenance lock.
     pub MAINTAIN_LOCK, mod maintain_lock {
         name: "maintain/lock",
         files: [sql_file!("maintain/lock.sql")],
@@ -613,7 +664,22 @@ crate::typed_query! {
             store: &'q str,
         },
         row {
-            pg_advisory_lock: (),
+            pg_try_advisory_lock: bool,
+        },
+    }
+}
+
+crate::typed_query! {
+    /// The session holding a store's maintenance lock.
+    pub MAINTAIN_HOLDER, mod maintain_holder {
+        name: "maintain/holder",
+        files: [sql_file!("maintain/holder.sql")],
+        params<'q> {
+            store: &'q str,
+        },
+        row {
+            pid: Option<i32>,
+            role: Option<String>,
         },
     }
 }
@@ -1418,6 +1484,10 @@ pub const ALL: &[&template::Statement] = &[
     &SHARED_SCHEMA_EXISTS,
     &OPEN_STORE,
     &MIGRATE_LOCK,
+    &MIGRATE_BOOTSTRAP_LOCK,
+    &SCOPES_TABLE_EXISTS,
+    &MIGRATE_LOCK_HOLDER,
+    &MIGRATE_BOOTSTRAP_HOLDER,
     &SCOPE,
     &MIN_COMPATIBLE,
     &TOO_OLD,
@@ -1433,6 +1503,7 @@ pub const ALL: &[&template::Statement] = &[
     &RECORD_MIGRATION,
     &SET_SCOPE_VERSION,
     &MAINTAIN_LOCK,
+    &MAINTAIN_HOLDER,
     &MAINTAIN_UNLOCK,
     &MAINTAIN_SESSION,
     &INSERT_CATEGORY,
@@ -1521,6 +1592,10 @@ pub const TYPED: &[typed::Shape] = &[
     typed::Shape::of::<shared_schema_exists::Query>(),
     typed::Shape::of::<open_store::Query>(),
     typed::Shape::of::<migrate_lock::Query>(),
+    typed::Shape::of::<migrate_bootstrap_lock::Query>(),
+    typed::Shape::of::<scopes_table_exists::Query>(),
+    typed::Shape::of::<migrate_lock_holder::Query>(),
+    typed::Shape::of::<migrate_bootstrap_holder::Query>(),
     typed::Shape::of::<scope::Query>(),
     typed::Shape::of::<min_compatible::Query>(),
     typed::Shape::of::<too_old::Query>(),
@@ -1534,6 +1609,7 @@ pub const TYPED: &[typed::Shape] = &[
     typed::Shape::of::<record_migration::Query>(),
     typed::Shape::of::<set_scope_version::Query>(),
     typed::Shape::of::<maintain_lock::Query>(),
+    typed::Shape::of::<maintain_holder::Query>(),
     typed::Shape::of::<maintain_unlock::Query>(),
     typed::Shape::of::<insert_category::Query>(),
     typed::Shape::of::<select_category::Query>(),

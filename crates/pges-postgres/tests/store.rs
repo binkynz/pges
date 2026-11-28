@@ -260,6 +260,82 @@ async fn maintenance_waits_for_another_maintainer() -> Result<()> {
     f.finish().await
 }
 
+/// A maintainer whose lock wait runs out fails with `LockTimeout`, naming the session that holds the lock,
+/// instead of waiting forever for any role that took the store's advisory key.
+#[tokio::test]
+async fn maintenance_gives_up_waiting_and_names_the_holder() -> Result<()> {
+    let f = Fixture::new().await?;
+    let mut holder = f.db.connect().await?;
+    let (pid, role): (i32, String) = sqlx::query_as(
+        "SELECT pg_backend_pid(), session_user::text
+         FROM (SELECT pg_advisory_lock(hashtext('pges.maintain.' || $1))) AS locked",
+    )
+    .bind(common::STORE)
+    .fetch_one(&mut holder)
+    .await?;
+
+    let admin = f.store.admin().with_lock_wait(pges_core::interval!(300 ms));
+    let started = std::time::Instant::now();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(10), admin.maintain())
+        .await
+        .expect("the wait for the maintenance lock is bounded")
+        .unwrap_err();
+    let admin::MaintainError::LockTimeout(timeout) = &error else {
+        panic!("{error}");
+    };
+    assert!(started.elapsed() >= std::time::Duration::from_millis(300));
+    assert_eq!(
+        timeout.lock,
+        pges_postgres::lock::Lock::Maintenance(common::STORE_NAME)
+    );
+    assert_eq!(timeout.waited, std::time::Duration::from_millis(300));
+    let found = timeout.holder.as_ref().expect("the holder is visible");
+    assert_eq!(found.pid.get(), pid);
+    assert_eq!(found.role.as_deref(), Some(role.as_str()));
+    assert!(error.to_string().contains(&format!("pid {pid}")), "{error}");
+
+    holder.close().await?;
+    admin.maintain().await?;
+    f.finish().await
+}
+
+/// Operations waiting for the maintenance lock do not hold pooled connections while they wait, so they cannot
+/// drain the store's pool: here three waiters and a pool of two leave a connection free.
+#[tokio::test]
+async fn operations_waiting_for_the_maintenance_lock_leave_the_pool_free() -> Result<()> {
+    let f = Fixture::new().await?;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(std::time::Duration::from_secs(1))
+        .connect(f.db.url())
+        .await?;
+    let mut holder = f.db.connect().await?;
+    sqlx::query("SELECT pg_advisory_lock(hashtext('pges.maintain.' || $1))")
+        .bind(common::STORE)
+        .execute(&mut holder)
+        .await?;
+
+    let waiting: Vec<_> = (0..3)
+        .map(|_| {
+            let admin = admin::Admin::new(pool.clone(), common::STORE_NAME)
+                .with_lock_wait(pges_core::interval!(30 s));
+            tokio::spawn(async move { admin.maintain().await })
+        })
+        .collect();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let mut free = pool.acquire().await?;
+    sqlx::query("SELECT 1").execute(&mut *free).await?;
+    drop(free);
+    assert!(waiting.iter().all(|task| !task.is_finished()));
+
+    holder.close().await?;
+    for task in waiting {
+        task.await??;
+    }
+    pool.close().await;
+    f.finish().await
+}
+
 /// Maintenance of leaves that already exist runs no DDL on them, so a reader holding a lock on the current
 /// leaf does not block it.
 #[tokio::test]

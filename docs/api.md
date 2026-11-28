@@ -511,8 +511,8 @@ pub struct StoreDefinition {                             // what a store is crea
 ```
 
 - `StoreConfig` opens a store; `StoreDefinition` is what a store is created with. Only
-  `AutoMigrate::CreateOrMigrate(definition)` and `migrate::run(conn, &name, &definition)` read a definition,
-  and only to create a missing store: an existing store keeps its own. `Store::name() -> &StoreName`.
+  `AutoMigrate::CreateOrMigrate(definition)` and `migrate::run(conn, &name, &definition, &config)` read a
+  definition, and only to create a missing store: an existing store keeps its own. `Store::name() -> &StoreName`.
 - `StoreDefinition`, `AutoMigrate`, `admin::CategoryConfig`, `retention::Retention` and `AfterWindow` are
   `Clone` but not `Copy`, so a later variant or field may hold owned data (an archive destination).
 - DCB is not a public option. A DCB store made by another build is refused at open
@@ -603,13 +603,16 @@ set `append_routing` to `AppendRouting::Streams`.
 Migrations and administration:
 
 ```rust
-migrate::run(&mut conn, &name, &definition).await?;         // run_shared, then run_store; both also public
-migrate::run_shared(&mut conn).await?;                      // the shared pges schema
-migrate::run_store(&mut conn, &name, &definition).await?;   // creates the store from the StoreDefinition if
-                                                            // missing, then migrates it; each takes
-                                                            // &mut PgConnection and returns a BoxFuture
+let config = migrate::MigrateConfig::default();             // lock_wait: Interval, 60 s (lock::DEFAULT_WAIT)
+migrate::run(&mut conn, &name, &definition, &config).await?;       // run_shared, then run_store; both public
+migrate::run_shared(&mut conn, &config).await?;                    // the shared pges schema
+migrate::run_store(&mut conn, &name, &definition, &config).await?; // creates the store from the
+                                                            // StoreDefinition if missing, then migrates it;
+                                                            // each takes &mut PgConnection and returns a
+                                                            // BoxFuture
 let admin = store.admin();                        // or admin::Admin::new(pool, store_name!("ops_es")),
                                                   // which cannot fail
+let admin = admin.with_lock_wait(interval!(5 min));   // wait for the maintenance lock; default 60 s
 admin.register_category(JobEvent::CATEGORY, admin::CategoryConfig::default()).await?;
                                                   // CategoryConfig { bucket: Bucket::Day | Month (default),
                                                   //   retention: Option<Retention> (None: store default) }
@@ -830,22 +833,29 @@ outcomes are classified after the statement wrote no row.
 | `load::LoadError` | `Read(ReadError)`, `SnapshotDecode`, `SnapshotSave(SnapshotError)` |
 | `load::SnapshotError` | `Encode`, `UnknownCategory`, `Database` |
 | `unit_of_work::TransactionError` | `Aborted`, `Database` |
-| `migrate::MigrateError` | `SharedSchemaMissing`, `SharedSchemaNotOwned { owner }`, `ChecksumMismatch`, `CrateTooOld`, `OutboxMismatch { store, outbox }`, `Failed`, `Database` |
-| `admin::RegisterCategoryError` | `UnsupportedBucket`, `NameTaken { name }`, `KeepTooLong(Duration)`, `Database` |
-| `admin::MaintainError` | `UnsupportedBucket`, `NameTaken { name }`, `Database` |
-| `admin::ChangeBucketError` | `UnknownCategory`, `NameTaken { name }`, `Database` |
+| `migrate::MigrateError` | `SharedSchemaMissing`, `SharedSchemaNotOwned { owner }`, `ChecksumMismatch`, `CrateTooOld`, `OutboxMismatch { store, outbox }`, `Failed`, `LockTimeout(lock::LockTimeout)`, `Database` |
+| `admin::RegisterCategoryError` | `UnsupportedBucket`, `NameTaken { name }`, `KeepTooLong(Duration)`, `Database`, `LockTimeout` |
+| `admin::MaintainError` | `UnsupportedBucket`, `NameTaken { name }`, `Database`, `LockTimeout` |
+| `admin::ChangeBucketError` | `UnknownCategory`, `NameTaken { name }`, `Database`, `LockTimeout` |
 | `admin::PartitionHeadroomError` | `UnsupportedBucket`, `Database` |
-| `retention::SetRetentionError` | `UnknownCategory`, `KeepTooLong(Duration)`, `Database` |
-| `retention::SetDefaultRetentionError` | `StoreNotFound`, `KeepTooLong(Duration)`, `Database` |
-| `retention::RetentionError` | `SequencerHalted`, `StoreNotFound`, `WriterRole(WriterRoleError)`, `Database` |
-| `retention::PruneLogError` | `UnknownCategory`, `Database` |
-| `freeze::FreezeError` | `StoreNotFound`, `Database` |
+| `retention::SetRetentionError` | `UnknownCategory`, `KeepTooLong(Duration)`, `Database`, `LockTimeout` |
+| `retention::SetDefaultRetentionError` | `StoreNotFound`, `KeepTooLong(Duration)`, `Database`, `LockTimeout` |
+| `retention::RetentionError` | `SequencerHalted`, `StoreNotFound`, `WriterRole(WriterRoleError)`, `Database`, `LockTimeout` |
+| `retention::PruneLogError` | `UnknownCategory`, `Database`, `LockTimeout` |
+| `freeze::FreezeError` | `StoreNotFound`, `Database`, `LockTimeout` |
 | `freeze::PartitionAgesError` | `Database` |
-| `limit::SetWriterLimitsError` | `StoreNotFound`, `Lowering { max_clock_skew, max_txn_age }` (the recorded values, as `Duration`s), `Database` |
+| `limit::SetWriterLimitsError` | `StoreNotFound`, `Lowering { max_clock_skew, max_txn_age }` (the recorded values, as `Duration`s), `Database`, `LockTimeout` |
 | `limit::WriterRoleError` | `UnknownRole`, `TransactionTimeoutNotSet { role }`, `TransactionTimeoutTooLong { role, transaction_timeout, max_txn_age }`, `InvalidTransactionTimeout { role, value }`, `Database` |
 | `delete::DeleteStreamError` | `NotFound`, `Conflict { expected: DeleteExpected, .. }`, `CategoryMismatch`, `StreamDeleted`, `StreamArchived`, `UnknownCategory`, `Write(AppendError)`, `Database` |
 
 How each "no row" outcome is classified is in schema.md (Append).
+
+`LockTimeout` carries a `lock::LockTimeout { lock, waited, holder }`: `lock` is `lock::Lock::Migration` or
+`Maintenance(StoreName)`, `waited` the configured wait, and `holder` an `Option<lock::LockHolder { pid:
+BackendPid, role: Option<String> }>`, the session that held the lock when the wait ran out, from `pg_locks`
+and `pg_stat_activity`. It is never retried by the crate: run the operation again, or end the holder. Every
+`Admin` operation but `partition_headroom` and `partition_ages` can return it; an operation waiting for the
+lock holds a pooled connection only for each try (schema.md, Partition maintenance).
 
 Errors that name a store carry a `StoreName`: `OpenError::StoreNotFound`,
 `SetWriterLimitsError::StoreNotFound`, `SetDefaultRetentionError::StoreNotFound`,

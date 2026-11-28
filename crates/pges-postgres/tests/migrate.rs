@@ -22,7 +22,13 @@ async fn run(
     conn: &mut sqlx::PgConnection,
     name: core_store::StoreName,
 ) -> Result<(), migrate::MigrateError> {
-    migrate::run(conn, &name, &definition(store::Outbox::Disabled)).await
+    migrate::run(
+        conn,
+        &name,
+        &definition(store::Outbox::Disabled),
+        &migrate::MigrateConfig::default(),
+    )
+    .await
 }
 
 async fn run_with_outbox(
@@ -30,7 +36,13 @@ async fn run_with_outbox(
     name: core_store::StoreName,
     outbox: store::Outbox,
 ) -> Result<(), migrate::MigrateError> {
-    migrate::run(conn, &name, &definition(outbox)).await
+    migrate::run(
+        conn,
+        &name,
+        &definition(outbox),
+        &migrate::MigrateConfig::default(),
+    )
+    .await
 }
 
 #[tokio::test]
@@ -101,6 +113,159 @@ async fn concurrent_runners_create_the_store_once() -> Result<()> {
             .fetch_one(&mut conn)
             .await?;
     assert_eq!(stores, 1);
+
+    conn.close().await?;
+    db.cleanup().await
+}
+
+fn waiting(lock_wait: pges_core::interval::Interval) -> migrate::MigrateConfig {
+    let mut config = migrate::MigrateConfig::default();
+    config.lock_wait = lock_wait;
+    config
+}
+
+/// The migration lock is a row only roles with `UPDATE` on `pges.scopes` can lock. A role that can only
+/// connect, holding the advisory key the lock used to be, blocks neither store creation nor the
+/// one-source-kind trigger, and a role that reads `pges.scopes` cannot lock the row. Before, both waited
+/// forever.
+#[tokio::test]
+async fn a_role_that_can_only_connect_cannot_block_migrations() -> Result<()> {
+    let db = pges_testing::TestDb::new().await?;
+    let role = format!("{}_squatter", db.name());
+    let mut squatter = db.connect().await?;
+    squatter
+        .execute(sqlx::AssertSqlSafe(format!(
+            "CREATE ROLE {role};
+             GRANT USAGE ON SCHEMA pges TO {role};
+             GRANT SELECT ON pges.scopes TO {role};
+             SET ROLE {role};
+             SELECT pg_advisory_lock(hashtext('pges.migrate'));"
+        )))
+        .await?;
+    let error = sqlx::query("SELECT FROM pges.scopes WHERE scope = 'pges' FOR UPDATE")
+        .execute(&mut squatter)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.as_database_error().and_then(|e| e.code()).as_deref(),
+        Some("42501")
+    );
+
+    let mut conn = db.connect().await?;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        run(&mut conn, store_name!("free")),
+    )
+    .await
+    .expect("migrations do not wait for the advisory key")?;
+    assert_eq!(store_names(&mut conn).await?, ["free"]);
+
+    squatter.close().await?;
+    conn.execute(sqlx::AssertSqlSafe(format!(
+        "DROP OWNED BY {role}; DROP ROLE {role}"
+    )))
+    .await?;
+    conn.close().await?;
+    db.cleanup().await
+}
+
+/// A runner waits for the migration lock while another session holds it, up to its lock wait, then fails
+/// with `LockTimeout` naming that session's pid and role and creates nothing. Once the lock is free it
+/// creates the store, and a runner whose wait is longer than the hold waits for it.
+#[tokio::test]
+async fn a_runner_gives_up_waiting_for_the_migration_lock_and_names_the_holder() -> Result<()> {
+    let db = pges_testing::TestDb::new().await?;
+    let mut holder = db.connect().await?;
+    let mut tx = holder.begin().await?;
+    let (pid, role): (i32, String) = sqlx::query_as(
+        "SELECT pg_backend_pid(), session_user::text
+         FROM pges.scopes WHERE scope = 'pges' FOR UPDATE",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+
+    let mut conn = db.connect().await?;
+    let started = std::time::Instant::now();
+    let error = migrate::run(
+        &mut conn,
+        &store_name!("late"),
+        &definition(store::Outbox::Disabled),
+        &waiting(pges_core::interval!(300 ms)),
+    )
+    .await
+    .unwrap_err();
+    let migrate::MigrateError::LockTimeout(timeout) = &error else {
+        panic!("{error}");
+    };
+    assert!(started.elapsed() >= std::time::Duration::from_millis(300));
+    assert_eq!(timeout.lock, pges_postgres::lock::Lock::Migration);
+    let found = timeout.holder.as_ref().expect("the holder is visible");
+    assert_eq!(found.pid.get(), pid);
+    assert_eq!(found.role.as_deref(), Some(role.as_str()));
+    assert!(store_names(&mut conn).await?.is_empty());
+
+    let patient = tokio::spawn(async move {
+        let result = migrate::run(
+            &mut conn,
+            &store_name!("late"),
+            &definition(store::Outbox::Disabled),
+            &waiting(pges_core::interval!(30 s)),
+        )
+        .await;
+        (result, conn)
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!patient.is_finished(), "the runner waits for the lock");
+    tx.commit().await?;
+    let (result, mut conn) = patient.await?;
+    result?;
+    assert_eq!(store_names(&mut conn).await?, ["late"]);
+
+    holder.close().await?;
+    conn.close().await?;
+    db.cleanup().await
+}
+
+/// Before the shared schema exists, an advisory lock stands for the migration lock: concurrent first runs
+/// apply the shared migrations once, and a run whose wait runs out while another session holds the key fails
+/// with `LockTimeout` naming it.
+#[tokio::test]
+async fn the_first_shared_migration_is_serialised_by_the_bootstrap_lock() -> Result<()> {
+    let db = pges_testing::TestDb::new().await?;
+    let mut conn = db.connect().await?;
+    conn.execute("DROP PUBLICATION pges; DROP SCHEMA pges CASCADE")
+        .await?;
+    let mut holder = db.connect().await?;
+    let pid: i32 = sqlx::query_scalar(
+        "SELECT pg_backend_pid() FROM (SELECT pg_advisory_lock(hashtext('pges.migrate'))) AS locked",
+    )
+    .fetch_one(&mut holder)
+    .await?;
+
+    let error = migrate::run_shared(&mut conn, &waiting(pges_core::interval!(300 ms)))
+        .await
+        .unwrap_err();
+    let migrate::MigrateError::LockTimeout(timeout) = &error else {
+        panic!("{error}");
+    };
+    assert_eq!(timeout.holder.as_ref().map(|h| h.pid.get()), Some(pid));
+    holder.close().await?;
+
+    let mut runners = Vec::new();
+    for _ in 0..4 {
+        let mut conn = db.connect().await?;
+        runners.push(tokio::spawn(async move {
+            migrate::run_shared(&mut conn, &migrate::MigrateConfig::default()).await
+        }));
+    }
+    for runner in runners {
+        runner.await??;
+    }
+    let applied: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM pges.migrations WHERE scope = 'pges'")
+            .fetch_one(&mut conn)
+            .await?;
+    assert_eq!(applied, 1);
 
     conn.close().await?;
     db.cleanup().await
@@ -408,11 +573,18 @@ async fn a_store_with_over_1000_stream_partitions_names_them_by_the_widest_remai
     let mut conn = db.connect().await?;
     let mut wide = definition(store::Outbox::Disabled);
     wide.stream_partitions = NonZeroU16::new(1001).unwrap();
-    migrate::run(&mut conn, &store_name!("wide"), &wide).await?;
+    migrate::run(
+        &mut conn,
+        &store_name!("wide"),
+        &wide,
+        &migrate::MigrateConfig::default(),
+    )
+    .await?;
     migrate::run(
         &mut conn,
         &store_name!("narrow"),
         &definition(store::Outbox::Disabled),
+        &migrate::MigrateConfig::default(),
     )
     .await?;
 
@@ -593,8 +765,14 @@ async fn a_role_that_does_not_own_the_publication_creates_only_outbox_stores() -
             .await?;
 
         // The shared schema belongs to the owner, who migrated it: the creator only creates the store.
-        let created = migrate::run_store(&mut conn, &store_name!("n1"), &definition(outbox)).await;
-        let shared = migrate::run_shared(&mut conn).await;
+        let created = migrate::run_store(
+            &mut conn,
+            &store_name!("n1"),
+            &definition(outbox),
+            &migrate::MigrateConfig::default(),
+        )
+        .await;
+        let shared = migrate::run_shared(&mut conn, &migrate::MigrateConfig::default()).await;
         assert!(
             matches!(
                 shared,
@@ -705,7 +883,7 @@ async fn a_schema_of_another_role_is_refused_with_its_migrations_applied() -> Re
     .await?;
     conn.execute(sqlx::AssertSqlSafe(format!("SET ROLE {squatter}")))
         .await?;
-    migrate::run_shared(&mut conn).await?;
+    migrate::run_shared(&mut conn, &migrate::MigrateConfig::default()).await?;
     conn.execute("RESET ROLE").await?;
 
     let error = run(&mut conn, store_name!("q1")).await.unwrap_err();
@@ -713,7 +891,9 @@ async fn a_schema_of_another_role_is_refused_with_its_migrations_applied() -> Re
         matches!(&error, migrate::MigrateError::SharedSchemaNotOwned { owner } if *owner == squatter),
         "{error}"
     );
-    let error = migrate::run_shared(&mut conn).await.unwrap_err();
+    let error = migrate::run_shared(&mut conn, &migrate::MigrateConfig::default())
+        .await
+        .unwrap_err();
     assert!(
         matches!(&error, migrate::MigrateError::SharedSchemaNotOwned { .. }),
         "{error}"
@@ -728,7 +908,9 @@ async fn a_schema_of_another_role_is_refused_with_its_migrations_applied() -> Re
     // A member of the owner is refused as itself, and migrates after SET ROLE to the owner.
     conn.execute(sqlx::AssertSqlSafe(format!("SET ROLE {member}")))
         .await?;
-    let error = migrate::run_shared(&mut conn).await.unwrap_err();
+    let error = migrate::run_shared(&mut conn, &migrate::MigrateConfig::default())
+        .await
+        .unwrap_err();
     assert!(
         matches!(&error, migrate::MigrateError::SharedSchemaNotOwned { .. }),
         "{error}"

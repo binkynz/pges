@@ -1,5 +1,12 @@
--- Takes the migration lock until the transaction ends, so concurrent runners apply each migration once.
+-- Tries to take the migration lock until the transaction ends: the `pges` row of pges.scopes. One row:
+-- taken; no row: another transaction holds it. Concurrent runners apply each migration once.
 --
--- The trigger that keeps one source kind per database (pges.check_one_source_kind) takes the same lock, so
--- two transactions adding stores of different kinds serialize and the second sees the first's row.
-SELECT pg_advisory_xact_lock(hashtext('pges.migrate'))
+-- Only roles with UPDATE on pges.scopes can lock the row (its owner, and store creators, who record their
+-- migrations there), unlike an advisory lock, which every role that can connect may take. The trigger that
+-- keeps one source kind per database (pges.check_one_source_kind) locks the same row, so two transactions
+-- adding stores of different kinds serialize and the second sees the first's row; the runner already holds
+-- it when its insert fires the trigger.
+--
+-- SKIP LOCKED instead of a wait in the server: the runner tries again until its lock wait runs out, then
+-- reports who holds the row (migrate/lock_holder.sql).
+SELECT scope FROM pges.scopes WHERE scope = 'pges' FOR UPDATE SKIP LOCKED

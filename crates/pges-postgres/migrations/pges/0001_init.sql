@@ -1,6 +1,7 @@
 -- pges/0001_init.sql
 -- Shared objects, once per database. Applied by the crate's migration runner inside one transaction,
--- holding pg_advisory_xact_lock(hashtext('pges.migrate')).
+-- holding pg_advisory_xact_lock(hashtext('pges.migrate')), which stands for the migration lock until
+-- pges.scopes exists; later migrations lock the scope's row in pges.scopes instead.
 
 CREATE SCHEMA IF NOT EXISTS pges;
 
@@ -45,14 +46,15 @@ CREATE TABLE pges.stores (
 );
 
 -- One kind of sequencer source per database: either every store has the outbox or none has. A store row is
--- inserted with its final outbox flag. The check first takes the migration runner's lock (which the runner
--- already holds), so of two READ COMMITTED transactions adding stores of different kinds, the second sees the
--- first's row once it commits. SQLSTATE PGE02 maps to MigrateError::OutboxMismatch.
+-- inserted with its final outbox flag. The check first takes the migration lock, the 'pges' row of
+-- pges.scopes (which the runner already holds), so of two READ COMMITTED transactions adding stores of
+-- different kinds, the second sees the first's row once it commits. A row lock, not an advisory lock, so
+-- only roles with UPDATE on pges.scopes can hold it. SQLSTATE PGE02 maps to MigrateError::OutboxMismatch.
 CREATE FUNCTION pges.check_one_source_kind() RETURNS trigger
   LANGUAGE plpgsql
 AS $$
 BEGIN
-  PERFORM pg_advisory_xact_lock(hashtext('pges.migrate'));
+  PERFORM 1 FROM pges.scopes WHERE scope = 'pges' FOR UPDATE;
   IF EXISTS (SELECT 1 FROM pges.stores WHERE outbox <> NEW.outbox) THEN
     RAISE EXCEPTION 'store % has outbox = %, unlike the other stores of this database', NEW.schema_name,
       NEW.outbox USING ERRCODE = 'PGE02';

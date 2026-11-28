@@ -72,7 +72,13 @@ async fn quickstart(db: &database::Database) -> Result<()> {
     let pool = db.pool().await?;
     let config = store::StoreConfig::new(pges::core::store_name!("shop"));
     let mut conn = pool.acquire().await?;
-    migrate::run(&mut conn, &config.name, &store::StoreDefinition::default()).await?;
+    migrate::run(
+        &mut conn,
+        &config.name,
+        &store::StoreDefinition::default(),
+        &migrate::MigrateConfig::default(),
+    )
+    .await?;
     drop(conn);
 
     let store = store::Store::open(pool.clone(), config).await?;
