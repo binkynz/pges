@@ -1414,3 +1414,128 @@ async fn a_subscription_past_its_crate_does_not_take_a_released_lease() -> Resul
     }
     Ok(())
 }
+
+/// Counts its calls; the first waits until the test lets it go. Implements both handler kinds.
+#[derive(Clone)]
+struct FirstWaits {
+    calls: Arc<Mutex<usize>>,
+    entered: Arc<Notify>,
+    go: Arc<Notify>,
+}
+
+impl FirstWaits {
+    fn new() -> Self {
+        Self {
+            calls: Arc::new(Mutex::new(0)),
+            entered: Arc::new(Notify::new()),
+            go: Arc::new(Notify::new()),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        *self.calls.lock().unwrap()
+    }
+
+    async fn call(&self) {
+        let call = {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            *calls
+        };
+        if call == 1 {
+            self.entered.notify_one();
+            self.go.notified().await;
+        }
+    }
+}
+
+impl handler::Handler for FirstWaits {
+    async fn handle(&mut self, _batch: &batch::Batch) -> Result<(), handler::HandlerError> {
+        self.call().await;
+        Ok(())
+    }
+}
+
+impl handler::PgHandler for FirstWaits {
+    async fn handle(
+        &mut self,
+        _tx: &mut PgConnection,
+        _batch: &batch::Batch,
+    ) -> Result<(), handler::HandlerError> {
+        self.call().await;
+        Ok(())
+    }
+}
+
+/// A migration that drops support for this crate between lease renewals stops the subscription with
+/// `CrateTooOld` at the checkpoint that renews the lease, whether it checkpoints a delivered batch or an
+/// empty page that only moves the cursor, for `run` and `run_pg`. The refused checkpoint leaves the cursor and
+/// the fence where they were, so reading the cursor again tells nothing: reading the same page and being
+/// refused again would go on forever, the handler called again each time.
+///
+/// The first batch's handler waits while the test raises `min_compatible` and locks the log, so the next page
+/// is read only after more than half of the lease has gone: its checkpoint renews the lease, and no renewal
+/// runs before it.
+#[tokio::test]
+async fn a_migration_past_the_crate_stops_a_subscription_at_a_renewing_checkpoint() -> Result<()> {
+    for pg in [false, true] {
+        for empty in [false, true] {
+            let case = format!("run_pg {pg}, empty page {empty}");
+            let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+            f.append(Cat::Jobs, stream::StreamId::new_v7(), 1).await?;
+            let next = if empty { Cat::Orders } else { Cat::Jobs };
+            f.append(next, stream::StreamId::new_v7(), 1).await?;
+            f.sequence_all().await?;
+
+            let handler = FirstWaits::new();
+            let builder = f
+                .store
+                .subscription(subscription_name!("old"))
+                .categories(non_empty![category!("jobs")])
+                .batch_size(NonZeroU32::new(1).unwrap())
+                .lease(interval!(400 ms));
+            let running = common::Running::spawn(if pg {
+                builder.run_pg(handler.clone())
+            } else {
+                builder.run(handler.clone())
+            });
+
+            tokio::time::timeout(Duration::from_secs(10), handler.entered.notified())
+                .await
+                .context("the first batch was not delivered")?;
+            let updated = sqlx::query(
+                "UPDATE pges.scopes SET schema_version = 9, min_compatible = 9 WHERE scope = 'es'",
+            )
+            .execute(&f.pool)
+            .await?;
+            assert_eq!(updated.rows_affected(), 1);
+            let mut lock = f.pool.begin().await?;
+            sqlx::query("LOCK TABLE es.log IN ACCESS EXCLUSIVE MODE")
+                .execute(&mut *lock)
+                .await?;
+            handler.go.notify_one();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            lock.rollback().await?;
+
+            let stopped = running.stopped().await;
+            let calls = handler.calls();
+            let error =
+                stopped.with_context(|| format!("{case}: the handler was called {calls} times"))?;
+            assert!(
+                matches!(
+                    &error,
+                    subscription::SubscribeError::CrateTooOld { scope, min_compatible, .. }
+                        if scope == "es" && min_compatible.get() == 9
+                ),
+                "{case}: {error}"
+            );
+            assert_eq!(
+                calls,
+                if empty { 1 } else { 2 },
+                "{case}: the refused batch was not handled again"
+            );
+            f.finish().await?;
+        }
+    }
+    Ok(())
+}

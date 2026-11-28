@@ -1415,7 +1415,7 @@ impl Runner {
         if !page.batch.is_empty() {
             match self.deliver(term, &page.batch, shutdown).await? {
                 Delivered::Checkpointed => {}
-                Delivered::Refused => return self.reread_cursor(term).await,
+                Delivered::Refused => return self.refused(term).await,
                 Delivered::LostLease => return Ok(Step::LostLease),
                 Delivered::Shutdown => return Ok(Step::Shutdown),
             }
@@ -1427,7 +1427,7 @@ impl Runner {
                 .await?
             {
                 Checkpoint::Moved(renewed) => renew(term, renewed),
-                Checkpoint::Refused => return self.reread_cursor(term).await,
+                Checkpoint::Refused => return self.refused(term).await,
             }
         }
 
@@ -1443,6 +1443,20 @@ impl Runner {
         // The cut, not `H`: a cursor can be ahead of `H` (Start::Position past the log), and a level-triggered
         // waker given `H` would fire again at once.
         Ok(Step::CaughtUp(reader.known(cut)))
+    }
+
+    /// After a refused checkpoint ([`Checkpoint::Refused`]), reads the stored cursor into `term` to read on
+    /// from it ([`Step::More`]), if a COMMIT whose reply was lost moved it. If the fence moved on, or the
+    /// cursor is still `term.cursor`, the lease is lost ([`Step::LostLease`]): with the fence and the cursor
+    /// in place, a renewing checkpoint was refused because a migration dropped support for this crate, which
+    /// [`Ctx::lost_lease`] reports. Reading on from the same cursor would read the same page and be refused
+    /// again, forever.
+    async fn refused(&mut self, term: &mut Term) -> Result<Step, SubscribeError> {
+        let held = term.cursor;
+        match self.reread_cursor(term).await? {
+            Step::More if term.cursor == held => Ok(Step::LostLease),
+            step => Ok(step),
+        }
     }
 
     /// Reads the stored cursor into `term`: [`Step::More`] to read on from it, or [`Step::LostLease`] if the
