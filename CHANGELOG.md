@@ -6,6 +6,13 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the crates
 
 ## [Unreleased]
 
+### Fixed
+
+- A stream read or `load` that retention truncated between reading the stream's head and fetching its
+  commits did not fail: it returned the stream without its first events (`load` built the aggregate
+  from the rest). It now fails with `ReadError::Truncated`, or `StreamDeleted` when the stream was deleted
+  meanwhile.
+
 ## [0.1.0] - 2026-11-27
 
 The first release: `pges`, `pges-core`, `pges-derive`, `pges-postgres`, `pges-subscribe`, `pges-sequencer`,
