@@ -751,7 +751,9 @@ the replica's WAL page and segment sizes once (`crates/pges-subscribe/sql/replic
 - With `Replica::fallback(after, limit)`, once the replica has lagged longer than `after`, one page is read
   from the primary while a permit of `limit` is free. Errors reading the replica's position then count
   as lag.
-- Each shard of a sharded subscription waits for its own LSN target.
+- Each shard of a sharded subscription waits for its own LSN target. A shard that was busy through more than
+  one wake sees only the latest, so it takes the primary's insert position as its target, not that wake's
+  LSN.
 
 ### Slot and origin names
 

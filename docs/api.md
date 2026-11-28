@@ -1050,7 +1050,8 @@ The first `.categories(..)` takes a `NonEmpty<CategoryName>`, later ones any ite
   the lowest cursor of its held shards, and can step back when it takes a shard that is behind.
 - `.replica(pool)`: pages are read from a streaming replica after it has replayed the waker's LSN, or the
   primary's insert LSN when the waker gives none (schema.md, Replica reads). The waker's LSN is untrusted:
-  one the replica has not replayed is lowered to the primary's insert LSN before the wait. Checkpoints, leases, `run_pg`
+  one the replica has not replayed is lowered to the primary's insert LSN before the wait. A shard that was
+  busy through more than one wake waits for the primary's insert LSN, not the latest wake's. Checkpoints, leases, `run_pg`
   transactions, horizon checks and event-type loads stay on the store's pool. It waits however long the
   replica lags, and a pool whose server is not in recovery is read without waiting. With
   `Replica::fallback(after, limit)` it reads one page at a time from the primary once the replica has lagged
