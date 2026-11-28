@@ -319,4 +319,19 @@ mod tests {
         assert!(parse(Bytes::from_static(b"x")).is_err());
         assert!(parse(Bytes::new()).is_err());
     }
+
+    proptest::proptest! {
+        /// CopyData from the server never panics the parser: arbitrary bytes after each tag, at lengths
+        /// around the XLogData header and the keepalive.
+        #[test]
+        fn parse_never_panics(
+            tag in proptest::sample::select(b"wkx".as_slice()),
+            body in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
+        ) {
+            let mut bytes = vec![tag];
+            bytes.extend_from_slice(&body);
+
+            let _ = parse(Bytes::from(bytes));
+        }
+    }
 }

@@ -1981,6 +1981,7 @@ version = "0.1.0"
 dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
+ "proptest",
  "prost",
  "serde",
  "serde_json",
@@ -2063,6 +2064,7 @@ dependencies = [
  "pges-core",
  "pges-testing",
  "postgres-protocol",
+ "proptest",
  "rcgen",
  "rustls",
  "rustls-native-certs",
