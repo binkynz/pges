@@ -470,7 +470,8 @@ impl Running {
         let _ = self.task.await;
         sqlx::query(
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-             WHERE application_name = $1 AND pid <> pg_backend_pid()",
+             WHERE datname = current_database() AND application_name = $1
+               AND pid <> pg_backend_pid()",
         )
         .bind(application_name)
         .execute(server)

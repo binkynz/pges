@@ -72,6 +72,11 @@ database until the next sweep; clean them up as for tests (Isolation).
 - Replication slot names are server-wide. Tests that create slots derive the name from their database and drop
   the slot before cleanup. Sequencer tests with the logical source create slot `pges_<oid>` for their test
   database and drop it in `Fixture::finish`, once every sequencer has stopped.
+- `application_name` is not unique either: concurrent test binaries, and other runs on the same server, use
+  the same names (`inv_seq_1`). A test that finds or ends sessions by name also filters on
+  `datname = current_database()` (the sequencer fixture's `Running::crash`, `term.rs`, `crash.rs`, the
+  invariants harness's `Seq::crash`). Without it, one run's simulated crash ended another run's sequencer,
+  which then failed with "terminating connection due to administrator command".
 - The server runs with `fsync`, `synchronous_commit` and `full_page_writes` off. Tests that read logical
   decoding output set `synchronous_commit = on` in their session, because decoding sees only flushed WAL.
   The sequencer fixture's writers pool sets it through connect options, for both source kinds.

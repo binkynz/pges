@@ -284,7 +284,8 @@ async fn start_named(f: &Fixture, name: &str, behaviour: Behaviour) -> Result<(R
 /// Ends every session of `application_name` and waits until they are gone.
 async fn terminate(pool: &PgPool, application_name: &str) -> Result<()> {
     let ended: Vec<bool> = sqlx::query_scalar(
-        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = $1",
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+         WHERE datname = current_database() AND application_name = $1",
     )
     .bind(application_name)
     .fetch_all(pool)
@@ -292,11 +293,13 @@ async fn terminate(pool: &PgPool, application_name: &str) -> Result<()> {
     ensure!(!ended.is_empty(), "no session of {application_name}");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let left: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE application_name = $1")
-                .bind(application_name)
-                .fetch_one(pool)
-                .await?;
+        let left: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+                 WHERE datname = current_database() AND application_name = $1",
+        )
+        .bind(application_name)
+        .fetch_one(pool)
+        .await?;
         if left == 0 {
             return Ok(());
         }
