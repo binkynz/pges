@@ -126,8 +126,9 @@ pub(crate) fn outbox_scope(store: &core_store::StoreName) -> String {
 /// Applies every [`SHARED`] migration the database does not have yet.
 ///
 /// Fails if an applied migration was edited, or if the database requires a newer crate. Fails with
-/// [`MigrateError::SharedSchemaNotOwned`] when a schema `pges` exists before the first migration and the
-/// current role is not its owner.
+/// [`MigrateError::SharedSchemaNotOwned`], before it reads or writes anything in the schema, when a schema
+/// `pges` exists and the current role (`current_user`) is not its owner, whatever the schema holds: migrate
+/// as the owner, or `SET ROLE` to it first.
 ///
 /// Run it on a connection outside a transaction. Each migration then runs in a transaction of its own, which a
 /// dropped future rolls back. On a connection already inside a transaction, each is a savepoint instead, and a
@@ -138,6 +139,7 @@ pub fn run_shared(conn: &mut PgConnection) -> BoxFuture<'_, Result<(), MigrateEr
 }
 
 async fn run_shared_inner(conn: &mut PgConnection) -> Result<(), MigrateError> {
+    ensure_shared_schema_owned(conn).await?;
     let latest = latest_version(SHARED);
     let applied = applied_migrations(conn, SHARED_SCOPE)
         .await
@@ -157,9 +159,7 @@ async fn run_shared_inner(conn: &mut PgConnection) -> Result<(), MigrateError> {
             verify_checksum(SHARED_SCOPE, migration, checksum)?;
             continue;
         }
-        if applied.is_empty() {
-            ensure_shared_schema_owned(&mut tx).await?;
-        } else {
+        if !applied.is_empty() {
             ensure_supported(&mut tx, SHARED_SCOPE, latest).await?;
         }
 
@@ -182,6 +182,11 @@ async fn run_shared_inner(conn: &mut PgConnection) -> Result<(), MigrateError> {
 /// (SQLSTATE 42501) when the `pges` publication exists and the role lacks the privileges of its owner, which
 /// adding the store's `commits` to it needs. Without the publication the store is created outside it, and the
 /// logical source adds it.
+///
+/// Unlike [`run_shared`], it does not check who owns the schema `pges`: it trusts the schema the owner
+/// migrated, so a role granted the store creator's privileges there can create stores without owning it. Call
+/// it alone only after the owner ran [`run_shared`] (or [`run`]); on a database whose `pges` may belong to
+/// someone else, run [`run`], which checks first.
 ///
 /// Run it on a connection outside a transaction. Each migration then runs in a transaction of its own, which a
 /// dropped future rolls back. On a connection already inside a transaction, each is a savepoint instead, and a
@@ -303,12 +308,13 @@ pub enum MigrateError {
     /// The shared `pges` schema is missing; run [`run_shared`] first.
     #[error("the shared pges schema is missing; run the shared migrations first")]
     SharedSchemaMissing,
-    /// The schema `pges` exists before the first shared migration and belongs to another role. A schema's
-    /// owner may drop any table in it and put its own in its place, whose triggers then run as each role
-    /// that writes to it, so the runner does not create the shared tables there. Nothing was created.
-    /// Migrate as `owner`, or drop the schema. Being a superuser or a member of `owner` is not enough.
+    /// The schema `pges` belongs to another role than the migrating one (`current_user`). A schema's owner
+    /// may drop any table in it and put its own in its place, whose triggers then run as each role that
+    /// writes to it, so the runner neither reads nor writes it, whatever it holds. Nothing was changed.
+    /// Migrate as `owner` (a login role that inherits from a NOLOGIN owner runs `SET ROLE <owner>` first),
+    /// or drop the schema if nobody should own it. Being a superuser or a member of `owner` is not enough.
     #[error(
-        "schema pges already exists and belongs to {owner}, not to the migrating role; migrate as {owner} or \
+        "schema pges belongs to {owner}, not to the migrating role; migrate as {owner} (SET ROLE {owner}) or \
          drop the schema"
     )]
     SharedSchemaNotOwned {
@@ -570,7 +576,9 @@ async fn ensure_supported(
     }
 }
 
-/// Refuses to create the shared tables in a `pges` schema that already exists and belongs to another role.
+/// Refuses a `pges` schema that belongs to another role than `current_user`. It reads the catalog only, so
+/// nothing in the schema (a `pges.migrations` its owner filled in, a view in place of a table) can make it
+/// pass, and it runs before the runner reads or writes the schema.
 async fn ensure_shared_schema_owned(conn: &mut PgConnection) -> Result<(), MigrateError> {
     let row = statement::shared_schema_owner::Query::fixed()
         .bind(statement::shared_schema_owner::Params {})

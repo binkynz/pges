@@ -1,5 +1,5 @@
--- The owner of an existing schema pges, read before the first shared migration creates its tables there. No
--- row: the schema does not exist.
+-- The owner of an existing schema pges, read from the catalog before every shared migration run reads or
+-- writes the schema. No row: the schema does not exist.
 --
 -- `owned` is whether the current role is the owner itself. Membership in the owner's role is not enough, and
 -- neither is being a superuser: a schema's owner may drop any table in it and put its own in its place, with
