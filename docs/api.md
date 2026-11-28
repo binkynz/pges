@@ -1155,6 +1155,12 @@ The first `.categories(..)` takes a `NonEmpty<CategoryName>`, later ones any ite
   after the subscription was created) is checked against its horizon again. `Start::Position(horizon)` is
   not a substitute: a kept commit can be positioned below the horizon. After `CursorBeforeHorizon`, rebuild
   under a new name (or `.redefine(Start::Retained)` with a changed definition) from `Start::Retained`.
+  `Start::Beginning` does not skip: it fails with `CursorBeforeHorizon` on a category whose retention
+  dropped events.
+- Limit of `Start::Retained`: until a store-wide subscription's cursor passes `skip_through`, a commit
+  missing at or below the horizon of a skipped category is taken as dropped without consulting
+  `deleted_commits`, so a commit missing there for another reason (deleted by hand) is skipped, not
+  reported as `Corrupt` (design.md, Decided, Retention start position).
 - Without a waker, a caught-up subscription uses `waker::recheck::Recheck::default()`: it reads the log again
   every 500 ms. A plain timer, which works with no features; a custom interval is
   `.waker(waker::recheck::Recheck::every(interval!(..)))`.

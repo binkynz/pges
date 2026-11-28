@@ -105,7 +105,10 @@ The first release: `pges`, `pges-core`, `pges-derive`, `pges-postgres`, `pges-su
   dropped leaf's last commit, stays. `Start::Retained` creates a subscription that reads every event
   retention kept and skips the dropped ones (`subscriptions.skip_through`); backfills read from the start
   position instead of the horizon, so neither misses a kept commit below the horizon. Running subscriptions
-  behind the horizon still fail with `CursorBeforeHorizon`.
+  behind the horizon, and `Start::Beginning` on a category whose retention dropped commits, still fail with
+  `CursorBeforeHorizon`, whose advice now points to `Start::Retained`. Until a store-wide `Retained`
+  subscription passes the position it skips through, a commit missing at or below a skipped category's
+  horizon is skipped as dropped, not reported as `Corrupt`.
 
 ### Stability
 

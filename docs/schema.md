@@ -761,7 +761,9 @@ a type id not yet loaded.
 - `coalesce` lets a store with no categories pass the check.
 - A cursor behind the highest horizon of any category raises `CursorBeforeHorizon`, except horizons at or
   below `skip_through` (`Start::Retained`): a missing commit of such a category at or below its horizon was
-  dropped and its log row is skipped.
+  dropped and its log row is skipped. This does not consult `deleted_commits`, so a commit missing there
+  for another reason (deleted by hand) is skipped too, not reported as `Corrupt` (design.md, Decided,
+  Retention start position).
 - Rows at or below their category's start name dropped commits. While the cursor is below `skip_through`,
   `log_retained.sql` leaves them out in the statement (a correlated lookup of the row's category in the
   small `categories` table per row scanned), so a page holds rows that may still have a commit. Otherwise

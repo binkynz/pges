@@ -856,6 +856,11 @@ pub enum Start {
     /// one of an event retention dropped), which covers every drop before it and any drop
     /// of those events while it catches up. A later drop of events written after it was created, while
     /// its cursor is behind them, still fails with [`SubscribeError::CursorBeforeHorizon`].
+    ///
+    /// Limit: until a store-wide subscription has read past that position, an event missing at or below
+    /// the retention horizon of such a category is taken as dropped and skipped. An event missing there
+    /// for another reason, such as one deleted by hand, is skipped too, not reported as
+    /// [`SubscribeError::Corrupt`].
     Retained,
 }
 
