@@ -996,6 +996,112 @@ async fn prune_log_keeps_the_rows_above_the_coarse_mark() -> Result<()> {
     f.finish().await
 }
 
+/// Truncates `stream` up to `floor` as retention does, raising its floor and then dropping `leaf`, while
+/// `read` waits between reading the stream's head and fetching its first page (held there by a lock on
+/// `commits_jobs`). Returns what `read` returned.
+async fn truncate_during<T: Send + 'static>(
+    f: &Fixture,
+    stream: stream::StreamId,
+    floor: i64,
+    leaf: &str,
+    read: impl Future<Output = T> + Send + 'static,
+) -> Result<T> {
+    let mut tx = f.pool.begin().await?;
+    tx.execute("LOCK TABLE es.commits_jobs IN ACCESS EXCLUSIVE MODE")
+        .await?;
+    let reading = tokio::spawn(read);
+    let mut waiting = false;
+    for _ in 0..500 {
+        let blocked: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(&f.pool)
+        .await?;
+        if blocked > 0 {
+            waiting = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(waiting, "the read never waited for its page");
+    sqlx::query("UPDATE es.streams SET floor_version = $2 WHERE stream_id = $1")
+        .bind(stream.as_uuid())
+        .bind(floor)
+        .execute(&mut *tx)
+        .await?;
+    tx.execute(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE es.commits_jobs DETACH PARTITION es.{leaf}; DROP TABLE es.{leaf}"
+    )))
+    .await?;
+    tx.commit().await?;
+
+    Ok(reading.await?)
+}
+
+/// Retention can raise a stream's floor and drop its oldest commits after a read checked the floor and before
+/// it fetched them. The read then fails as truncated instead of returning the stream without its start.
+#[tokio::test]
+async fn a_read_that_retention_truncates_midway_fails_as_truncated() -> Result<()> {
+    let mut f = Fixture::new().await?;
+    let (job, short) = (stream::StreamId::new_v7(), stream::StreamId::new_v7());
+    let at = f.id_at(3, 2).await?;
+    let created = f
+        .job(
+            job,
+            version::ExpectedVersion::NoStream,
+            at,
+            JobEvent::created("long"),
+        )
+        .await?;
+    let at = f.id_at(2, 2).await?;
+    f.job(
+        short,
+        version::ExpectedVersion::NoStream,
+        at,
+        JobEvent::created("short"),
+    )
+    .await?;
+    let at = f.id_now();
+    f.job(job, created.expected(), at, JobEvent::assigned())
+        .await?;
+
+    // A load whose first version is gone.
+    let store = f.store.clone();
+    let leaf = f.leaf(3).await?;
+    let loaded = truncate_during(
+        &f,
+        job,
+        1,
+        &leaf,
+        async move { store.load::<Job>(job).await },
+    )
+    .await?;
+    match loaded {
+        Err(load::LoadError::Read(read::ReadError::Truncated { floor, .. })) => {
+            assert_eq!(floor, v(1));
+        }
+        other => panic!("expected Truncated, got {other:?}"),
+    }
+
+    // A read of a stream whose every version is gone.
+    let store = f.store.clone();
+    let leaf = f.leaf(2).await?;
+    let read = truncate_during(&f, short, 1, &leaf, async move {
+        store
+            .read_stream::<JobEvent>(short, version::Version::FIRST)
+            .try_collect::<Vec<_>>()
+            .await
+    })
+    .await?;
+    match read {
+        Err(read::ReadError::Truncated { floor, .. }) => assert_eq!(floor, v(1)),
+        other => panic!("expected Truncated, got {other:?}"),
+    }
+
+    f.finish().await
+}
+
 fn interval(duration: Duration) -> sqlx::postgres::types::PgInterval {
     sqlx::postgres::types::PgInterval {
         months: 0,

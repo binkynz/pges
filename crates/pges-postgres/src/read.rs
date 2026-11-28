@@ -62,6 +62,7 @@ impl store::Store {
                                     state.stream_id,
                                     state.from,
                                     head.commits(),
+                                    head.version,
                                     state.on_unknown,
                                 ))
                             }
@@ -253,6 +254,8 @@ pub(crate) struct Pager<E> {
     /// From the stream's lowest commit id, or the snapshot's commit, to its last commit id when the read
     /// began; lets the planner skip the leaves outside.
     commits: RangeInclusive<Uuid>,
+    /// The stream's version when the read began: the pages must reach it.
+    through: i64,
     on_unknown: event::OnUnknown,
     finished: Finished,
     events: PhantomData<fn() -> E>,
@@ -271,6 +274,7 @@ impl<E: event::Event> Pager<E> {
         stream_id: stream::StreamId,
         from: version::Version,
         commits: RangeInclusive<Uuid>,
+        through: i64,
         on_unknown: event::OnUnknown,
     ) -> Self {
         Self {
@@ -280,6 +284,7 @@ impl<E: event::Event> Pager<E> {
             from,
             next_last_version: append::to_i64(from),
             commits,
+            through,
             on_unknown,
             finished: Finished::No,
             events: PhantomData,
@@ -314,8 +319,26 @@ impl<E: event::Event> Pager<E> {
         for row in &rows {
             self.decode_commit(row.row()?, out).await?;
         }
+        if self.is_finished() && self.next_last_version <= self.through {
+            return Err(self.missing_versions().await);
+        }
 
         Ok(())
+    }
+
+    /// Why versions from `next_last_version` on that the head promised are not there: retention raised the
+    /// floor and dropped them after the head was read, or `delete_stream` deleted the stream.
+    async fn missing_versions(&self) -> ReadError {
+        match open_stream::<E>(&self.store, self.stream_id).await {
+            Ok(Some((_, head))) if head.floor_version >= self.next_last_version => {
+                truncated(self.stream_id, head.floor_version)
+            }
+            Ok(_) => ReadError::Corrupt {
+                stream_id: self.stream_id,
+                reason: "versions below the stream's version are missing",
+            },
+            Err(error) => error,
+        }
     }
 
     async fn decode_commit(
@@ -341,6 +364,9 @@ impl<E: event::Event> Pager<E> {
         let metadata = Arc::new(frame.metadata);
         let recorded_at = commit_id.recorded_at();
         let first_version = last_version - i64::from(event_count) + 1;
+        if first_version > self.next_last_version {
+            return Err(self.missing_versions().await);
+        }
         self.next_last_version = last_version + 1;
 
         for (offset, stored) in (0_i64..).zip(&frame.events) {

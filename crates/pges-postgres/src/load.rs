@@ -32,7 +32,7 @@ impl store::Store {
             commit_id: None,
         };
 
-        Ok(replay(self, category, stream_id, start).await?)
+        Ok(replay(self, category, stream_id, head.version, start).await?)
     }
 
     /// Loads an aggregate from its snapshot, then replays the events after it.
@@ -62,7 +62,7 @@ impl store::Store {
                 commit_id: None,
             },
         };
-        let loaded = replay(self, category, stream_id, start).await?;
+        let loaded = replay(self, category, stream_id, head.version, start).await?;
 
         if let aggregate::SnapshotPolicy::EveryN(n) = A::policy()
             && loaded.replayed >= u64::from(n.get())
@@ -297,6 +297,7 @@ async fn replay<A: aggregate::Aggregate>(
     store: &store::Store,
     category: catalog::Category,
     stream_id: stream::StreamId,
+    through: i64,
     start: Replay<A>,
 ) -> Result<Loaded<A>, read::ReadError> {
     let Replay {
@@ -312,6 +313,7 @@ async fn replay<A: aggregate::Aggregate>(
         stream_id,
         from,
         commits,
+        through,
         event::OnUnknown::Fail,
     );
     let mut buffer = VecDeque::new();

@@ -486,6 +486,12 @@ lever there. The upper bound also ends the read at the head's version: commits a
 returned, consistent with the snapshot's `version <= streams.version` check. The first commit returned can
 start below `$2`; the client skips those events. The next page uses `$2 = previous last_version + 1`.
 
+Retention can raise the floor and drop the oldest commits, or `delete_stream` delete them, after the head
+read. So the client checks that the pages are contiguous: each commit starts at or below the next version it
+wants, and the last page reaches the head's version. Otherwise it reads the head again and fails with
+`Truncated` when the floor now covers the missing versions, `StreamDeleted` when the stream was deleted, and
+`Corrupt` otherwise.
+
 ### Snapshots
 
 A load reads the stream's snapshot (`crates/pges-postgres/sql/snapshot/read.sql`) and ignores it when its
