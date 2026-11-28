@@ -163,8 +163,21 @@ impl Fixture {
     }
 
     /// Gives every commit without a log row one, in commit id order, from `first` on (or after the newest
-    /// position when there is one).
+    /// position when there is one), and raises the store's coarse high-water mark to the newest, as a
+    /// sequencer that stored its token does.
     async fn sequence_from(&self, first: i64) -> Result<()> {
+        self.sequence_unmarked(first).await?;
+        self.pool
+            .execute(sqlx::query(
+                "UPDATE pges.stores SET last_position = (SELECT max(last_position) FROM es.log)
+                 WHERE schema_name = 'es'",
+            ))
+            .await?;
+        Ok(())
+    }
+
+    /// [`Fixture::sequence_from`] without the mark: a sequencer that stopped before it stored its token.
+    async fn sequence_unmarked(&self, first: i64) -> Result<()> {
         self.pool
             .execute(
                 sqlx::query(
@@ -787,6 +800,50 @@ async fn a_log_partition_retention_has_passed_for_every_category_is_dropped() ->
     f.finish().await
 }
 
+/// A full log partition with a row above the store's coarse high-water mark stays, even when retention has
+/// passed every row in it. Here it holds the store's newest row: a sequencer that stopped before it stored its
+/// token would continue from the mark and hand that row's position out again.
+#[tokio::test]
+async fn a_log_partition_with_rows_above_the_coarse_mark_stays() -> Result<()> {
+    let mut f = Fixture::new().await?;
+    f.window(7 * DAY).await?;
+    let mut conn = f.db.connect().await?;
+    pges_testing::create_log_partition(&mut conn, &STORE_NAME, 1).await?;
+    pges_testing::create_log_partition(&mut conn, &STORE_NAME, 2).await?;
+
+    // Log partitions span 100 000 000 positions: the second commit takes partition 0's last position.
+    for (day, sequenced) in [(2, Mark::Raised), (3, Mark::Kept)] {
+        let at = f.id_at(3, day).await?;
+        f.job(
+            stream::StreamId::new_v7(),
+            version::ExpectedVersion::NoStream,
+            at,
+            JobEvent::created("old"),
+        )
+        .await?;
+        match sequenced {
+            Mark::Raised => f.sequence_from(99_999_998).await?,
+            Mark::Kept => f.sequence_unmarked(1).await?,
+        }
+    }
+
+    let report = f.apply().await?;
+    assert!(report.log_partitions.is_empty(), "{report:?}");
+    assert!(f.exists("log_0000").await?);
+    let newest: i64 = sqlx::query_scalar("SELECT max(last_position) FROM es.log")
+        .fetch_one(&f.pool)
+        .await?;
+    assert_eq!(newest, 99_999_999);
+
+    f.finish().await
+}
+
+/// Whether a fixture's sequencing raised the store's coarse high-water mark.
+enum Mark {
+    Raised,
+    Kept,
+}
+
 #[tokio::test]
 async fn a_run_interrupted_before_the_drop_is_finished_by_the_next() -> Result<()> {
     let mut f = Fixture::new().await?;
@@ -887,6 +944,54 @@ async fn prune_log_keeps_the_rows_of_commits_that_still_exist() -> Result<()> {
         .fetch_one(&f.pool)
         .await?;
     assert_eq!(left, 2);
+
+    f.finish().await
+}
+
+/// `prune_log` keeps the rows above the store's coarse high-water mark, even of commits retention dropped:
+/// a sequencer that stopped before it stored its token continues from the newest log row next time, and
+/// without those rows it would hand their positions out again.
+#[tokio::test]
+async fn prune_log_keeps_the_rows_above_the_coarse_mark() -> Result<()> {
+    let mut f = Fixture::new().await?;
+    f.window(7 * DAY).await?;
+    for day in [2, 3] {
+        let at = f.id_at(3, day).await?;
+        f.job(
+            stream::StreamId::new_v7(),
+            version::ExpectedVersion::NoStream,
+            at,
+            JobEvent::created("old"),
+        )
+        .await?;
+    }
+    f.sequence().await?;
+    // A backlogged old commit, sequenced by a leader that stopped before it raised the mark.
+    let at = f.id_at(3, 4).await?;
+    f.job(
+        stream::StreamId::new_v7(),
+        version::ExpectedVersion::NoStream,
+        at,
+        JobEvent::created("late"),
+    )
+    .await?;
+    f.sequence_unmarked(1).await?;
+
+    let report = f.apply().await?;
+    let old = f.leaf(3).await?;
+    assert!(dropped(&report).contains(&old.as_str()), "{report:?}");
+    assert_eq!(
+        f.horizon("jobs").await?.1,
+        3,
+        "the scan reached the newest row"
+    );
+
+    let pruned = f.admin.prune_log(common::JOBS).await?;
+    assert_eq!(pruned.rows, 2);
+    let left: Vec<i64> = sqlx::query_scalar("SELECT last_position FROM es.log")
+        .fetch_all(&f.pool)
+        .await?;
+    assert_eq!(left, [3], "prune_log deleted a row above the mark");
 
     f.finish().await
 }

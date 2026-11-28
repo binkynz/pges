@@ -972,8 +972,12 @@ source's reads and writes (the outbox drain, below), then the log rows of each s
 
 Positions continue from the store's newest log row, one per event, in source order; never from below
 `pges.stores.last_position`, because `prune_log` can delete the newest rows (those of commits retention
-dropped) and their positions must not be handed out again. Resequence starts from the same floor. A commit
-already in the dedupe window (below) is skipped. A takeover's `UPDATE … SET fence = fence + 1` waits for the
+dropped) and their positions must not be handed out again. Resequence starts from the same floor. The mark is
+not written with the rows: a batch writes it with the token, when `token_interval` is due or at shutdown, and
+resequence does not write it (Resequence, above). So a leader that stops uncleanly leaves rows above it, and
+`prune_log` and the log partition drop keep every row above the mark (Retention, Log partitions of dropped
+commits): the newest row then survives, and the next term continues after it. A commit already in the dedupe
+window (below) is skipped. A takeover's `UPDATE … SET fence = fence + 1` waits for the
 in-flight batch and fences out every later one.
 
 A log row needs a log partition. Without one the `INSERT` fails, the batch rolls back (the outbox rows stay
@@ -1397,10 +1401,10 @@ matching CHECK constraint lets it skip the validation scan. Each attach still in
 - **Log partitions of dropped commits.** Log partitions are ranged by position across all categories. Both
   `apply_retention` and `prune_log` end by dropping, oldest first, every log partition that is not the newest,
   is full (the store's last position, `crates/pges-postgres/sql/log/last_position.sql`, at or above its upper
-  bound − 1) and has no row above its own category's `retention_scan_from`
-  (`crates/pges-postgres/sql/log/pinned.sql`; a partition already "detach pending" is dropped without the
-  check). The partitions are listed by `crates/pges-postgres/sql/log/partitions.sql`, then detached and
-  dropped as leaves are.
+  bound − 1) and has no row above its own category's `retention_scan_from`, nor above the store's coarse
+  high-water mark (`crates/pges-postgres/sql/log/pinned.sql`; a partition already "detach pending" is dropped
+  without the check). The partitions are listed by `crates/pges-postgres/sql/log/partitions.sql`, then
+  detached and dropped as leaves are.
 
   A category with no rows in a partition does not pin it, but a `Forever` (or `SnapshotAndTruncate`) category
   with rows in it does, so such a category pins every log partition it writes to. Use a separate store for
@@ -1416,6 +1420,17 @@ matching CHECK constraint lets it skip the validation scan. Each attach still in
   writers keep to the store's limits. The delete also keeps any row whose commit is still in the category
   partition, even if writers did not keep to them: without its log row, resequence would take that commit for
   an unsequenced one and sequence it again. Pruned partitions are no longer insert-only.
+
+  Neither the delete nor the partition drop removes a row above `pges.stores.last_position`. The sequencer
+  continues from the newest log row, but at least from that mark, and writes the mark with its token, not
+  with the rows: about once a second, at shutdown, and not at all after a crash or in resequence. Without the
+  guard, a leader that sequenced old backlogged commits and stopped before writing the mark could leave their
+  rows as the store's newest; retention drops their leaf, the scan reaches those rows, and `prune_log` deletes
+  them; the next term then starts again from the mark and hands their positions to new commits (the outbox
+  source never delivers a drained commit again). Rows above the mark stay until the sequencer next writes it,
+  and are pruned then (`prune_log_keeps_the_rows_above_the_coarse_mark`,
+  `a_log_partition_with_rows_above_the_coarse_mark_stays`,
+  `positions_continue_after_a_crash_before_the_mark_and_prune_log`).
 
   Dropping a whole log partition relies on `retention_scan_from` alone, with no such existence check, which
   would scan the whole partition (not yet addressed).
