@@ -102,9 +102,11 @@ impl store::Store {
                 store::RegisterError::Database(error) => SnapshotError::Database(error),
             })?;
 
+        // Locks the stream's row, so a deletion since the load stores nothing (snapshot/live_stream.sql).
+        // Unprepared: a prepared statement per partition of streams would crowd the statement cache.
         self.inner
             .sql
-            .snapshot_upsert
+            .snapshot_save(loaded.stream_id.as_uuid())
             .bind(statement::snapshot_upsert::Params {
                 version: append::to_i64(version),
                 stream_id: loaded.stream_id.as_uuid(),
@@ -115,6 +117,7 @@ impl store::Store {
                 state: &state,
                 min_distance: 1,
             })
+            .unprepared()
             .execute(&self.inner.pool)
             .await
             .map_err(|e| SnapshotError::Database(e.into()))?;

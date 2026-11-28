@@ -308,3 +308,189 @@ async fn a_snapshot_saved_during_the_deletion_is_not_stored() -> Result<()> {
 
     f.finish().await
 }
+
+/// A save that holds the stream's row when a deletion starts makes the deletion wait, and the deletion then
+/// deletes the snapshot the save stored. The save is stopped after it locked the stream's row: another
+/// transaction holds the stored snapshot's row, which the save must update.
+#[tokio::test]
+async fn a_deletion_waits_for_a_save_in_progress_then_deletes_its_snapshot() -> Result<()> {
+    let f = Fixture::new().await?;
+    let (id, _) = job_with_snapshot(&f, "job-1").await?;
+    f.store
+        .append(
+            id,
+            version::ExpectedVersion::Exact(v(2)),
+            &[JobEvent::assigned()],
+        )
+        .await?;
+    let loaded = f.store.load_snapshotted::<Job>(id).await?;
+
+    let mut holder = hold_snapshot(&f, id).await?;
+    let save = tokio::spawn({
+        let store = f.store.clone();
+        async move { store.save_snapshot(&loaded).await }
+    });
+    let saver = lock_waiter(&f, "INSERT INTO es.snapshots").await?;
+    let deletion = tokio::spawn({
+        let store = f.store.clone();
+        async move {
+            store
+                .delete_stream::<JobEvent>(id, delete::DeleteExpected::Any)
+                .await
+        }
+    });
+    let deleter = lock_waiter(&f, "FROM es.streams WHERE stream_id = $1 FOR UPDATE").await?;
+    let blockers: Vec<i32> = sqlx::query_scalar("SELECT unnest(pg_blocking_pids($1))")
+        .bind(deleter)
+        .fetch_all(&f.pool)
+        .await?;
+    assert_eq!(blockers, [saver], "the deletion waits for the save");
+
+    sqlx::query("COMMIT").execute(&mut holder).await?;
+    save.await??;
+    deletion.await??;
+
+    let (_, snapshots, _, state) = rows(&f, id).await?;
+    assert_eq!(state, 2, "the stream is deleted");
+    assert_eq!(snapshots, 0, "the deletion left the saved snapshot");
+
+    f.finish().await
+}
+
+/// Relation locks a save holds once it has locked the stream's row and waits to update the stored snapshot:
+/// `snapshots`, its partition and their keys, and the stream's partition of `streams` and its key: 6.
+/// It names that partition, so a generic plan locks no other: through `streams`, every one.
+#[tokio::test]
+async fn a_save_locks_one_streams_partition_under_a_generic_plan() -> Result<()> {
+    for routing in [store::AppendRouting::Auto, store::AppendRouting::Streams] {
+        let mut definition = pges_testing::definition(store::Outbox::Disabled);
+        definition.stream_partitions = std::num::NonZeroU16::new(64).unwrap();
+        let f = Fixture::with_definition(definition).await?;
+        let options: sqlx::postgres::PgConnectOptions = f.db.url().parse()?;
+        let generic = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(options.options([("plan_cache_mode", "force_generic_plan")]))
+            .await?;
+        let mut config = store::StoreConfig::new(common::STORE_NAME);
+        config.append_routing = routing;
+        let store = store::Store::open(generic.clone(), config).await?;
+        let (id, _) = job_with_snapshot(&f, "job-1").await?;
+        f.store
+            .append(
+                id,
+                version::ExpectedVersion::Exact(v(2)),
+                &[JobEvent::assigned()],
+            )
+            .await?;
+        let loaded = store.load_snapshotted::<Job>(id).await?;
+
+        let mut holder = hold_snapshot(&f, id).await?;
+        let save = tokio::spawn({
+            let store = store.clone();
+            async move { store.save_snapshot(&loaded).await }
+        });
+        let saver = lock_waiter(&f, "INSERT INTO es.snapshots").await?;
+        let relations: Vec<String> = sqlx::query_scalar(
+            "SELECT l.relation::regclass::text || ' ' || l.mode FROM pg_locks l
+             WHERE l.pid = $1 AND l.locktype = 'relation' AND l.granted ORDER BY 1",
+        )
+        .bind(saver)
+        .fetch_all(&f.pool)
+        .await?;
+        let partitions: i64 = sqlx::query_scalar(
+            "SELECT count(DISTINCT c.relname) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
+             WHERE l.pid = $1 AND c.relnamespace = 'es'::regnamespace
+               AND c.relname ~ '^streams_p[0-9]+$'",
+        )
+        .bind(saver)
+        .fetch_one(&f.pool)
+        .await?;
+        sqlx::query("COMMIT").execute(&mut holder).await?;
+        save.await??;
+
+        match routing {
+            store::AppendRouting::Auto => {
+                assert_eq!(partitions, 1, "{routing:?}");
+                assert_eq!(relations.len(), 6, "{routing:?}: {relations:?}");
+            }
+            _ => assert_eq!(partitions, 64, "{routing:?}"),
+        }
+        let (_, snapshots, _, _) = rows(&f, id).await?;
+        assert_eq!(snapshots, 1, "{routing:?}");
+
+        generic.close().await;
+        f.finish().await?;
+    }
+
+    Ok(())
+}
+
+/// An append's snapshot needs no deleted check: the append's own row lock makes a deletion wait for its
+/// transaction, and the deletion then deletes the snapshot.
+#[tokio::test]
+async fn a_deletion_waits_for_an_append_with_a_snapshot_then_deletes_it() -> Result<()> {
+    let f = Fixture::new().await?;
+    let (id, _) = job_with_snapshot(&f, "job-1").await?;
+
+    let mut conn = f.pool.acquire().await?;
+    let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+    let mut work = pges_postgres::unit_of_work::UnitOfWork::wrap(&f.store, &mut tx);
+    work.append(
+        id,
+        version::ExpectedVersion::Exact(v(2)),
+        &[JobEvent::assigned()],
+    )
+    .snapshot_after(&Job::default())
+    .await?;
+    work.finish().await?;
+    let deletion = tokio::spawn({
+        let store = f.store.clone();
+        async move {
+            store
+                .delete_stream::<JobEvent>(id, delete::DeleteExpected::Any)
+                .await
+        }
+    });
+    lock_waiter(&f, "FROM es.streams WHERE stream_id = $1 FOR UPDATE").await?;
+    tx.commit().await?;
+    deletion.await??;
+
+    let (_, snapshots, _, state) = rows(&f, id).await?;
+    assert_eq!(state, 2, "the stream is deleted");
+    assert_eq!(snapshots, 0, "the deletion left the append's snapshot");
+
+    drop(conn);
+    f.finish().await
+}
+
+/// Begins a transaction that locks the stream's stored snapshot.
+async fn hold_snapshot(f: &Fixture, id: stream::StreamId) -> Result<sqlx::PgConnection> {
+    let mut holder = f.db.connect().await?;
+    sqlx::query("BEGIN").execute(&mut holder).await?;
+    sqlx::query("SELECT FROM es.snapshots WHERE stream_id = $1 FOR UPDATE")
+        .bind(id.as_uuid())
+        .execute(&mut holder)
+        .await?;
+
+    Ok(holder)
+}
+
+/// The backend that waits for a lock while running a statement containing `statement`.
+async fn lock_waiter(f: &Fixture, statement: &str) -> Result<i32> {
+    for _ in 0..2000 {
+        let pid: Option<i32> = sqlx::query_scalar(
+            "SELECT pid FROM pg_stat_activity
+             WHERE datname = current_database() AND wait_event_type = 'Lock'
+               AND strpos(query, $1) > 0",
+        )
+        .bind(statement)
+        .fetch_optional(&f.pool)
+        .await?;
+        if let Some(pid) = pid {
+            return Ok(pid);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    anyhow::bail!("no statement containing {statement:?} waited for a lock")
+}

@@ -488,7 +488,10 @@ start below `$2`; the client skips those events. The next page uses `$2 = previo
 
 A load reads the stream's snapshot (`crates/pges-postgres/sql/snapshot/read.sql`) and ignores it when its
 `state_version`, `format` or category differ, or its version is outside `[floor_version, streams.version]`.
-Saving is an upsert (`crates/pges-postgres/sql/snapshot/upsert.sql`).
+Saving is an upsert: `crates/pges-postgres/sql/snapshot/insert.sql` completed by
+`crates/pges-postgres/sql/snapshot/replace.sql` (`snapshot/upsert`, for `snapshot_after`), with
+`crates/pges-postgres/sql/snapshot/live_stream.sql` between them for `save_snapshot` and the save of
+`load_snapshotted` (`snapshot/save`).
 
 The upsert's `$8` is the number of versions the new snapshot must be ahead of the stored one: 1 for manual
 saves (and `snapshot_after` with `Manual`), `n` for `EveryN(n)`. The stored version and state version never
@@ -503,10 +506,27 @@ So old code in a rolling deploy cannot overwrite new code's snapshot, and a snap
 lower `SNAPSHOT_VERSION`, that code's saves are skipped.
 
 A save for a stream that was deleted, or does not exist, stores nothing: a save from a load made before
-`delete_stream` would otherwise bring the deleted state back. The upsert locks the stream's row `FOR KEY
+`delete_stream` would otherwise bring the deleted state back. `snapshot/save` locks the stream's row `FOR KEY
 SHARE`, which conflicts with the `FOR UPDATE` lock `delete_stream` takes first, so a save and a deletion that
 overlap are ordered: the save waits and then sees the stream deleted, or the deletion waits and then deletes
 the saved snapshot. Appends lock the row `FOR NO KEY UPDATE`, which does not conflict with it.
+
+- The save names the stream's partition of `streams` (`{stream_table}`), as a routed append does, whenever
+  the store knows its partitions, also when the appends fall back to `streams` because of the statement
+  cache: it runs unprepared (sqlx `persistent(false)`), so one statement per partition costs no cache
+  entries, only a parse and a plan per save. It takes 6 relation locks (`snapshots`, its partition, their
+  keys, the stream's partition of `streams` and its key) under `force_generic_plan` too. A store that does
+  not route goes through `streams`: an unprepared statement gets a custom plan, which prunes to the stream's
+  partition, except under `force_generic_plan`, where it locks every partition (64 at 64).
+- `snapshot_after` uses `snapshot/upsert`, which does not read `streams`: it adds 4 relation locks to the
+  append's (`snapshots`, the stream's partition of it and their keys) and no row lock
+  (`an_append_with_a_snapshot_locks_one_streams_partition`). With the deleted check through `streams`, a
+  generic plan locked every partition (about 69 relation locks per append at 64 partitions, against 4 to 5
+  without it) and wrote a row-lock WAL record per append. The append needs no check: its snapshot is written
+  only after the append updated or created the stream's row in the same transaction, which a deleted stream
+  refuses (`bumped` requires `state = 0`, `created` conflicts with the existing row), and the append's `FOR NO
+  KEY UPDATE` lock makes `delete_stream`'s `FOR UPDATE` wait until the transaction ends, after which the
+  deletion deletes the snapshot.
 
 ### Writer limits
 

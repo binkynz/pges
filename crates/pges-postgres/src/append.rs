@@ -945,6 +945,8 @@ async fn write_snapshot(
         Err(error) => return Err(AppendError::SnapshotEncode(error.to_string().into())),
     };
 
+    // Not save_snapshot's statement: the append's own row lock already orders this against delete_stream, so
+    // the upsert skips the deleted check and the lock on streams that check takes (snapshot/insert.sql).
     store
         .inner
         .sql

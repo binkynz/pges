@@ -32,6 +32,7 @@ pub(crate) struct StoreSql {
     pub(crate) stream_head: typed::Rendered<statement::stream_head::Query>,
     pub(crate) snapshot_read: typed::Rendered<statement::snapshot_read::Query>,
     pub(crate) snapshot_upsert: typed::Rendered<statement::snapshot_upsert::Query>,
+    snapshot_save: SnapshotSave,
     pub(crate) register_types: typed::Rendered<statement::register_types::Query>,
     pub(crate) select_types: typed::Rendered<statement::select_types::Query>,
     pub(crate) category_types: typed::Rendered<statement::category_types::Query>,
@@ -61,6 +62,17 @@ impl StoreSql {
                 typed::Rendered::variant::<statement::append_many_outbox::Query>(&values)
             }
         };
+        let snapshot_save = match &leaves {
+            Some(leaves) => SnapshotSave::Routed {
+                saves: leaves
+                    .names()
+                    .iter()
+                    .map(|leaf| render_snapshot_save(&values.clone().stream_table(Some(leaf))))
+                    .collect(),
+                leaves: leaves.clone(),
+            },
+            None => SnapshotSave::Parent(render_snapshot_save(&values.clone().stream_table(None))),
+        };
         let append = match leaves.filter(|leaves| fits(leaves, cache_capacity)) {
             Some(leaves) => Append::Routed {
                 appends: leaves
@@ -83,6 +95,7 @@ impl StoreSql {
             stream_head: statement::stream_head::Query::render(&values),
             snapshot_read: statement::snapshot_read::Query::render(&values),
             snapshot_upsert: statement::snapshot_upsert::Query::render(&values),
+            snapshot_save,
             register_types: statement::register_types::Query::render(&values),
             select_types: statement::select_types::Query::render(&values),
             category_types: statement::category_types::Query::render(&values),
@@ -101,6 +114,19 @@ impl StoreSql {
         match &self.append {
             Append::Parent(append) => append,
             Append::Routed { leaves, appends } => &appends[leaves.index(stream_id)],
+        }
+    }
+
+    /// The snapshot save outside an append for `stream_id`, which checks that the stream was not deleted: the
+    /// one naming its partition of `streams` when the store knows its partitions, whether or not appends are
+    /// routed. Run it unprepared: one statement per partition would crowd the statement cache.
+    pub(crate) fn snapshot_save(
+        &self,
+        stream_id: Uuid,
+    ) -> &typed::Rendered<statement::snapshot_upsert::Query> {
+        match &self.snapshot_save {
+            SnapshotSave::Parent(save) => save,
+            SnapshotSave::Routed { leaves, saves } => &saves[leaves.index(stream_id)],
         }
     }
 }
@@ -199,6 +225,24 @@ fn render_append(
             typed::Rendered::variant::<statement::append_outbox::Query>(values)
         }
     }
+}
+
+/// Which table a snapshot save outside an append locks the stream's row in.
+enum SnapshotSave {
+    /// `streams` itself: an unprepared save is planned for its stream, unless `plan_cache_mode` forces a
+    /// generic plan, which locks every partition.
+    Parent(typed::Rendered<statement::snapshot_upsert::Query>),
+    /// The partition holding the stream: one statement per partition, by remainder.
+    Routed {
+        leaves: route::Leaves,
+        saves: Vec<typed::Rendered<statement::snapshot_upsert::Query>>,
+    },
+}
+
+fn render_snapshot_save(
+    values: &template::Values,
+) -> typed::Rendered<statement::snapshot_upsert::Query> {
+    typed::Rendered::variant::<statement::snapshot_save::Query>(values)
 }
 
 #[cfg(test)]
