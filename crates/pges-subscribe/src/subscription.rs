@@ -854,8 +854,10 @@ pub enum Start {
     /// The events skipped are those of the categories whose retention horizon is at or below the newest
     /// position the store had assigned when the subscription is created (its newest event's, or a newer
     /// one of an event retention dropped), which covers every drop before it and any drop
-    /// of those events while it catches up. A later drop of events written after it was created, while
-    /// its cursor is behind them, still fails with [`SubscribeError::CursorBeforeHorizon`].
+    /// of those events while it catches up. The subscription stores that position as its `skip_through`.
+    /// A later drop of events positioned after `skip_through`, while its cursor is behind them, still fails
+    /// with [`SubscribeError::CursorBeforeHorizon`]: this includes events written before the subscription
+    /// was created but sequenced after it.
     ///
     /// Limit: until a store-wide subscription has read past that position, an event missing at or below
     /// the retention horizon of such a category is taken as dropped and skipped. An event missing there

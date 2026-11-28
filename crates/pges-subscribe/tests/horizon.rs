@@ -331,7 +331,10 @@ async fn redefined_at_retained() -> Result<()> {
             .redefine(subscription::Start::Retained)
             .run_pg(Recorder::new("after")),
     );
-    running.wait_position(6).await?;
+    if let Err(waiting) = running.wait_position(6).await {
+        let error = running.stopped().await?;
+        anyhow::bail!("{waiting:#}: the subscription stopped with {error:?}");
+    }
     running.stop().await?;
     assert_eq!(
         f.delivered("after")
