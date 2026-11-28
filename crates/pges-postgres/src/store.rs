@@ -40,7 +40,7 @@ impl Store {
 
         let mut conn = pool.acquire().await.map_err(OpenError::database)?;
         if let Some(definition) = config.definition() {
-            migrate::run(&mut conn, &store_name, &definition).await?;
+            migrate::run(&mut conn, &store_name, definition).await?;
         }
 
         let shared_exists = sql::statement::shared_schema_exists::Query::fixed()
@@ -416,8 +416,8 @@ impl StoreConfig {
     }
 
     /// The definition [`Store::open`] migrates with, if any.
-    fn definition(&self) -> Option<StoreDefinition> {
-        match self.migrate {
+    fn definition(&self) -> Option<&StoreDefinition> {
+        match &self.migrate {
             AutoMigrate::Disabled => None,
             AutoMigrate::CreateOrMigrate(definition) => Some(definition),
         }
@@ -429,7 +429,7 @@ impl StoreConfig {
 ///
 /// [`migrate::run`] and [`AutoMigrate::CreateOrMigrate`] use it only when the store does not exist yet; an
 /// existing store keeps its own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct StoreDefinition {
     /// Hash partitions of `streams` and `snapshots`. Default 64, enough for about 1B streams. More partitions
@@ -506,7 +506,7 @@ pub enum AppendRouting {
 }
 
 /// Whether [`Store::open`] applies migrations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum AutoMigrate {
     /// Only check; a database that is behind fails with [`OpenError::SchemaBehind`].

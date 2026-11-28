@@ -502,7 +502,7 @@ pub struct StoreConfig {                                 // how a writer opens a
 }
 
 #[non_exhaustive]
-pub struct StoreDefinition {                             // what a store is created with; Copy, Default
+pub struct StoreDefinition {                             // what a store is created with; Clone, Default
     pub stream_partitions: NonZeroU16,                   // 64; fixed at store creation
     pub outbox: store::Outbox,                           // Enabled | Disabled (default)
     pub max_clock_skew: Duration,                        // 5 s; recorded at creation, only raised
@@ -513,6 +513,8 @@ pub struct StoreDefinition {                             // what a store is crea
 - `StoreConfig` opens a store; `StoreDefinition` is what a store is created with. Only
   `AutoMigrate::CreateOrMigrate(definition)` and `migrate::run(conn, &name, &definition)` read a definition,
   and only to create a missing store: an existing store keeps its own. `Store::name() -> &StoreName`.
+- `StoreDefinition`, `AutoMigrate`, `admin::CategoryConfig`, `retention::Retention` and `AfterWindow` are
+  `Clone` but not `Copy`, so a later variant or field may hold owned data (an archive destination).
 - DCB is not a public option. A DCB store made by another build is refused at open
   (`OpenError::StoreRequiresFeature("dcb")`).
 - `AppendRouting::Auto`: a single append names its stream's hash partition of `streams`, so it locks only
@@ -650,13 +652,14 @@ not own `pges` can create stores in the schema the owner migrated; call it only 
 
 ```rust
 // pges_postgres::retention
-#[non_exhaustive] pub enum Retention {            // Default Forever
+#[non_exhaustive] pub enum Retention {            // Default Forever; Clone, not Copy
     Forever,
     Window { keep: Duration, then: AfterWindow },
     SnapshotAndTruncate { keep: Duration },
 }                                                 // keep is at most Retention::MAX_KEEP (1,000 years of
                                                   // 365 days); a longer one is KeepTooLong where it is set
-#[non_exhaustive] pub enum AfterWindow { Drop }   // Default Drop; Archive is not built
+#[non_exhaustive] pub enum AfterWindow { Drop }   // Default Drop; Clone, not Copy: Archive (not built)
+                                                  // may carry a destination
 #[non_exhaustive] pub struct RetentionConfig {    // RetentionConfig::new(WriterRoles)
     pub writer_roles: limit::WriterRoles,         // each needs a transaction_timeout of at most the
 }                                                 // store's max_txn_age

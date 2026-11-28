@@ -553,7 +553,7 @@ async fn day_leaves_and_bucket_changes_do_not_collide() -> Result<()> {
     let mut daily = admin::CategoryConfig::default();
     daily.bucket = admin::Bucket::Day;
     let like_a_leaf = category::CategoryName::leak(format!("parts_{today}"))?;
-    admin.register_category(like_a_leaf, daily).await?;
+    admin.register_category(like_a_leaf, daily.clone()).await?;
     admin.register_category(category!("parts"), daily).await?;
     admin.maintain().await?;
     assert_eq!(
