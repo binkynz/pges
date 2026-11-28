@@ -1,0 +1,6 @@
+/tmp/claude-1003/-home-sean-dev/b28c5e1f-52c7-4708-a192-aa7d04fb1f9e/scratchpad/wt-merge/crates/pges-subscribe/../target-merge/tests/trybuild/x86_64-unknown-linux-gnu/debug/deps/pges_watch_proto-46f02cfc13d304a8.d: /tmp/claude-1003/-home-sean-dev/b28c5e1f-52c7-4708-a192-aa7d04fb1f9e/scratchpad/wt-merge/crates/pges-watch-proto/src/lib.rs /tmp/claude-1003/-home-sean-dev/b28c5e1f-52c7-4708-a192-aa7d04fb1f9e/scratchpad/wt-merge/crates/pges-watch-proto/src/generated/pges.watch.v1.rs
+
+/tmp/claude-1003/-home-sean-dev/b28c5e1f-52c7-4708-a192-aa7d04fb1f9e/scratchpad/wt-merge/crates/pges-subscribe/../target-merge/tests/trybuild/x86_64-unknown-linux-gnu/debug/deps/libpges_watch_proto-46f02cfc13d304a8.rmeta: /tmp/claude-1003/-home-sean-dev/b28c5e1f-52c7-4708-a192-aa7d04fb1f9e/scratchpad/wt-merge/crates/pges-watch-proto/src/lib.rs /tmp/claude-1003/-home-sean-dev/b28c5e1f-52c7-4708-a192-aa7d04fb1f9e/scratchpad/wt-merge/crates/pges-watch-proto/src/generated/pges.watch.v1.rs
+
+/tmp/claude-1003/-home-sean-dev/b28c5e1f-52c7-4708-a192-aa7d04fb1f9e/scratchpad/wt-merge/crates/pges-watch-proto/src/lib.rs:
+/tmp/claude-1003/-home-sean-dev/b28c5e1f-52c7-4708-a192-aa7d04fb1f9e/scratchpad/wt-merge/crates/pges-watch-proto/src/generated/pges.watch.v1.rs:

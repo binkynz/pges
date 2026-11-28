@@ -1,0 +1,8 @@
+/tmp/claude-1003/-home-sean-dev/b28c5e1f-52c7-4708-a192-aa7d04fb1f9e/scratchpad/wt-merge/crates/pges-subscribe/../target-merge/tests/trybuild/debug/deps/parse_display_derive-bc7dfce74a984cef.d: /home/sean/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parse-display-derive-0.9.1/src/lib.rs /home/sean/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parse-display-derive-0.9.1/src/regex_utils.rs /home/sean/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parse-display-derive-0.9.1/src/syn_utils.rs /home/sean/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parse-display-derive-0.9.1/src/format_syntax.rs
+
+/tmp/claude-1003/-home-sean-dev/b28c5e1f-52c7-4708-a192-aa7d04fb1f9e/scratchpad/wt-merge/crates/pges-subscribe/../target-merge/tests/trybuild/debug/deps/libparse_display_derive-bc7dfce74a984cef.so: /home/sean/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parse-display-derive-0.9.1/src/lib.rs /home/sean/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parse-display-derive-0.9.1/src/regex_utils.rs /home/sean/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parse-display-derive-0.9.1/src/syn_utils.rs /home/sean/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parse-display-derive-0.9.1/src/format_syntax.rs
+
+/home/sean/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parse-display-derive-0.9.1/src/lib.rs:
+/home/sean/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parse-display-derive-0.9.1/src/regex_utils.rs:
+/home/sean/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parse-display-derive-0.9.1/src/syn_utils.rs:
+/home/sean/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/parse-display-derive-0.9.1/src/format_syntax.rs:

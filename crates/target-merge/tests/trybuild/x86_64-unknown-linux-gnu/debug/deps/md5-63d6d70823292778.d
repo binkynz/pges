@@ -1,0 +1,10 @@
+/tmp/claude-1003/-home-sean-dev/b28c5e1f-52c7-4708-a192-aa7d04fb1f9e/scratchpad/wt-merge/crates/pges-subscribe/../target-merge/tests/trybuild/x86_64-unknown-linux-gnu/debug/deps/md5-63d6d70823292778.d: /home/sean/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/md-5-0.11.0/src/lib.rs /home/sean/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/md-5-0.11.0/src/block_api.rs /home/sean/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/md-5-0.11.0/src/compress.rs /home/sean/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/md-5-0.11.0/src/consts.rs /home/sean/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/md-5-0.11.0/src/../README.md /home/sean/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/md-5-0.11.0/src/compress/soft.rs
+
+/tmp/claude-1003/-home-sean-dev/b28c5e1f-52c7-4708-a192-aa7d04fb1f9e/scratchpad/wt-merge/crates/pges-subscribe/../target-merge/tests/trybuild/x86_64-unknown-linux-gnu/debug/deps/libmd5-63d6d70823292778.rmeta: /home/sean/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/md-5-0.11.0/src/lib.rs /home/sean/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/md-5-0.11.0/src/block_api.rs /home/sean/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/md-5-0.11.0/src/compress.rs /home/sean/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/md-5-0.11.0/src/consts.rs /home/sean/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/md-5-0.11.0/src/../README.md /home/sean/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/md-5-0.11.0/src/compress/soft.rs
+
+/home/sean/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/md-5-0.11.0/src/lib.rs:
+/home/sean/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/md-5-0.11.0/src/block_api.rs:
+/home/sean/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/md-5-0.11.0/src/compress.rs:
+/home/sean/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/md-5-0.11.0/src/consts.rs:
+/home/sean/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/md-5-0.11.0/src/../README.md:
+/home/sean/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/md-5-0.11.0/src/compress/soft.rs:

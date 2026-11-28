@@ -1148,6 +1148,34 @@ the halt, 43 recovered, 335 after.
     `Wakers::any` with a poll waker. A read per 30 s is negligible beside the lease renewal every 7.5 s.
     Treating each lease renewal as a wake-up was the alternative; it ties the delivery bound to the lease
     and could not be tuned on its own.
+  - Notices are untrusted (2026-11-28). `NOTIFY` needs no privilege, so any role that can connect can send
+    a notice on `pges_<store>` with any payload. Two forgeries broke subscriptions until restart. A notice
+    at position `i64::MAX` stayed ahead of every `known`: the waker kept the highest position it had seen
+    and resolved every call at once, so an unsharded subscription read its log about 12,000 times a second,
+    and each shard of a sharded one did the same through the fan-out's shared high-water mark. A notice
+    with LSN `FFFFFFFF/FFFFFFFF` became the WAL position a replica subscription waited for, which no
+    replica reaches: without a fallback it stopped delivering; with one it read the primary forever.
+    A notice is now only a hint that the log may have changed, and nothing compares a later wake with a
+    position a notice claimed:
+    - `NotifyWaker` forgets the notices that woke a call. Each notice wakes at most one call, so a forged
+      one costs one log read. Notices that arrive while the subscriber is busy still wake the next call
+      whose `known` they have passed, so the normal path reads no more than before. This drops the old
+      level-triggered promise that a notice already seen wakes every call it has passed: that promise is
+      what made a forged position spin, and no subscription needs it, since `known` comes from its reads.
+    - The sharded fan-out no longer raises its own `known` with each wake's high-water mark. It calls the
+      waker only while some shard waits that has seen every wake, with the lowest positions those shards
+      read, and calls again when a shard with lower positions starts waiting. Shard wakers resolve once per
+      wake, not also when the last wake's high-water mark is past their `known`. A forged position wakes
+      each shard once and hides nothing after it. The fan-out first opens the waker when the first shard
+      waits, not when the instance starts.
+    - A waker's LSN is a hint too. If the replica has not replayed it at the first check, the subscription
+      reads the primary's WAL insert position and lowers the target to it. A real notice's LSN is never
+      above that position, so this changes nothing for it, and when the replica has kept up it costs
+      nothing.
+    Rejected: re-reading the head for every notice before trusting it (a round trip per wake on the
+    normal path); a sharded fan-out that clamps each wake to the head it reads before waking the shards
+    (one more round trip per wake); checking the notifying backend's PID against the sequencer's
+    connection (needs `pg_stat_activity` or `pg_locks`, and a PID can be reused).
 - Compatibility after start (2026-11-27): `min_compatible` was checked only by `Store::open` and the
   migration runner, so a subscription or sequencer of a release a later migration stopped supporting kept
   running. Lease renewals now carry the check (a `NOT EXISTS` on `pges.scopes` in the renewal statement),
@@ -1345,7 +1373,8 @@ the halt, 43 recovered, 335 after.
     retention.
   - Create runs once per name (`NOT EXISTS`, no `ON CONFLICT`); shard 0 is in every definition, so two
     concurrent creates conflict as a whole.
-  - The waker is shared through one fan-out task per instance, which keeps the level-triggered contract.
+  - The waker is shared through one fan-out task per instance. It calls the waker with what the waiting
+    shards read, never with a position a waker claimed (Notices are untrusted, above).
     The fan-out never ends, so its channel closes only when the instance's task is dropped (aborted, as
     in a crash). A shard's task can still finish a poll then, since dropping a `JoinSet` only asks its tasks
     to stop; a shard's waker waits instead of failing with `WakeError::Closed`, or the instance would show

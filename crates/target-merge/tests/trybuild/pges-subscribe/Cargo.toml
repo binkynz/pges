@@ -1,0 +1,158 @@
+[package]
+name = "pges-subscribe-tests"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[features]
+default = ["pges-subscribe/default"]
+otel = ["pges-subscribe/otel", "dep:opentelemetry"]
+wake-grpc = ["pges-subscribe/wake-grpc"]
+wake-grpc-tls = ["pges-subscribe/wake-grpc-tls", "dep:rustls", "dep:rustls-pki-types"]
+wake-inproc = ["pges-subscribe/wake-inproc"]
+wake-notify = ["pges-subscribe/wake-notify"]
+wake-poll = ["pges-subscribe/wake-poll"]
+
+[dependencies.anyhow]
+version = "1.0.105"
+default-features = true
+
+[dependencies.futures-util]
+version = "0.3.31"
+default-features = false
+features = ["std"]
+
+[dependencies.opentelemetry]
+version = "0.33.1"
+optional = true
+default-features = false
+features = ["trace"]
+
+[dependencies.pges-core]
+version = "0.1.0"
+path = "/tmp/claude-1003/-home-sean-dev/b28c5e1f-52c7-4708-a192-aa7d04fb1f9e/scratchpad/wt-merge/crates/pges-subscribe/../pges-core/"
+
+[dependencies.pges-derive]
+path = "/tmp/claude-1003/-home-sean-dev/b28c5e1f-52c7-4708-a192-aa7d04fb1f9e/scratchpad/wt-merge/crates/pges-subscribe/../pges-derive/"
+
+[dependencies.pges-postgres]
+version = "0.1.0"
+path = "/tmp/claude-1003/-home-sean-dev/b28c5e1f-52c7-4708-a192-aa7d04fb1f9e/scratchpad/wt-merge/crates/pges-subscribe/../pges-postgres/"
+
+[dependencies.pges-replication]
+path = "/tmp/claude-1003/-home-sean-dev/b28c5e1f-52c7-4708-a192-aa7d04fb1f9e/scratchpad/wt-merge/crates/pges-subscribe/../pges-replication/"
+
+[dependencies.pges-sequencer]
+path = "/tmp/claude-1003/-home-sean-dev/b28c5e1f-52c7-4708-a192-aa7d04fb1f9e/scratchpad/wt-merge/crates/pges-subscribe/../pges-sequencer/"
+features = ["watch-notify", "watch-grpc", "watch-grpc-tls"]
+
+[dependencies.pges-subscribe]
+path = "/tmp/claude-1003/-home-sean-dev/b28c5e1f-52c7-4708-a192-aa7d04fb1f9e/scratchpad/wt-merge/crates/pges-subscribe/"
+default-features = false
+
+[dependencies.pges-testing]
+path = "/tmp/claude-1003/-home-sean-dev/b28c5e1f-52c7-4708-a192-aa7d04fb1f9e/scratchpad/wt-merge/crates/pges-subscribe/../pges-testing/"
+features = ["tls"]
+
+[dependencies.pges-watch-proto]
+path = "/tmp/claude-1003/-home-sean-dev/b28c5e1f-52c7-4708-a192-aa7d04fb1f9e/scratchpad/wt-merge/crates/pges-subscribe/../pges-watch-proto/"
+features = ["client", "server"]
+
+[dependencies.proptest]
+version = "1.11"
+default-features = true
+
+[dependencies.rustls]
+version = "0.23.46"
+optional = true
+default-features = false
+features = ["std"]
+
+[dependencies.rustls-pki-types]
+version = "1.16"
+optional = true
+features = ["std"]
+
+[dependencies.serde]
+version = "1"
+features = ["derive"]
+
+[dependencies.sha2]
+version = "0.10.9"
+default-features = true
+
+[dependencies.sqlx]
+version = "0.9.1"
+default-features = false
+features = ["runtime-tokio", "postgres", "uuid"]
+
+[dependencies.thiserror]
+version = "2"
+default-features = true
+
+[dependencies.time]
+version = "0.3"
+default-features = true
+
+[dependencies.tokio]
+version = "1.44"
+features = ["macros", "rt-multi-thread", "sync", "time"]
+
+[dependencies.tonic]
+version = "0.14.2"
+default-features = false
+features = ["channel", "codegen", "server"]
+
+[dependencies.tracing]
+version = "0.1.41"
+default-features = true
+
+[dependencies.uuid]
+version = "1.26.1"
+features = ["serde", "v7"]
+
+[[bin]]
+name = "pges-subscribe-tests"
+path = "main.rs"
+
+[[bin]]
+name = "trybuild000"
+path = "/tmp/claude-1003/-home-sean-dev/b28c5e1f-52c7-4708-a192-aa7d04fb1f9e/scratchpad/wt-merge/crates/pges-subscribe/tests/ui/all_categories_and_listed.rs"
+
+[[bin]]
+name = "trybuild001"
+path = "/tmp/claude-1003/-home-sean-dev/b28c5e1f-52c7-4708-a192-aa7d04fb1f9e/scratchpad/wt-merge/crates/pges-subscribe/tests/ui/backfill_all_categories.rs"
+
+[[bin]]
+name = "trybuild002"
+path = "/tmp/claude-1003/-home-sean-dev/b28c5e1f-52c7-4708-a192-aa7d04fb1f9e/scratchpad/wt-merge/crates/pges-subscribe/tests/ui/backfill_without_categories.rs"
+
+[[bin]]
+name = "trybuild003"
+path = "/tmp/claude-1003/-home-sean-dev/b28c5e1f-52c7-4708-a192-aa7d04fb1f9e/scratchpad/wt-merge/crates/pges-subscribe/tests/ui/backfill_without_until.rs"
+
+[[bin]]
+name = "trybuild004"
+path = "/tmp/claude-1003/-home-sean-dev/b28c5e1f-52c7-4708-a192-aa7d04fb1f9e/scratchpad/wt-merge/crates/pges-subscribe/tests/ui/invalid_subscription_name.rs"
+
+[[bin]]
+name = "trybuild005"
+path = "/tmp/claude-1003/-home-sean-dev/b28c5e1f-52c7-4708-a192-aa7d04fb1f9e/scratchpad/wt-merge/crates/pges-subscribe/tests/ui/lanes_out_of_range.rs"
+
+[[bin]]
+name = "trybuild006"
+path = "/tmp/claude-1003/-home-sean-dev/b28c5e1f-52c7-4708-a192-aa7d04fb1f9e/scratchpad/wt-merge/crates/pges-subscribe/tests/ui/shards_out_of_range.rs"
+
+[[bin]]
+name = "trybuild007"
+path = "/tmp/claude-1003/-home-sean-dev/b28c5e1f-52c7-4708-a192-aa7d04fb1f9e/scratchpad/wt-merge/crates/pges-subscribe/tests/ui/statement_binds_and_reads_are_typed.rs"
+
+[[bin]]
+name = "trybuild008"
+path = "/tmp/claude-1003/-home-sean-dev/b28c5e1f-52c7-4708-a192-aa7d04fb1f9e/scratchpad/wt-merge/crates/pges-subscribe/tests/ui/subscription_without_categories.rs"
+
+[[bin]]
+name = "trybuild009"
+path = "/tmp/claude-1003/-home-sean-dev/b28c5e1f-52c7-4708-a192-aa7d04fb1f9e/scratchpad/wt-merge/crates/pges-subscribe/tests/ui/zero_settings.rs"
+
+[workspace]
