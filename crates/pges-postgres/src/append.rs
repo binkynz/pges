@@ -472,14 +472,23 @@ impl<'a, E: event::Event> Append<'a, E> {
         let result = match target {
             Target::Pool(store) => append_pooled(store, &mut prepared, snapshot.as_ref()).await,
             Target::Connection {
-                store, conn, state, ..
+                store,
+                conn,
+                mut state,
+                ..
             } => {
+                // An append dropped while its statement runs leaves the statement's error, if it raises one,
+                // unread on the connection, and sqlx returns it at the next statement. So the unit of work
+                // counts as failed until the append ends without aborting the transaction.
+                let before = state.as_deref().copied();
+                if let Some(state) = state.as_deref_mut() {
+                    *state = unit_of_work::State::Failed;
+                }
                 let result =
                     append_in_transaction(store, conn, &mut prepared, snapshot.as_ref()).await;
-                if let (Err(error), Some(state)) = (&result, state)
-                    && error.aborts_transaction()
-                {
-                    *state = unit_of_work::State::Failed;
+                let aborted = result.as_ref().is_err_and(AppendError::aborts_transaction);
+                if let (false, Some(state), Some(before)) = (aborted, state, before) {
+                    *state = before;
                 }
 
                 result

@@ -20,7 +20,9 @@ use crate::{append, error, sql, store};
 /// duplicate or skewed commit id, or any [`UnitOfWork::append_many`] that fails or is dropped before it
 /// completes), or a statement of the caller's through [`UnitOfWork::conn`] fails, [`UnitOfWork::commit`]
 /// rolls back and fails with [`TransactionError::Aborted`]. PostgreSQL itself would turn that COMMIT into a ROLLBACK and report
-/// success. Conflicts from [`UnitOfWork::append`] write nothing and leave the unit of work usable.
+/// success. Conflicts from [`UnitOfWork::append`] write nothing and leave the unit of work usable. An
+/// [`UnitOfWork::append`] dropped before it completes also fails the unit of work: its statement may still
+/// raise, or have written its commit.
 ///
 /// Savepoints on [`UnitOfWork::conn`] (`conn.begin()`) are allowed, but a savepoint begin that fails (on an
 /// aborted transaction) or is dropped before it completes makes sqlx roll back the whole transaction. The
@@ -193,8 +195,9 @@ impl std::fmt::Debug for WrappedUnitOfWork<'_> {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum TransactionError {
-    /// A failed append or a failed statement of the caller's aborted or partly wrote the transaction, or a
-    /// failed or dropped savepoint begin ended it; it was rolled back.
+    /// A failed append or a failed statement of the caller's aborted or partly wrote the transaction, an
+    /// append was dropped before it completed, or a failed or dropped savepoint begin ended it; it was
+    /// rolled back.
     #[error("the unit of work was aborted by a failed statement and rolled back")]
     Aborted,
     /// A database error.
