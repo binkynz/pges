@@ -456,6 +456,9 @@ pub enum DecodeError {
     /// A name is not valid UTF-8.
     #[error("pgoutput string is not valid UTF-8")]
     InvalidString,
+    /// A count of columns is negative.
+    #[error("negative {} count: {}", .0, .1)]
+    NegativeCount(&'static str, i16),
 }
 
 struct Reader(Bytes);
@@ -486,6 +489,12 @@ impl Reader {
     fn i16(&mut self) -> Result<i16, DecodeError> {
         self.need(2)?;
         Ok(self.0.get_i16())
+    }
+
+    /// An Int16 count of columns, which must not be negative.
+    fn count(&mut self, what: &'static str) -> Result<usize, DecodeError> {
+        let count = self.i16()?;
+        usize::try_from(count).map_err(|_| DecodeError::NegativeCount(what, count))
     }
 
     fn u32(&mut self) -> Result<u32, DecodeError> {
@@ -535,8 +544,8 @@ impl Reader {
             b'i' => ReplicaIdentity::Index,
             other => return Err(DecodeError::Invalid("replica identity", other)),
         };
-        let count = self.i16()?;
-        let mut columns = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
+        let count = self.count("column")?;
+        let mut columns = Vec::with_capacity(count);
         for _ in 0..count {
             let flags = self.u8()?;
             columns.push(Column {
@@ -560,8 +569,8 @@ impl Reader {
     }
 
     fn tuple(&mut self) -> Result<Tuple, DecodeError> {
-        let count = self.i16()?;
-        let mut values = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
+        let count = self.count("tuple column")?;
+        let mut values = Vec::with_capacity(count);
         for _ in 0..count {
             let value = match self.u8()? {
                 b'n' => Value::Null,
@@ -776,6 +785,28 @@ mod tests {
             Err(DecodeError::UnknownMessage(b'z'))
         );
         assert_eq!(Message::decode(Bytes::new()), Err(DecodeError::Truncated));
+
+        let mut relation = BytesMut::new();
+        relation.put_u8(b'R');
+        relation.put_u32(16_384);
+        cstr(&mut relation, "public");
+        cstr(&mut relation, "t");
+        relation.put_u8(b'd');
+        relation.put_i16(-1);
+        assert_eq!(
+            Message::decode(relation.freeze()),
+            Err(DecodeError::NegativeCount("column", -1))
+        );
+
+        let mut insert = BytesMut::new();
+        insert.put_u8(b'I');
+        insert.put_u32(16_384);
+        insert.put_u8(b'N');
+        insert.put_i16(-2);
+        assert_eq!(
+            Message::decode(insert.freeze()),
+            Err(DecodeError::NegativeCount("tuple column", -2))
+        );
 
         let mut buf = BytesMut::new();
         buf.put_u8(b'O');
