@@ -2163,8 +2163,8 @@ the halt, 43 recovered, 335 after.
   - `skip_through` covers the head at creation, not only the highest horizon: a drop that races the
     creation, or drops events the subscription had not reached while it catches up, is still of events
     that existed before it, so it is skipped rather than failing a subscription that never handled them. A
-    drop of events written after the creation, while the cursor is behind them, fails as for any
-    subscription. Stored, because the reader must still know after a restart that it was created this way.
+    drop of events positioned after `skip_through`, while the cursor is behind them, fails as for any
+    subscription, also of events written before the creation but sequenced after it. Stored, because the reader must still know after a restart that it was created this way.
   - The head alone can be below a horizon: `Admin::prune_log` can delete the newest log row of an idle
     store, the dropped commit's, so the head falls below that category's horizon, the category is read
     strictly, and the new subscription fails at once with `CursorBeforeHorizon`, whose advice is to use

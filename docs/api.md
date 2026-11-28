@@ -1151,8 +1151,9 @@ The first `.categories(..)` takes a `NonEmpty<CategoryName>`, later ones any ite
   kept and skips the ones it dropped. The subscription stores the newest position the store had assigned at
   creation (`skip_through`: the head, or the highest horizon if `prune_log` deleted the newest log row); a
   category whose horizon is at or below it is read after its start position, and its
-  missing commits are skipped. A category whose horizon rises above it (retention dropped events written
-  after the subscription was created) is checked against its horizon again. `Start::Position(horizon)` is
+  missing commits are skipped. A category whose horizon rises above it (retention dropped events
+  positioned after `skip_through`, also ones written before the subscription was created but sequenced
+  after it) is checked against its horizon again. `Start::Position(horizon)` is
   not a substitute: a kept commit can be positioned below the horizon. After `CursorBeforeHorizon`, rebuild
   under a new name (or `.redefine(Start::Retained)` with a changed definition) from `Start::Retained`.
   `Start::Beginning` does not skip: it fails with `CursorBeforeHorizon` on a category whose retention

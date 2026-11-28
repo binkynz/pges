@@ -323,7 +323,8 @@ async fn changing_the_number_of_shards_needs_a_redefine() -> Result<()> {
     f.finish().await
 }
 
-/// A [`Recorder`] that takes a while per batch, so a second instance joins while the first still reads.
+/// A [`Recorder`] that takes a while per batch, so the shards usually move to the second instance while
+/// the first still reads. The test does not rely on it: it waits until each instance holds two shards.
 struct Slow(Recorder);
 
 impl handler::PgHandler for Slow {
@@ -337,8 +338,8 @@ impl handler::PgHandler for Slow {
     }
 }
 
-/// A sharded subscription started at `Start::Retained`, run by two instances over 4 shards, listed and
-/// store-wide: together they deliver every commit retention kept, also those below the horizon in each
+/// A sharded subscription started at `Start::Retained`, run by two instances that each end up holding 2 of
+/// its 4 shards, listed and store-wide: together they deliver every commit retention kept, also those below the horizon in each
 /// shard, skip the dropped ones, deliver nothing twice and keep each stream in order.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_sharded_retained_subscription_reads_every_kept_commit_once() -> Result<()> {
@@ -449,6 +450,9 @@ async fn sharded_retained() -> Result<()> {
             };
             instances.push((common::Running::spawn(subscription), subscriber));
         }
+        for (running, _) in &instances {
+            wait_holding(running.handle.status_changes(), 2).await?;
+        }
         wait_shards(&f, name, head).await?;
 
         let mut delivered: Vec<(i64, Uuid)> = Vec::new();
@@ -462,7 +466,6 @@ async fn sharded_retained() -> Result<()> {
             .bind(&subscriber)
             .fetch_all(&f.pool)
             .await?;
-            ensure!(!mine.is_empty(), "{subscriber} delivered nothing");
             let mut by_stream: BTreeMap<Uuid, Vec<i64>> = BTreeMap::new();
             for (position, stream_id) in &mine {
                 by_stream.entry(*stream_id).or_default().push(*position);
