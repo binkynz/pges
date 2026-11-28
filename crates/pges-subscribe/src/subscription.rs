@@ -1231,12 +1231,15 @@ enum Wait {
 enum Checkpoint {
     /// The cursor moved; the lease was renewed if a new deadline is given.
     Moved(Option<Instant>),
-    /// The fence moved on: another instance took the lease.
-    Fenced,
+    /// No row matched: the fence moved on (another instance took the lease), or the stored cursor is not
+    /// `Term::cursor` (a COMMIT whose reply was lost moved it). Read the stored cursor to tell which.
+    Refused,
 }
 
 enum Delivered {
     Checkpointed,
+    /// The checkpoint was refused ([`Checkpoint::Refused`]) and the batch rolled back, if it could be.
+    Refused,
     LostLease,
     /// Shutdown came while a failed batch waited for its retry.
     Shutdown,
@@ -1380,14 +1383,10 @@ impl Runner {
         reader: &mut read::Reader,
         shutdown: &mut Shutdown,
     ) -> Result<Step, SubscribeError> {
-        if term.cursor_state == CursorState::Unconfirmed {
-            let Some(stored) = self.ctx.stored_cursor(term).await? else {
-                return Ok(Step::LostLease);
-            };
-            term.cursor = stored;
-            term.cursor_state = CursorState::Confirmed;
-            self.status
-                .send_if_modified(|status| replace(&mut status.position, stored));
+        if term.cursor_state == CursorState::Unconfirmed
+            && let Step::LostLease = self.reread_cursor(term).await?
+        {
+            return Ok(Step::LostLease);
         }
 
         let page = match &mut self.replica {
@@ -1416,6 +1415,7 @@ impl Runner {
         if !page.batch.is_empty() {
             match self.deliver(term, &page.batch, shutdown).await? {
                 Delivered::Checkpointed => {}
+                Delivered::Refused => return self.reread_cursor(term).await,
                 Delivered::LostLease => return Ok(Step::LostLease),
                 Delivered::Shutdown => return Ok(Step::Shutdown),
             }
@@ -1427,7 +1427,7 @@ impl Runner {
                 .await?
             {
                 Checkpoint::Moved(renewed) => renew(term, renewed),
-                Checkpoint::Fenced => return Ok(Step::LostLease),
+                Checkpoint::Refused => return self.reread_cursor(term).await,
             }
         }
 
@@ -1443,6 +1443,19 @@ impl Runner {
         // The cut, not `H`: a cursor can be ahead of `H` (Start::Position past the log), and a level-triggered
         // waker given `H` would fire again at once.
         Ok(Step::CaughtUp(reader.known(cut)))
+    }
+
+    /// Reads the stored cursor into `term`: [`Step::More`] to read on from it, or [`Step::LostLease`] if the
+    /// fence moved on.
+    async fn reread_cursor(&mut self, term: &mut Term) -> Result<Step, SubscribeError> {
+        let Some(stored) = self.ctx.stored_cursor(term).await? else {
+            return Ok(Step::LostLease);
+        };
+        term.cursor = stored;
+        term.cursor_state = CursorState::Confirmed;
+        self.status
+            .send_if_modified(|status| replace(&mut status.position, stored));
+        Ok(Step::More)
     }
 
     /// Hands the batch to the handler and checkpoints, retrying transient handler errors. The lease is
@@ -1741,6 +1754,7 @@ impl Ctx {
                     store: self.store.as_str(),
                     store_version: migrate::latest_version(migrate::STORE).get(),
                     outbox_version: migrate::latest_version(migrate::OUTBOX).get(),
+                    from: read::to_i64(term.cursor),
                 })
                 .execute(&mut *conn)
                 .await?
@@ -1752,12 +1766,13 @@ impl Ctx {
                     shard: term.shard,
                     position: read::to_i64(to),
                     fence: term.fence,
+                    from: read::to_i64(term.cursor),
                 })
                 .execute(&mut *conn)
                 .await?
         };
         if updated.rows_affected() == 0 {
-            return Ok(Checkpoint::Fenced);
+            return Ok(Checkpoint::Refused);
         }
 
         Ok(Checkpoint::Moved(due.then_some(renewed)))
@@ -1929,9 +1944,9 @@ async fn deliver_pg(
         .await
     {
         Ok(Checkpoint::Moved(renewed)) => renewed,
-        Ok(Checkpoint::Fenced) => {
+        Ok(Checkpoint::Refused) => {
             let _ = tx.rollback().await;
-            return Ok(Delivered::LostLease);
+            return Ok(Delivered::Refused);
         }
         Err(error) if is_aborted_transaction(&error) => {
             let _ = tx.rollback().await;
@@ -1982,7 +1997,7 @@ async fn deliver_external(
             renew(term, renewed);
             Ok(Delivered::Checkpointed)
         }
-        Checkpoint::Fenced => Ok(Delivered::LostLease),
+        Checkpoint::Refused => Ok(Delivered::Refused),
     }
 }
 

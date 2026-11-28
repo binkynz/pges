@@ -1004,7 +1004,8 @@ The first `.categories(..)` takes a `NonEmpty<CategoryName>`, later ones any ite
   an id is unknown (`SubscribeError::UnknownEventType` if it stays unknown).
 - `run_pg`: the handler runs in a transaction, then the fenced checkpoint runs in the same transaction, then
   it commits. The read model must live in the store's database. After any retried error the subscriber
-  re-reads its stored cursor, so a COMMIT whose reply was lost does not deliver the batch twice.
+  re-reads its stored cursor, and the checkpoint moves the cursor only from where the subscriber holds it,
+  so a COMMIT whose reply was lost does not deliver the batch twice, also when it lands after the re-read.
 - `run`: the handler runs first, then an autocommit checkpoint. A crash or lost lease in between delivers the
   batch again; make the effect idempotent.
 - A handler that leaves its transaction aborted is detected (25P02 at the checkpoint), rolled back, and

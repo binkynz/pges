@@ -850,6 +850,91 @@ async fn after_a_database_error_the_stored_cursor_wins() -> Result<()> {
     f.finish().await
 }
 
+/// A COMMIT whose reply was lost can become visible only after the subscription read its cursor again: the
+/// client saw an error while the server still finished the transaction. The batch read from the stale cursor
+/// must not be applied on top of it. The test holds the lost COMMIT open until the subscription's own
+/// checkpoint waits on its row lock, then commits it: the checkpoint finds the cursor moved, rolls the batch
+/// back and reads the cursor again.
+#[tokio::test]
+async fn a_lost_commit_landing_late_is_not_applied_twice() -> Result<()> {
+    let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    let id = jobs(&f, 2).await?;
+
+    let handle = f
+        .store
+        .subscription(subscription_name!("late"))
+        .categories(non_empty![category!("jobs")])
+        .retry_interval(interval!(50 ms))
+        .waker(recheck::Recheck::every(interval!(5 ms)))
+        .run_pg(Recorder::new("late"))
+        .spawn();
+    common::wait_position(handle.status_changes(), 2).await?;
+
+    for _ in 0..2 {
+        f.append(Cat::Jobs, id, 1).await?;
+    }
+    sqlx::query("ALTER TABLE es.commits_jobs RENAME TO commits_jobs_hidden")
+        .execute(&f.pool)
+        .await?;
+    f.sequence_all().await?;
+    common::wait_state(handle.status_changes(), |s| {
+        matches!(s, subscription::State::Recovering(_))
+    })
+    .await?;
+
+    // The lost COMMIT's transaction: the batch applied and the cursor moved, not yet visible.
+    let expected = f.expected(&[f.id(Cat::Jobs)]).await?;
+    let mut lost = f.pool.begin().await?;
+    for (position, category_id) in &expected[2..] {
+        sqlx::query(
+            "INSERT INTO public.delivered (position, commit_id, category_id, subscriber)
+             VALUES ($1, gen_random_uuid(), $2, 'late')",
+        )
+        .bind(position)
+        .bind(category_id)
+        .execute(&mut *lost)
+        .await?;
+    }
+    sqlx::query("UPDATE es.subscriptions SET position = 4 WHERE name = 'late'")
+        .execute(&mut *lost)
+        .await?;
+    sqlx::query("ALTER TABLE es.commits_jobs_hidden RENAME TO commits_jobs")
+        .execute(&f.pool)
+        .await?;
+
+    // The subscription reads the cursor again (still 2), applies 3 and 4 and waits on the row lock.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT FROM pg_stat_activity
+                                WHERE datname = current_database() AND wait_event_type = 'Lock'
+                                  AND query LIKE '%subscriptions SET position%')",
+            )
+            .fetch_one(&f.pool)
+            .await?;
+            if waiting {
+                return anyhow::Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .context("the subscription's checkpoint never waited on the lost COMMIT")??;
+    lost.commit().await?;
+
+    f.append(Cat::Jobs, id, 1).await?;
+    f.sequence_all().await?;
+    common::wait_position(handle.status_changes(), 5).await?;
+    handle.shutdown().await?;
+
+    common::check_delivery(
+        &f.delivered("late").await?,
+        &f.expected(&[f.id(Cat::Jobs)]).await?,
+    )?;
+
+    f.finish().await
+}
+
 /// Records after a pause, as a slow projection would.
 struct Slow {
     recorder: Recorder,

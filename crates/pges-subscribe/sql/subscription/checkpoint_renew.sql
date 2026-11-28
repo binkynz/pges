@@ -2,11 +2,12 @@
 --
 -- $1 the name, $2 the shard, $3 the new cursor, $4 the fence, $5 the lease duration, $6 the crate's newest
 -- shared (pges) schema version, $7 the store, $8 the crate's newest store schema version, $9 its newest
--- outbox schema version. Updates no row when the fence moved on (another instance took the shard over), or
+-- outbox schema version, $10 the cursor the instance holds. Updates no row when the fence moved on (another
+-- instance took the shard over), when the stored cursor is elsewhere (as subscription/checkpoint.sql), or
 -- when a migration raised the min_compatible of the shared scope, the store's or the store's outbox scope
 -- above the crate's version for it, as subscription/renew.sql.
 UPDATE {store}.subscriptions SET position = $3, lease_until = now() + $5
-WHERE name = $1 AND shard = $2 AND fence = $4
+WHERE name = $1 AND shard = $2 AND fence = $4 AND position = $10
   AND NOT EXISTS (SELECT FROM pges.scopes
                   WHERE (scope = 'pges' AND min_compatible > $6) OR (scope = $7 AND min_compatible > $8)
                      OR (scope = $7 || '.outbox' AND min_compatible > $9))
