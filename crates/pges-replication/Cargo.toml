@@ -33,6 +33,7 @@ tls = ["dep:rustls", "dep:rustls-native-certs", "dep:rustls-pki-types", "dep:sha
 
 [dev-dependencies]
 anyhow = "1.0.105"
+proptest = "1.11"
 pges-testing = { path = "../pges-testing" }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "postgres"] }
