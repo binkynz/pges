@@ -100,7 +100,7 @@ types travel inside the payload frame instead, and subscribers filter after deco
 | `pending` | append path, sequencer | queue, outbox stores only | drained by the sequencer |
 | `deleted_commits` | `delete_stream`, retention | one row per deleted commit, key (`category_id`, `commit_id`) | lets the store-wide read tell a deleted commit's log row from corruption; retention forgets the rows whose log rows its horizon covers when it drops a leaf (Partition maintenance, retention step 2) |
 | `snapshots` | append path (`snapshot_after`), `save_snapshot` | latest per stream, HASH(`stream_partitions`) | upserted |
-| `subscriptions` | subscribers | one row per shard (one, shard 0, for an unsharded subscription) | cursor, lease, fence, definition (categories, number of shards), `skip_through` (`Start::Retained`: the head at creation; 0 otherwise); rows with `shard >= shards` are retired |
+| `subscriptions` | subscribers | one row per shard (one, shard 0, for an unsharded subscription) | cursor, lease, fence, definition (categories, number of shards), `skip_through` (`Start::Retained`: the greater of the head and the highest horizon at creation; 0 otherwise); rows with `shard >= shards` are retired |
 | `subscription_members` | sharded subscriptions | one row per running instance | liveness, for each instance's fair share of the shards |
 | `backfills` | backfills (`pges-subscribe`) | one row per lane of a backfill | lane cursor, end, lane count, categories |
 | `tag_heads`, `commit_tags` | append path | DCB stores only | |
@@ -686,10 +686,16 @@ In two steps:
   above it is checked against the horizon: 0 for a subscription, so it never skips a commit it has not
   handled. A category whose horizon is at or below it is checked against `start_position`, and the client
   reads it after max(cursor, `start_position`): every commit at or below the start was dropped, and a commit
-  missing between the start and the horizon was dropped too and is skipped. `skip_through` is the head at
-  creation for a subscription started at `Start::Retained` (stored in `subscriptions.skip_through`), and the
-  largest position for a backfill. Only a reader whose cursor is below `skip_through` reads the starts
-  before a page; past it, every such start is at or below the cursor.
+  missing between the start and the horizon was dropped too and is skipped. `skip_through` is, for a
+  subscription started at `Start::Retained`, the greater of the head and the highest horizon of any category
+  at creation, read in one statement (`crates/pges-subscribe/sql/read/skip_through.sql`; stored in
+  `subscriptions.skip_through`), and the largest position for a backfill. The head alone is not enough:
+  `Admin::prune_log` can delete the newest log row of an idle store, the dropped commit's, so the head falls
+  below that category's horizon, the category would be read strictly and the new subscription would fail
+  with `CursorBeforeHorizon`. Every horizon is the position of a commit written before the statement, so
+  the greater value still covers only commits that existed before the subscription. Only a reader whose
+  cursor is below `skip_through` reads the starts before a page; past it, every such start is at or below
+  the cursor.
 - The fetch is a second statement, so retention can raise the horizon and drop commits between the two.
   Retention commits the horizon raise before it drops commits, so when a page's commit is missing the client
   reads the category's horizon and start again (`horizons.sql`). If the horizon is now above the read's
