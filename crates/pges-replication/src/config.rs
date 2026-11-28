@@ -128,7 +128,8 @@ impl Config {
     /// Understood query parameters: `host` (a path starting with `/` selects a unix socket directory), `port`,
     /// `user`, `password`, `dbname`, `application_name`, `sslmode` ([`SslMode`]), `sslrootcert` (a PEM file,
     /// or `system`: [`RootCertificates`]), `sslnegotiation` ([`SslNegotiation`]) and `channel_binding`
-    /// ([`ChannelBinding`]). Anything else is an error rather than silently ignored.
+    /// ([`ChannelBinding`]). Anything else is an error rather than silently ignored. As in libpq, the URL's
+    /// host part may also name a socket directory, percent-encoded: `postgres://user@%2Fvar%2Frun/app`.
     ///
     /// As in libpq, `sslrootcert=system` without an `sslmode` selects [`SslMode::VerifyFull`]. The result
     /// passes [`Config::check`]: settings that need TLS fail with [`ConfigError::TlsFeatureRequired`] when
@@ -143,7 +144,7 @@ impl Config {
         }
 
         let mut host = match url.host() {
-            Some(url::Host::Domain(name)) if !name.is_empty() => Some(Host::Tcp(decode(name)?)),
+            Some(url::Host::Domain(name)) if !name.is_empty() => Some(host_from(decode(name)?)),
             Some(url::Host::Domain(_)) | None => None,
             Some(url::Host::Ipv4(ip)) => Some(Host::Tcp(ip.to_string())),
             Some(url::Host::Ipv6(ip)) => Some(Host::Tcp(ip.to_string())),
@@ -169,8 +170,7 @@ impl Config {
             let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
             let (key, value) = (decode(key)?, decode(value)?);
             match key.as_str() {
-                "host" if value.starts_with('/') => host = Some(Host::Unix(PathBuf::from(value))),
-                "host" => host = Some(Host::Tcp(value)),
+                "host" => host = Some(host_from(value)),
                 "port" => {
                     port = value
                         .parse()
@@ -451,6 +451,15 @@ fn parse_value<T: FromStr>(parameter: &str, value: String) -> Result<T, ConfigEr
     })
 }
 
+/// As in libpq, a host that starts with `/` is a unix socket directory.
+fn host_from(host: String) -> Host {
+    if host.starts_with('/') {
+        Host::Unix(PathBuf::from(host))
+    } else {
+        Host::Tcp(host)
+    }
+}
+
 fn decode(text: &str) -> Result<String, ConfigError> {
     percent_decode_str(text)
         .decode_utf8()
@@ -480,6 +489,15 @@ mod tests {
         assert_eq!(config.get_host(), &Host::Unix("/tmp/x/.pg".into()));
         assert_eq!(config.get_port(), 54318);
         assert_eq!(config.password_bytes(), None);
+    }
+
+    #[test]
+    fn parses_a_percent_encoded_unix_socket_in_the_host() {
+        // libpq: a host that starts with `/` once decoded is a unix socket directory.
+        let config = Config::from_url("postgres://postgres@%2Ftmp%2Fx%2F.pg:54318/app").unwrap();
+        assert_eq!(config.get_host(), &Host::Unix("/tmp/x/.pg".into()));
+        assert_eq!(config.get_port(), 54318);
+        assert_eq!(config.get_database(), "app");
     }
 
     #[test]
