@@ -468,6 +468,90 @@ async fn a_checkpoint_serialization_failure_follows_the_retry_policy() -> Result
     f.finish().await
 }
 
+/// Records with a short `lock_timeout`, which the checkpoint in its transaction inherits; the first call waits
+/// until the test lets it go.
+struct ShortLockTimeout {
+    recorder: Recorder,
+    entered: Arc<Notify>,
+    go: Arc<Notify>,
+}
+
+impl handler::PgHandler for ShortLockTimeout {
+    async fn handle(
+        &mut self,
+        tx: &mut PgConnection,
+        batch: &batch::Batch,
+    ) -> Result<(), handler::HandlerError> {
+        let call = {
+            let mut calls = self.recorder.calls.lock().unwrap();
+            *calls += 1;
+            *calls
+        };
+        sqlx::query("SET LOCAL lock_timeout = '100ms'")
+            .execute(&mut *tx)
+            .await?;
+        if call == 1 {
+            self.entered.notify_one();
+            self.go.notified().await;
+        }
+        self.recorder.record(tx, batch).await?;
+        Ok(())
+    }
+}
+
+/// A checkpoint that times out waiting for the subscription's row lock (55P03, as behind a lost COMMIT still
+/// in flight) is no fault of the handler: it is transient and retried, and the batch is applied once the lock
+/// is gone, instead of stopping the run with `HandlerFailed`.
+#[tokio::test]
+async fn a_checkpoint_lock_timeout_is_retried() -> Result<()> {
+    let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    jobs(&f, 1).await?;
+    let recorder = Recorder::new("locked");
+    let (entered, go) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+
+    let running = common::Running::spawn(
+        f.store
+            .subscription(subscription_name!("locked"))
+            .categories(non_empty![category!("jobs")])
+            .on_error(subscription::RetryPolicy::new(
+                interval!(100 ms),
+                NonZeroU32::new(20).unwrap(),
+            ))
+            .run_pg(ShortLockTimeout {
+                recorder: recorder.clone(),
+                entered: entered.clone(),
+                go: go.clone(),
+            }),
+    );
+    tokio::time::timeout(Duration::from_secs(10), entered.notified())
+        .await
+        .context("the batch was not delivered")?;
+    let mut lock = f.pool.begin().await?;
+    sqlx::query("SELECT FROM es.subscriptions WHERE name = 'locked' FOR UPDATE")
+        .execute(&mut *lock)
+        .await?;
+    go.notify_one();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    lock.rollback().await?;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while f.cursor("locked").await? != Some(1) {
+        if running.handle.is_finished() {
+            panic!(
+                "the subscription stopped: {:?}",
+                running.handle.join().await
+            );
+        }
+        assert!(tokio::time::Instant::now() < deadline, "not checkpointed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(recorder.calls() >= 2, "the first attempt timed out");
+    assert_eq!(f.delivered("locked").await?.len(), 1, "applied once");
+    running.stop().await?;
+
+    f.finish().await
+}
+
 #[tokio::test]
 async fn a_standby_takes_over_from_the_checkpoint() -> Result<()> {
     let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;

@@ -1941,15 +1941,15 @@ async fn deliver_pg(
         }
         Err(error) if is_refused(&error) => {
             let _ = tx.rollback().await;
-            return Err(Failure::Handler(error.into()));
+            return Err(Failure::Handler(refused(error)));
         }
         Err(error) => return Err(database(error)),
     };
     // A refused COMMIT (a deferred constraint, a serialization failure) rolled the batch back for sure:
-    // it is the handler's failure and follows the retry policy. Any other error may hide a commit.
+    // it follows the retry policy ([`refused`]). Any other error may hide a commit.
     if let Err(error) = tx.commit().await {
         return Err(if is_refused(&error) {
-            Failure::Handler(error.into())
+            Failure::Handler(refused(error))
         } else {
             database(error)
         });
@@ -2058,6 +2058,25 @@ fn is_refused(error: &sqlx::Error) -> bool {
         .as_database_error()
         .and_then(|error| error.try_downcast_ref::<PgDatabaseError>())
         .is_some_and(|error| matches!(error.severity(), PgSeverity::Error))
+}
+
+/// The handler failure for an ERROR the server returned for `run_pg`'s checkpoint or COMMIT, which rolled the
+/// batch back. Transient, so the batch is retried and the [`RetryPolicy`] still stops a batch that can never
+/// commit once its attempts run out: most such errors are not the batch's fault and pass (a lock or statement
+/// timeout behind a lost COMMIT's row lock, a serialization failure, a read-only transaction during a
+/// failover). Fatal for an integrity constraint violation (class 23, such as a deferred unique constraint)
+/// or a data exception (class 22, such as a deferred trigger's cast) at the COMMIT: the same batch fails
+/// the same way on every attempt.
+fn refused(error: sqlx::Error) -> handler::HandlerError {
+    let error = pges_postgres::error::DbError::from(error);
+    let never_commits = error
+        .code()
+        .is_some_and(|code| code.starts_with("23") || code.starts_with("22"));
+    if never_commits {
+        handler::HandlerError::Fatal(Box::new(error))
+    } else {
+        handler::HandlerError::Transient(Box::new(error))
+    }
 }
 
 fn renew(term: &mut Term, renewed: Option<Instant>) {
