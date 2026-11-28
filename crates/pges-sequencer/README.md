@@ -24,7 +24,10 @@ that only sequences, or to write a source of your own.
 - `watch-grpc-tls`: the gRPC watch over TLS (rustls), optionally requiring client certificates. With `bin`,
   `--grpc-tls-cert`, `--grpc-tls-key` and `--grpc-tls-client-ca`.
 - `bin`: the `pges-sequencer` binary. `pges-sequencer bootstrap` creates the logical source's publication
-  and slot; `pges-sequencer resequence` recovers from a lost slot.
+  and slot; `pges-sequencer resequence` recovers from a lost slot. SIGINT or SIGTERM stops the binary
+  cleanly: it finishes its batch, stores its token, releases the lease and exits 0. A second SIGINT or
+  SIGTERM during that shutdown exits at once, with 130 (SIGINT) or 143 (SIGTERM), and may leave the lease
+  to expire.
 
 With the logical source, create the slot before the first append: run the migrations, then
 `pges-sequencer bootstrap`, then start the writers. `pges-sequencer bootstrap --failover` creates the slot

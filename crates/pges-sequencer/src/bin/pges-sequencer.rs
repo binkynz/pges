@@ -1,6 +1,7 @@
 //! `pges-sequencer`: runs a [`Sequencer`](pges_sequencer::sequencer::Sequencer) for one database until
-//! SIGINT or SIGTERM, then finishes its batch, stores its token and releases the lease. It exits with
-//! status 1 when the sequencer stops on an error (`Status::Halted`). A panic in the run ends the process with
+//! SIGINT or SIGTERM, then finishes its batch, stores its token and releases the lease. A second SIGINT or
+//! SIGTERM during that shutdown exits at once, with status 130 (SIGINT) or 143 (SIGTERM), without waiting
+//! for the release: the lease may be left to expire. It exits with status 1 when the sequencer stops on an error (`Status::Halted`). A panic in the run ends the process with
 //! Rust's status 101 and the run as `Status::Abandoned`: the lease is not released, and a standby takes
 //! over once it expires.
 //!
@@ -717,8 +718,9 @@ async fn run(plan: Plan) -> Result<(), Box<dyn std::error::Error>> {
         }
         None => (None, None),
     };
+    let mut signals = Signals::listen();
     #[cfg(feature = "watch-grpc")]
-    let stopping = async {
+    let stopping = async move {
         let failed = async {
             match server_failed {
                 Some(failed) => {
@@ -728,12 +730,16 @@ async fn run(plan: Plan) -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         tokio::select! {
-            () = shutdown() => {}
+            signal = signals.recv() => log_shutdown(signal),
             () = failed => tracing::error!("the gRPC watch server stopped; shutting down"),
         }
+        exit_on_next_signal(signals);
     };
     #[cfg(not(feature = "watch-grpc"))]
-    let stopping = shutdown();
+    let stopping = async move {
+        log_shutdown(signals.recv().await);
+        exit_on_next_signal(signals);
+    };
 
     tracing::info!(source = ?kind, "starting");
     let result = sequencer.run(stopping).await;
@@ -865,29 +871,112 @@ fn log_status(watch: watch::Watch) {
     });
 }
 
-/// Resolves on SIGINT or, on Unix, SIGTERM.
-async fn shutdown() {
+/// The shutdown signals: SIGINT and, on Unix, SIGTERM. Listening replaces a signal's default action, which
+/// ends the process, for the rest of the run, so a signal that arrives once shutdown has begun must be
+/// handled too ([`exit_on_next_signal`]).
+struct Signals {
     #[cfg(unix)]
-    {
-        let mut terminate =
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(terminate) => terminate,
+    interrupt: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    terminate: Option<tokio::signal::unix::Signal>,
+}
+
+/// A shutdown signal that arrived.
+#[derive(Debug, Clone, Copy)]
+enum Received {
+    Sigint,
+    #[cfg(unix)]
+    Sigterm,
+}
+
+impl Signals {
+    /// Starts listening. A signal that cannot be listened for keeps its default action, with a warning.
+    fn listen() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+
+            let listen = |kind: SignalKind, name: &str| match signal(kind) {
+                Ok(listener) => Some(listener),
                 Err(error) => {
-                    tracing::warn!(%error, "cannot listen for SIGTERM");
-                    let _ = tokio::signal::ctrl_c().await;
-                    return;
+                    tracing::warn!(%error, signal = name, "cannot listen for the signal");
+                    None
                 }
             };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = terminate.recv() => {}
+            Self {
+                interrupt: listen(SignalKind::interrupt(), "SIGINT"),
+                terminate: listen(SignalKind::terminate(), "SIGTERM"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {}
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+
+    /// Waits for the next signal. One that arrived since [`Signals::listen`] and was not yet returned is
+    /// returned at once.
+    async fn recv(&mut self) -> Received {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                () = next(&mut self.interrupt) => Received::Sigint,
+                () = next(&mut self.terminate) => Received::Sigterm,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => Received::Sigint,
+                Err(_) => std::future::pending().await,
+            }
+        }
     }
-    tracing::info!("shutting down");
+}
+
+impl Received {
+    /// The status a shell gives a process this signal ended: 128 plus the signal's number.
+    fn exit_code(self) -> i32 {
+        match self {
+            Self::Sigint => 130,
+            #[cfg(unix)]
+            Self::Sigterm => 143,
+        }
+    }
+}
+
+fn log_shutdown(signal: Received) {
+    tracing::info!(
+        ?signal,
+        "shutting down; a second SIGINT or SIGTERM exits at once"
+    );
+}
+
+/// Once shutdown has begun, the next SIGINT or SIGTERM exits the process at once with
+/// [`Received::exit_code`]. It does not wait for the batch, the token or the lease release; a statement
+/// already sent may still complete on the server, and otherwise a standby takes over once the lease expires.
+/// This ends a shutdown that hangs, such as releasing the lease while the database is unreachable.
+fn exit_on_next_signal(mut signals: Signals) {
+    tokio::spawn(async move {
+        let signal = signals.recv().await;
+        tracing::error!(
+            ?signal,
+            "shutdown forced by a second signal; exiting without waiting to release the lease"
+        );
+        std::process::exit(signal.exit_code());
+    });
+}
+
+/// Resolves on the listener's next signal, or never without a listener.
+#[cfg(unix)]
+async fn next(listener: &mut Option<tokio::signal::unix::Signal>) {
+    let received = match listener {
+        Some(listener) => listener.recv().await,
+        None => None,
+    };
+    if received.is_none() {
+        std::future::pending::<()>().await;
+    }
 }
 
 /// `250ms`, `10s`, `1m`.
