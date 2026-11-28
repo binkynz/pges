@@ -85,10 +85,23 @@ async fn wakes_on_notices_for_watched_categories() -> Result<()> {
     send(&f.pool, &format!("1;10;0/20;{jobs}:10")).await?;
     let high = woken(&mut waker, &watching_jobs).await?;
     assert_eq!(high.category(jobs), at(10));
-    assert_eq!(high.category(orders), at(9));
+    assert_eq!(
+        high.category(orders),
+        at(0),
+        "the orders notice woke the call before, and was forgotten"
+    );
     assert_eq!(high.store(), at(10));
-    // Level-triggered: the notice already seen wakes every call it has passed, and no other.
-    woken(&mut waker, &watching_jobs).await?;
+    // Notices are untrusted, so each wakes one call: one that woke a call does not wake the next, even if it
+    // is still ahead of `known`.
+    assert!(pending(&mut waker, &watching_jobs, SHORT).await);
+    // A notice that arrived while nobody waited wakes the next call it has passed, and none it has not.
+    send(&f.pool, &format!("1;11;0/30;{jobs}:11")).await?;
+    tokio::time::sleep(SHORT).await;
+    assert!(pending(&mut waker, &known(11, &[jobs]), SHORT).await);
+    assert_eq!(
+        woken(&mut waker, &known(10, &[jobs])).await?.category(jobs),
+        at(11)
+    );
     assert!(pending(&mut waker, &known(10, &[jobs]), SHORT).await);
 
     // Too many categories for the payload: any category may be at the notice's store position.
