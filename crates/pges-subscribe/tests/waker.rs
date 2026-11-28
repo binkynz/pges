@@ -7,13 +7,13 @@ mod common;
 
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 
 use pges_core::{category, high_water, interval, non_empty, position, stream};
 use pges_subscribe::{
     subscription::StoreExt,
     subscription_name,
-    waker::{self, Waker, inproc, poll},
+    waker::{self, Waker, inproc, poll, recheck},
 };
 
 use common::{Cat, Fixture, Recorder};
@@ -121,6 +121,37 @@ async fn poll_wakes_when_a_watched_category_gets_a_log_entry() -> Result<()> {
     f.sequence_all().await?;
     let (_, woken) = tokio::time::timeout(Duration::from_secs(5), watching).await??;
     assert_eq!(woken?.category(jobs), at(4));
+
+    f.finish().await
+}
+
+#[tokio::test]
+async fn recheck_fires_when_the_lease_is_renewed_more_often() -> Result<()> {
+    let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    let job = stream::StreamId::new_v7();
+    let running = common::Running::spawn(
+        f.store
+            .subscription(subscription_name!("slow-recheck"))
+            .categories(non_empty![category!("jobs")])
+            // A caught-up holder renews every 250 ms, four times per recheck interval.
+            .lease(interval!(500 ms))
+            .waker(recheck::Recheck::every(interval!(1 s)))
+            .max_idle(interval!(1 h))
+            .run_pg(Recorder::new("slow-recheck")),
+    );
+    f.append(Cat::Jobs, job, 1).await?;
+    f.sequence_all().await?;
+    running.wait_position(1).await?;
+
+    f.append(Cat::Jobs, job, 1).await?;
+    f.sequence_all().await?;
+    let woken = tokio::time::timeout(Duration::from_secs(10), running.wait_position(2)).await;
+    ensure!(
+        matches!(woken, Ok(Ok(()))),
+        "a 1 s recheck did not wake the subscription within 10 s: {:?}",
+        running.handle.status()
+    );
+    running.stop().await?;
 
     f.finish().await
 }
