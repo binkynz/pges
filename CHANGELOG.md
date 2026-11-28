@@ -30,7 +30,8 @@ The first release: `pges`, `pges-core`, `pges-derive`, `pges-postgres`, `pges-su
   `TransactionError::Aborted`.
 - **Reads and aggregates.** Stream reads, `load` of an `Aggregate`, snapshots (`load_snapshotted`,
   `save_snapshot`), stream deletion. A snapshot save for a deleted stream stores nothing, also one from a
-  load made before the deletion.
+  load made before the deletion. `load_snapshotted` of a stream that retention truncated loads from its
+  snapshot, also from one saved while the load runs.
 - **Events** (`pges-core`, `pges-derive`). `#[derive(Event)]` gives each variant a stable type name and a
   schema version, with upcasting from older versions. JSON codec by default. A versioned payload frame.
 - **Metadata.** Correlation id, causation id, actor, W3C trace context and string pairs on each commit; an

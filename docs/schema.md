@@ -511,6 +511,10 @@ wants, and the last page reaches the head's version. Otherwise it reads the head
 
 A load reads the stream's snapshot (`crates/pges-postgres/sql/snapshot/read.sql`) and ignores it when its
 `state_version`, `format` or category differ, or its version is outside `[floor_version, streams.version]`.
+A snapshot above `streams.version` from the head read was saved after that read. Its version was committed
+before it, so `load_snapshotted` reads the head again, then the snapshot, up to 8 times; each retry needs
+another save in between. Ignoring it would replay from version 1 or fail with `Truncated`, while retention
+may have dropped the start of the stream because this very snapshot covers it.
 Saving is an upsert: `crates/pges-postgres/sql/snapshot/insert.sql` completed by
 `crates/pges-postgres/sql/snapshot/replace.sql` (`snapshot/upsert`, for `snapshot_after`), with
 `crates/pges-postgres/sql/snapshot/live_stream.sql` between them for `save_snapshot` and the save of

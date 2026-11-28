@@ -1752,7 +1752,9 @@ the halt, 43 recovered, 335 after.
     replaces it at the same version or newer; one of a lower state version never does. Retention's
     `missing_snapshots.sql` accepts a snapshot of any state version at or after the stream's last version in
     the leaf, and a stored version that never falls keeps that check true after it ran, so
-    `load_snapshotted` does not fail with `Truncated` after a truncate. Old code in a rolling deploy cannot
+    `load_snapshotted` does not fail with `Truncated` after a truncate. That also needs the load to use a
+    snapshot saved between its head read and its snapshot read (above the head's version): it reads the head
+    again instead of ignoring it (schema.md, Snapshots). Old code in a rolling deploy cannot
     overwrite new code's snapshot, and the two cannot take turns. Rejected: "the current state version always
     wins, but never below the floor": its floor check races retention's transaction, and old and new code
     still take turns. The cost: after rolling back to a lower `SNAPSHOT_VERSION`, that code's saves are
