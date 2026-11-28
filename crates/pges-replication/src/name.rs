@@ -1,7 +1,9 @@
 //! Names interpolated into replication commands.
 //!
 //! The replication protocol takes slot and publication names inside command text, not as bind parameters, so
-//! both are validated on construction and never quoted.
+//! both are validated on construction. Slot names are double-quoted in commands, since PostgreSQL allows
+//! them to start with a digit, which an unquoted identifier cannot; the validation leaves nothing that needs
+//! escaping. Publication names go into a quoted list unchanged.
 
 use std::{borrow::Cow, fmt};
 

@@ -133,7 +133,7 @@ impl ReplicationConnection {
         };
         let rows = self
             .simple_query(&format!(
-                "CREATE_REPLICATION_SLOT {slot} LOGICAL pgoutput (SNAPSHOT '{action}'{failover})"
+                "CREATE_REPLICATION_SLOT \"{slot}\" LOGICAL pgoutput (SNAPSHOT '{action}'{failover})"
             ))
             .await?;
         let [row] = rows.as_slice() else {
@@ -167,7 +167,7 @@ impl ReplicationConnection {
             Failover::Disabled => "false",
         };
         self.simple_query(&format!(
-            "ALTER_REPLICATION_SLOT {slot} (FAILOVER {failover})"
+            "ALTER_REPLICATION_SLOT \"{slot}\" (FAILOVER {failover})"
         ))
         .await?;
         Ok(())
@@ -187,7 +187,7 @@ impl ReplicationConnection {
             DropWait::Wait => " WAIT",
             DropWait::NoWait => "",
         };
-        self.simple_query(&format!("DROP_REPLICATION_SLOT {slot}{wait}"))
+        self.simple_query(&format!("DROP_REPLICATION_SLOT \"{slot}\"{wait}"))
             .await?;
         Ok(())
     }
@@ -217,7 +217,7 @@ impl ReplicationConnection {
             Messages::Exclude => "false",
         };
         let command = format!(
-            "START_REPLICATION SLOT {} LOGICAL {} (proto_version '4', publication_names '{publications}', \
+            "START_REPLICATION SLOT \"{}\" LOGICAL {} (proto_version '4', publication_names '{publications}', \
              streaming 'off', messages '{messages}')",
             options.slot, options.start,
         );
