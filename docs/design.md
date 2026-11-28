@@ -1111,8 +1111,9 @@ the halt, 43 recovered, 335 after.
   Now the batch's transaction locks the row first (`SELECT … FOR NO KEY UPDATE`, fenced, with the renewal's
   crate-version check), the lock is the lease until the transaction ends, nothing renews beside the handler,
   and the checkpoint renews the lease from `clock_timestamp()`. The handler picks its level with
-  `PgHandler::isolation()` (`Isolation::{Default, RepeatableRead, Serializable}`), applied in the `BEGIN`;
-  it cannot `SET TRANSACTION` itself any more. Backfills begin at the same level.
+  `PgHandler::isolation()` (`Isolation::{Default, ReadCommitted, RepeatableRead, Serializable}`; `Default`
+  follows `default_transaction_isolation`, which may be SERIALIZABLE), applied in the `BEGIN`; it cannot
+  change the level with `SET TRANSACTION` any more. Backfills begin at the same level.
   - Fencing: unchanged, and stronger during a batch. Acquire's `FOR UPDATE SKIP LOCKED` skips the locked row
     (no wait, it takes another shard or none), and anything else that writes the row (redefine, an
     operator's `UPDATE`) waits for the batch. So no takeover lands between the lock and the COMMIT, and the
@@ -1122,10 +1123,23 @@ the halt, 43 recovered, 335 after.
   - Expiry: the stored `lease_until` may lapse while a batch runs; it does not matter while the lock is
     held. A crashed holder's lock goes with its connection: at once when the process exits, which is often
     faster than before (the lease has usually lapsed already). A vanished host (no FIN) keeps the lock until
-    the server's TCP keepalives drop the backend. That case was not much better before: the new holder then
-    replays the same batch and blocks on the read-model rows the zombie transaction locked. Operators bound
-    both with `tcp_keepalives_*` on the server. A holder that hangs inside its handler keeps the shard, as
-    its side renewal kept it before.
+    the server finds the connection dead, with the server's default keepalives about 2 h 11 min. That is
+    worse than before: a new holder took over after one lease, and only a handler whose rows the zombie
+    transaction had locked then blocked (an insert-only projection failed over in 15 s). So the batch's
+    transaction sets the session's `tcp_keepalives_idle` (a third of the lease), `tcp_keepalives_interval`
+    (a sixth), `tcp_keepalives_count` (3) and `tcp_user_timeout` (the lease), user-settable and local to the
+    transaction (`set_config(…, true)` in the lock statement, no extra round trip): a vanished client's
+    backend ends within about one lease (5/6 of it, at least 4 s, since keepalives count whole seconds;
+    `tcp_user_timeout` covers data sent and not acknowledged, where keepalives do not probe). Not covered:
+    Unix sockets (ignored, though a local client rarely vanishes without its kernel closing the socket);
+    `tcp_user_timeout` on platforms without `TCP_USER_TIMEOUT` (the server logs and ignores it); a TCP
+    proxy or pooler between client and server, which keeps answering the server's probes (the proxy needs
+    its own timeouts). Not tested end to end: a userspace proxy such as `pges_testing::Proxy` answers the
+    probes too, so the test only checks the settings on the holding session. A holder that hangs inside its
+    handler, connected, keeps the shard, as its side renewal kept it before. `idle_in_transaction_session_timeout`
+    bounds a holder stuck between statements (and a vanished one, over any transport), but the server then
+    ends the session of any handler that pauses longer between statements, such as during an external call,
+    so the crate does not set it; operators may, on the role, above their handlers' longest pause.
   - Lock waits: acquire never waits (SKIP LOCKED). Redefine waits for the running batch, then bumps the fence.
     A dropped renewal from before the batch can still be on the server when the lock runs; READ COMMITTED
     waits for it, the higher levels fail once with 40001 and retry. A lost COMMIT of an earlier batch still
@@ -1153,6 +1167,18 @@ the halt, 43 recovered, 335 after.
   rides on the lock and the check on the checkpoint. Alternatives: `SET LOCAL pges.batch` (a separate
   statement, and session state to reason about), or comparing `now()` with `statement_timestamp()`, which
   misses `ROLLBACK; BEGIN` in the handler.
+  - The failure paths (2026-11-28, review): the id is checked only by a checkpoint, which runs when the
+    handler returns `Ok`. A handler that committed raw, then returned an error, or began another
+    transaction and left it aborted (25P02 at the checkpoint, otherwise transient), was retried and its
+    batch applied twice. A query cannot tell, since it fails in an aborted transaction. So the batch's
+    `BEGIN` also takes a savepoint (`BEGIN; SAVEPOINT pges_batch` in one simple-protocol round trip), and
+    on a failure path the subscriber or backfill runs `ROLLBACK TO SAVEPOINT pges_batch` before rolling
+    back: it works in an aborted transaction and fails (25P01 or 3B001) once the batch's transaction is
+    gone, and then the failure is fatal, keeping the handler's error as its source. The cost: one statement
+    on a failure path only, and the handler's statements (and the row lock) run in a subtransaction, which
+    gets its own xid when it writes. That is one subtransaction per batch, far from the 64 that overflow a
+    snapshot's cache. A transaction sqlx ended itself (a failed or dropped savepoint begin of the
+    handler's) is fatal too now, for the same reason: the handler's statements after it ran in autocommit.
 - Sequencer polish (2026-11-25):
   - `Status::Halted(Arc<str>)` is set for every error `run()` returns: persisted halts, `RunError::Halted`
     at acquire, `SourceMismatch`, fatal and invalid source errors, unknown or invalid stores, position
@@ -1901,8 +1927,8 @@ the halt, 43 recovered, 335 after.
   - Savepoint guard: users may begin savepoints on the connections we hand out (`PgHandler::handle`'s `tx`,
     `UnitOfWork::conn`, a wrapped connection). Before checkpointing, `run_pg` and the backfill check
     `Connection::is_in_transaction` (sqlx's client-side depth, no round trip); if the transaction ended, the
-    batch fails with a transient error and is retried like an aborted one, so no checkpoint moves in
-    autocommit. A unit of work records whether its connection was in a transaction at `begin` / `wrap`; once
+    batch fails with a fatal error (transient until 2026-11-28, but the handler's statements after it ran
+    in autocommit and a retry could apply them twice), so no checkpoint moves in autocommit. A unit of work records whether its connection was in a transaction at `begin` / `wrap`; once
     it no longer is, appends fail with `AppendError::TransactionEnded` (rather than autocommit) and
     `commit` / `finish` with `Aborted`. The depth itself is behind sqlx's unexported `TransactionManager`,
     so a wrapped connection already inside a savepoint that drops one level is not detected.

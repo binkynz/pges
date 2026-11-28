@@ -4,7 +4,11 @@
 use std::{error, future::Future};
 
 use futures_util::future::BoxFuture;
-use sqlx::{Connection, PgConnection, Postgres, Transaction};
+use pges_postgres::sql::template;
+use sqlx::{
+    Connection, Executor as _, PgConnection, Postgres, Transaction,
+    postgres::{PgDatabaseError, PgSeverity},
+};
 
 use crate::{batch, sql::statement};
 
@@ -18,10 +22,12 @@ pub type BoxError = Box<dyn error::Error + Send + Sync + 'static>;
 /// cursor therefore commit together or not at all: a batch's effect is applied exactly once, also across
 /// crashes and lease takeovers. Write only through `tx`, and do not commit or roll it back.
 ///
-/// A raw `COMMIT` or `ROLLBACK` sent through `tx` ends the transaction behind sqlx's back. The checkpoint
-/// then finds itself outside the batch's transaction and moves nothing, and the batch fails with a fatal
-/// [`HandlerError`]: the subscription or backfill stops. The handler's writes before a `COMMIT` stay
-/// committed, so the batch's effect may then be applied twice when it runs again.
+/// A raw `COMMIT` or `ROLLBACK` sent through `tx` ends the transaction behind sqlx's back. The subscription
+/// finds out whatever the handler returns: the checkpoint then runs outside the batch's transaction and moves
+/// nothing, and on an error or an aborted transaction a probe finds the batch's savepoint gone. The batch
+/// fails with a fatal [`HandlerError`], also when the handler returned a transient one: the subscription or
+/// backfill stops. The handler's writes before a `COMMIT` stay committed, so retrying would apply them
+/// twice, and the batch's effect may be applied twice when it runs again after a fix.
 ///
 /// If the handler returns an error, or leaves the transaction aborted (a failed statement whose error it
 /// ignored), the transaction is rolled back and the batch is retried according to the subscription's
@@ -29,15 +35,20 @@ pub type BoxError = Box<dyn error::Error + Send + Sync + 'static>;
 /// or the COMMIT, which rolled the batch back: it is transient (a lock or statement timeout, a serialization
 /// failure, a read-only transaction during a failover), so a batch that can never commit still stops once
 /// its attempts run out, except an integrity constraint violation or a data exception (SQLSTATE class 23 or
-/// 22, such as a deferred unique constraint), which is fatal.
+/// 22, such as a deferred unique constraint), which is fatal. An error locking the subscription's row before
+/// the handler runs (such as a serialization failure under REPEATABLE READ) is classified the same way and
+/// counts as one of the batch's attempts, although the handler was not called.
 ///
 /// The transaction runs at the level [`PgHandler::isolation`] asks for. It is already under way when
-/// `handle` is called, so `SET TRANSACTION ISOLATION LEVEL` fails there.
+/// `handle` is called, so `SET TRANSACTION ISOLATION LEVEL` to another level fails there (the same level
+/// passes), and `SET TRANSACTION READ ONLY` passes but makes the checkpoint fail (SQLSTATE 25006), retried
+/// as transient until the attempts run out.
 ///
-/// Savepoints (`tx.begin()`) are allowed, but a savepoint begin that fails (on an aborted transaction) or is
-/// dropped before it completes makes sqlx roll back the whole transaction; the handler's statements after it
-/// run in autocommit. The subscription sees the transaction gone, moves no checkpoint, and retries the batch
-/// like an aborted one.
+/// The transaction holds a savepoint taken by its `BEGIN`, so the handler's statements run in a
+/// subtransaction. Savepoints of its own (`tx.begin()`) are allowed, but a savepoint begin that fails (on an
+/// aborted transaction) or is dropped before it completes makes sqlx roll back the whole transaction; the
+/// handler's statements after it run in autocommit, and may have committed. The subscription sees the
+/// transaction gone, moves no checkpoint, and fails the batch with a fatal error, as after a raw `COMMIT`.
 pub trait PgHandler: Send {
     /// Applies one batch.
     fn handle(
@@ -65,6 +76,9 @@ pub enum Isolation {
     /// otherwise.
     #[default]
     Default,
+    /// READ COMMITTED, whatever `default_transaction_isolation` says: each statement sees what committed
+    /// before it began.
+    ReadCommitted,
     /// REPEATABLE READ: one snapshot for the whole batch.
     RepeatableRead,
     /// SERIALIZABLE.
@@ -140,18 +154,42 @@ impl<T: PgHandler> DynPgHandler for T {
     }
 }
 
-/// Begins a batch's transaction at `isolation`.
+/// Begins a batch's transaction at `isolation`, with the savepoint [`ended_by_handler`] looks for.
 pub(crate) async fn begin(
     conn: &mut PgConnection,
     isolation: Isolation,
 ) -> Result<Transaction<'_, Postgres>, sqlx::Error> {
     match isolation {
-        Isolation::Default => conn.begin().await,
+        Isolation::Default => conn.begin_with(statement::BEGIN.sql()).await,
+        Isolation::ReadCommitted => conn.begin_with(statement::BEGIN_READ_COMMITTED.sql()).await,
         Isolation::RepeatableRead => {
             conn.begin_with(statement::BEGIN_REPEATABLE_READ.sql())
                 .await
         }
         Isolation::Serializable => conn.begin_with(statement::BEGIN_SERIALIZABLE.sql()).await,
+    }
+}
+
+/// Whether the handler ended the batch's transaction itself (a raw `COMMIT` or `ROLLBACK`): the savepoint
+/// [`begin`] took is gone. Works in an aborted transaction too. Only for a failure path: it undoes the batch's
+/// work back to the savepoint, and the caller rolls the batch back next.
+pub(crate) async fn ended_by_handler(tx: &mut PgConnection) -> Result<bool, sqlx::Error> {
+    match tx
+        .execute(template::text(statement::ROLLBACK_TO_BATCH.sql()))
+        .await
+    {
+        Ok(_) => Ok(false),
+        // No transaction block (25P01), or one without the savepoint (3B001). A FATAL error or a lost
+        // connection tells nothing.
+        Err(error)
+            if error
+                .as_database_error()
+                .and_then(|error| error.try_downcast_ref::<PgDatabaseError>())
+                .is_some_and(|error| matches!(error.severity(), PgSeverity::Error)) =>
+        {
+            Ok(true)
+        }
+        Err(error) => Err(error),
     }
 }
 

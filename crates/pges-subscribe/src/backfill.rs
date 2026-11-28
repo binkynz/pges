@@ -763,7 +763,14 @@ impl LaneCtx<'_> {
                     from: read::to_i64(from),
                 })
                 .fetch_optional(&mut *tx)
-                .await?;
+                .await;
+            let held = match held {
+                Ok(held) => held,
+                // Under REPEATABLE READ or SERIALIZABLE, a lane lock that waited for another run's batch
+                // which then moved the lane fails with 40001, where READ COMMITTED finds no row.
+                Err(error) if is_serialization_failure(&error) => None,
+                Err(error) => return Err(error.into()),
+            };
             let Some(held) = held else {
                 let _ = tx.rollback().await;
                 return Err(BackfillError::Overtaken);
@@ -773,9 +780,11 @@ impl LaneCtx<'_> {
             })?;
 
             let error = match handler.handle(&mut tx, &batch).await {
-                // Without this, the checkpoint would move in autocommit and the commit do nothing.
+                // Without this, the checkpoint would move in autocommit and the commit do nothing. The
+                // handler's statements after the rollback committed on their own: a retry could apply them
+                // twice.
                 Ok(()) if !tx.is_in_transaction() => {
-                    handler::HandlerError::Transient(Box::new(subscription::EndedTransaction))
+                    handler::HandlerError::Fatal(Box::new(subscription::EndedTransaction))
                 }
                 Ok(()) => {
                     // sqlx does not see a raw COMMIT or ROLLBACK the handler sent: the checkpoint checks it
@@ -797,7 +806,7 @@ impl LaneCtx<'_> {
                         Ok((Some(false), _)) => {
                             let _ = tx.rollback().await;
                             handler::HandlerError::Fatal(Box::new(
-                                subscription::HandlerEndedTransaction,
+                                subscription::HandlerEndedTransaction { after: None },
                             ))
                         }
                         Ok((Some(true), Some(false))) => {
@@ -815,16 +824,21 @@ impl LaneCtx<'_> {
                             )
                             .into());
                         }
+                        // Also when the handler began another transaction after a raw COMMIT and left
+                        // that one aborted.
                         Err(error) if subscription::is_aborted_transaction(&error) => {
-                            let _ = tx.rollback().await;
-                            handler::HandlerError::Transient(Box::new(
+                            let error = handler::HandlerError::Transient(Box::new(
                                 subscription::AbortedTransaction,
-                            ))
+                            ));
+                            let error = subscription::unless_ended(&mut tx, error).await?;
+                            let _ = tx.rollback().await;
+                            error
                         }
                         Err(error) => return Err(error.into()),
                     }
                 }
                 Err(error) => {
+                    let error = subscription::unless_ended(&mut tx, error).await?;
                     let _ = tx.rollback().await;
                     error
                 }
@@ -845,6 +859,13 @@ impl LaneCtx<'_> {
             }
         }
     }
+}
+
+fn is_serialization_failure(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|error| error.code())
+        .is_some_and(|code| code == "40001")
 }
 
 /// The lane of a stream: its id modulo the lane count. Stored cursors depend on it, so it never changes.

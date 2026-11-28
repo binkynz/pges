@@ -216,6 +216,14 @@ own statements in `crates/pges-postgres/sql/migrate/`.
   Before 0.1.0, migrations were edited in place, so a database created by an unreleased
   build fails with `ChecksumMismatch` and must be recreated. Test templates are keyed by the checksums, so
   they rebuild on their own.
+- **A migration that alters `subscriptions` waits for every `run_pg` batch.** Each batch's transaction locks
+  its subscription's row (Checkpoint (Postgres projections)), which holds a `RowShareLock` on the table for
+  the whole batch, however long the handler takes. A later `ALTER TABLE <store>.subscriptions` (most forms
+  take `AccessExclusiveLock`) waits behind the longest batch running, and every new batch's lock, and every
+  acquire, renewal and status read of the table, queues behind the waiting `ALTER`. Such a migration should
+  set a short `lock_timeout` and retry, or run while subscriptions are stopped; prefer forms that take a
+  weaker lock (`ADD COLUMN` without a volatile default is quick once it has the lock, but still needs it).
+  Backfills lock their lane's `backfills` row the same way.
 
 **One source kind per database.** A database holds stores of one kind: all with the outbox or none. A trigger,
 `pges.check_one_source_kind` in `crates/pges-postgres/migrations/pges/0001_init.sql`, right after `CREATE
@@ -1222,6 +1230,13 @@ handler: harmless under READ COMMITTED, but under REPEATABLE READ or SERIALIZABL
 the handler's snapshot fails the checkpoint's UPDATE with 40001, on every attempt of a batch slower than half
 the lease.
 
+The lock goes when the holder's backend ends. For a client host that vanished, that is when the server finds
+the connection dead, so the lock statement also sets the session's `tcp_keepalives_idle`,
+`tcp_keepalives_interval`, `tcp_keepalives_count` and `tcp_user_timeout` from the lease, local to the
+transaction (`set_config(…, true)` in a CTE of `hold.sql`): about one lease over TCP instead of the
+server's default of about 2 h 11 min. They do nothing over a Unix socket, and `tcp_user_timeout` only
+where the platform has `TCP_USER_TIMEOUT`.
+
 While caught up and idle, while a `run` handler runs and while a failed batch waits for its retry (in
 autocommit, on another pool connection), the instance renews its lease
 (`crates/pges-subscribe/sql/subscription/renew.sql`), and on shutdown or a fatal error it releases it
@@ -1264,6 +1279,12 @@ A dead instance's member row and leases lapse after the lease, and the others ta
   began) and move the cursor past writes that rolled back or committed alone. It returns `in_batch` false
   instead, and the batch fails as a fatal handler error. A savepoint's subtransaction keeps the top-level
   id, so savepoints pass.
+- The batch's `BEGIN` also takes the savepoint `pges_batch`
+  (`crates/pges-subscribe/sql/transaction/begin*.sql`). On a failure path (the handler returned an error, or
+  the checkpoint failed or found the transaction aborted) the instance first runs `ROLLBACK TO SAVEPOINT
+  pges_batch` (`crates/pges-subscribe/sql/transaction/rollback_to_batch.sql`), which also works in an
+  aborted transaction and fails once the handler ended the batch's transaction, also after `COMMIT; BEGIN`.
+  Then the batch fails as a fatal handler error, as above.
 - A 25P02 from the checkpoint means the handler left the transaction aborted (a statement failed and the
   handler ignored the error). PostgreSQL would turn the COMMIT into a ROLLBACK, so the batch is rolled back
   and counted as a transient handler failure, never as handled. No extra `SELECT 1` is needed, unlike
