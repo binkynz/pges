@@ -11,7 +11,7 @@ use std::time::Duration;
 use sqlx::{Executor, PgConnection, SqlStr};
 
 use crate::{
-    admin, error, retention,
+    admin, error, lock, retention,
     sql::{statement, template, typed::Query as _},
 };
 
@@ -129,6 +129,10 @@ pub enum FreezeError {
     /// A database error.
     #[error(transparent)]
     Database(#[from] error::DbError),
+    /// The store's maintenance lock stayed taken by another session for longer than the lock wait
+    /// ([`admin::Admin::with_lock_wait`]). Partitions frozen before stay frozen; the next run continues.
+    #[error(transparent)]
+    LockTimeout(lock::LockTimeout),
 }
 
 /// The partitions' ages could not be read.

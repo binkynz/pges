@@ -17,7 +17,7 @@ use uuid::Uuid;
 use pges_core::{category, position, stream};
 
 use crate::{
-    admin, catalog, error, ident, limit,
+    admin, catalog, error, ident, limit, lock,
     sql::{statement, template, typed::Query as _},
     store,
 };
@@ -337,6 +337,10 @@ pub enum SetRetentionError {
     /// A database error.
     #[error(transparent)]
     Database(#[from] error::DbError),
+    /// The store's maintenance lock stayed taken by another session for longer than the lock wait
+    /// ([`admin::Admin::with_lock_wait`]). Nothing was changed.
+    #[error(transparent)]
+    LockTimeout(lock::LockTimeout),
 }
 
 /// The store's default retention could not be set.
@@ -355,6 +359,10 @@ pub enum SetDefaultRetentionError {
     /// A database error.
     #[error(transparent)]
     Database(#[from] error::DbError),
+    /// The store's maintenance lock stayed taken by another session for longer than the lock wait
+    /// ([`admin::Admin::with_lock_wait`]). Nothing was changed.
+    #[error(transparent)]
+    LockTimeout(lock::LockTimeout),
 }
 
 /// Retention did not run, or stopped. What was dropped before the error stays dropped; running it again
@@ -376,6 +384,10 @@ pub enum RetentionError {
     /// A database error, including DDL that kept timing out waiting for a lock.
     #[error(transparent)]
     Database(#[from] error::DbError),
+    /// The store's maintenance lock stayed taken by another session for longer than the lock wait
+    /// ([`admin::Admin::with_lock_wait`]). Nothing was changed.
+    #[error(transparent)]
+    LockTimeout(lock::LockTimeout),
 }
 
 /// A category's log could not be pruned.
@@ -388,6 +400,10 @@ pub enum PruneLogError {
     /// A database error, including DDL that kept timing out waiting for a lock.
     #[error(transparent)]
     Database(#[from] error::DbError),
+    /// The store's maintenance lock stayed taken by another session for longer than the lock wait
+    /// ([`admin::Admin::with_lock_wait`]). Nothing was changed.
+    #[error(transparent)]
+    LockTimeout(lock::LockTimeout),
 }
 
 impl From<sqlx::Error> for SetRetentionError {

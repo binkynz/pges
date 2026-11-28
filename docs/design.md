@@ -97,6 +97,13 @@ Guardrails:
   holds back HOT pruning on the primary.
 - High-volume stores: keep projection read models in a separate database, so their WAL does not compete
   with the sequencer's decoding.
+- Trust boundary: every role that can connect to the database is trusted for availability, not for data.
+  Such a role can take pges's reserved advisory keys (`hashtext('pges.migrate')` before the shared schema
+  exists, `hashtext('pges.maintain.' || <store>)` per store; schema.md, Roles) and hold them, which makes the
+  first shared migration or every `Admin` operation fail with `LockTimeout` after its lock wait, naming the
+  holder's pid and role. The migration lock proper is a row of `pges.scopes` that needs `UPDATE` to lock.
+  Run `REVOKE CONNECT ON DATABASE <db> FROM PUBLIC`, grant `CONNECT` only to pges's roles, and give pges a
+  database of its own.
 
 ## Data flow
 
@@ -2053,6 +2060,25 @@ the halt, 43 recovered, 335 after.
   after the fetch, a schedule the old code already allowed. In `Fail` mode the page up to the cut is
   delivered before `CursorBeforeHorizon`; in `Skip` mode the surviving commits at or below the cut are
   delivered, where the old code could leave them out.
+
+- Lock waits are bounded and locks are tried, not queued (2026-11-28; schema.md, Migrations, Partition
+  maintenance, Roles). Any role that can connect could hold the advisory keys pges blocked on forever, and
+  administration waited on a pooled connection, so overlapping `Admin` calls could drain the store's pool.
+  - The migration lock is the `pges` row of `pges.scopes` (`FOR UPDATE`, which needs `UPDATE`), for the
+    runner and for the one-source-kind trigger; the advisory key stays only for the first shared migration,
+    before the table exists. Not a `pges.stores` row: the sequencer has `UPDATE` on that table. The runner
+    already holds the row when its store insert fires the trigger, so the trigger's lock is a no-op there.
+  - Migrations and `Admin` operations try their lock (`SKIP LOCKED`, `pg_try_advisory_lock`) with a backoff
+    of 10 ms to 250 ms, up to a total wait (`MigrateConfig::lock_wait`, `Admin::with_lock_wait`; 60 s), then
+    fail with `lock::LockTimeout`, naming the holder from `pg_locks` and `pg_stat_activity`. A legitimate
+    second maintainer is still waited for, up to the wait. A waiting `Admin` operation returns its pooled
+    connection between tries, so it never holds one for longer than a try.
+  - Rejected: `lock_timeout` around a queued wait. It needs the session's `lock_timeout` restored for the
+    migration's own DDL, and a waiter keeps its pooled connection for the whole wait. Also rejected: a
+    dedicated connection for `Admin`, which would skip the pool's `after_connect` (where a deployment may
+    `SET ROLE`). Trade-off: tries are not fair (a waiter may be overtaken), and a freed lock is noticed up to
+    250 ms late; both are irrelevant for migrations and maintenance.
+  - `Store::open` migrates with the default wait; `migrate::run` takes a `MigrateConfig` for another.
 
 ## Open decisions
 

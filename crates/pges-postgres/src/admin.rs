@@ -1,7 +1,10 @@
 //! Administration: categories and partition maintenance.
 //!
 //! Every operation takes `pg_advisory_lock(hashtext('pges.maintain.' || store))` on its own connection, runs
-//! with `TimeZone = 'UTC'` and `lock_timeout = '1s'`, and retries DDL that times out waiting for a lock.
+//! with `TimeZone = 'UTC'` and `lock_timeout = '1s'`, and retries DDL that times out waiting for a lock. It
+//! waits for the maintenance lock for at most its lock wait ([`Admin::with_lock_wait`], 60 s by default),
+//! then fails with a `LockTimeout` error naming the session that holds it. While it waits it holds no pooled
+//! connection, except for a moment on each try.
 //! New partitions are created detached, given a CHECK constraint matching their bounds, and then attached, so
 //! attaching takes only a SHARE UPDATE EXCLUSIVE lock on the parent and skips the validation scan.
 //!
@@ -19,10 +22,10 @@ use sqlx::{
     postgres::types::PgInterval,
 };
 
-use pges_core::{category, position, store};
+use pges_core::{category, interval, position, store};
 
 use crate::{
-    catalog, error, ident, retention,
+    catalog, error, freeze, ident, limit, lock, retention,
     sql::{self, statement, template, typed::Query as _},
 };
 
@@ -32,6 +35,7 @@ pub struct Admin {
     pool: PgPool,
     store: store::StoreName,
     sql: Arc<sql::AdminSql>,
+    lock_wait: interval::Interval,
 }
 
 impl Admin {
@@ -40,6 +44,19 @@ impl Admin {
         let sql = Arc::new(sql::AdminSql::new(&store));
 
         Self::for_store(pool, store, sql)
+    }
+
+    /// The same administration, waiting at most `wait` for the store's maintenance lock while another
+    /// session holds it, instead of [`lock::DEFAULT_WAIT`] (60 s). An operation whose wait runs out fails
+    /// with its error's `LockTimeout` variant, naming the holder, and changes nothing.
+    ///
+    /// Every operation but [`Admin::partition_headroom`] takes the lock, and holds it while it runs, so one
+    /// waits for another for up to `wait`: give a scheduled [`Admin::maintain`] a wait longer than the
+    /// longest operation it may overlap.
+    #[must_use]
+    pub fn with_lock_wait(mut self, wait: interval::Interval) -> Self {
+        self.lock_wait = wait;
+        self
     }
 
     /// Registers a category, creates its partition of `commits` and the time leaves from the current
@@ -124,7 +141,12 @@ impl Admin {
         store: store::StoreName,
         sql: Arc<sql::AdminSql>,
     ) -> Self {
-        Self { pool, store, sql }
+        Self {
+            pool,
+            store,
+            sql,
+            lock_wait: lock::DEFAULT_WAIT,
+        }
     }
 
     pub(crate) fn store(&self) -> &str {
@@ -144,22 +166,40 @@ impl Admin {
     }
 
     /// A connection holding the store's maintenance lock, with the session settings maintenance needs.
-    pub(crate) async fn session(&self) -> Result<PoolConnection<sqlx::Postgres>, error::DbError> {
-        let mut conn = self.pool.acquire().await?;
-        // The session settings must not reach other users of the pool.
-        conn.close_on_drop();
+    ///
+    /// The lock is tried until the lock wait runs out, on a pooled connection that goes back to the pool
+    /// between tries, so operations waiting for another maintainer do not drain the pool.
+    pub(crate) async fn session(&self) -> Result<PoolConnection<sqlx::Postgres>, SessionError> {
+        let deadline = lock::Deadline::after(self.lock_wait);
+        let mut pause = lock::FIRST_PAUSE;
+        loop {
+            let mut trying = LockTry(Some(self.pool.acquire().await?));
+            let locked = match trying.0.as_mut() {
+                Some(conn) => try_maintain_lock(conn, self.store()).await?,
+                None => false,
+            };
+            let Some(mut conn) = trying.finish() else {
+                continue;
+            };
 
-        // Locked before lock_timeout is set: the timeout also applies to advisory locks, and a second
-        // maintainer must wait for the first, not fail after a second.
-        statement::maintain_lock::Query::fixed()
-            .bind(statement::maintain_lock::Params {
-                store: self.store(),
-            })
-            .execute(&mut *conn)
-            .await?;
-        conn.execute(statement::MAINTAIN_SESSION.sql()).await?;
+            if locked {
+                // The session settings must not reach other users of the pool, nor the lock.
+                conn.close_on_drop();
+                conn.execute(statement::MAINTAIN_SESSION.sql()).await?;
+                return Ok(conn);
+            }
+            if deadline.passed() {
+                let holder = maintain_lock_holder(&mut conn, self.store()).await?;
+                return Err(SessionError::LockTimeout(lock::LockTimeout {
+                    lock: lock::Lock::Maintenance(self.store.clone()),
+                    waited: deadline.wait(),
+                    holder,
+                }));
+            }
 
-        Ok(conn)
+            drop(conn);
+            deadline.pause(&mut pause).await;
+        }
     }
 
     pub(crate) async fn end_session(&self, mut conn: PoolConnection<sqlx::Postgres>) {
@@ -172,6 +212,46 @@ impl Admin {
             .await;
     }
 }
+
+/// Why a maintenance session could not start: every administration operation's error has both variants.
+#[derive(Debug)]
+pub(crate) enum SessionError {
+    LockTimeout(lock::LockTimeout),
+    Database(error::DbError),
+}
+
+impl From<sqlx::Error> for SessionError {
+    fn from(source: sqlx::Error) -> Self {
+        Self::Database(source.into())
+    }
+}
+
+macro_rules! from_session_error {
+    ($($error:ty),* $(,)?) => {
+        $(
+            impl From<SessionError> for $error {
+                fn from(error: SessionError) -> Self {
+                    match error {
+                        SessionError::LockTimeout(timeout) => Self::LockTimeout(timeout),
+                        SessionError::Database(source) => Self::Database(source),
+                    }
+                }
+            }
+        )*
+    };
+}
+
+from_session_error!(
+    RegisterCategoryError,
+    ChangeBucketError,
+    MaintainError,
+    freeze::FreezeError,
+    limit::SetWriterLimitsError,
+    retention::SetRetentionError,
+    retention::SetDefaultRetentionError,
+    retention::RetentionError,
+    retention::PruneLogError,
+);
 
 /// How many buckets ahead of the current one time leaves are kept, so maintenance has slack to retry.
 pub const LEAVES_AHEAD: u16 = 3;
@@ -277,6 +357,10 @@ pub enum RegisterCategoryError {
     /// A database error, including DDL that kept timing out waiting for a lock.
     #[error(transparent)]
     Database(#[from] error::DbError),
+    /// The store's maintenance lock stayed taken by another session for longer than the lock wait
+    /// ([`Admin::with_lock_wait`]). Nothing was changed.
+    #[error(transparent)]
+    LockTimeout(lock::LockTimeout),
 }
 
 /// A category's bucket could not be changed.
@@ -298,6 +382,10 @@ pub enum ChangeBucketError {
     /// be recorded; [`Admin::maintain`] creates the leaves it needs.
     #[error(transparent)]
     Database(#[from] error::DbError),
+    /// The store's maintenance lock stayed taken by another session for longer than the lock wait
+    /// ([`Admin::with_lock_wait`]). Nothing was changed.
+    #[error(transparent)]
+    LockTimeout(lock::LockTimeout),
 }
 
 /// Partition maintenance failed. What was created before the failure stays; running it again continues.
@@ -321,6 +409,10 @@ pub enum MaintainError {
     /// A database error, including DDL that kept timing out waiting for a lock.
     #[error(transparent)]
     Database(#[from] error::DbError),
+    /// The store's maintenance lock stayed taken by another session for longer than the lock wait
+    /// ([`Admin::with_lock_wait`]). Nothing was changed.
+    #[error(transparent)]
+    LockTimeout(lock::LockTimeout),
 }
 
 /// The partitions' headroom could not be read.
@@ -582,6 +674,46 @@ async fn change_bucket(
     .await?;
 
     Ok(())
+}
+
+/// A pooled connection on which the maintenance lock is being tried. Dropped before [`LockTry::finish`], as
+/// when the try's future is dropped in flight, it is closed instead of going back to the pool, where it could
+/// hold the lock.
+struct LockTry(Option<PoolConnection<sqlx::Postgres>>);
+
+impl LockTry {
+    /// The connection, which from now on goes back to the pool when dropped.
+    fn finish(mut self) -> Option<PoolConnection<sqlx::Postgres>> {
+        self.0.take()
+    }
+}
+
+impl Drop for LockTry {
+    fn drop(&mut self) {
+        if let Some(conn) = self.0.as_mut() {
+            conn.close_on_drop();
+        }
+    }
+}
+
+async fn try_maintain_lock(conn: &mut PgConnection, store: &str) -> Result<bool, sqlx::Error> {
+    Ok(statement::maintain_lock::Query::fixed()
+        .bind(statement::maintain_lock::Params { store })
+        .fetch_one(conn)
+        .await?
+        .pg_try_advisory_lock)
+}
+
+async fn maintain_lock_holder(
+    conn: &mut PgConnection,
+    store: &str,
+) -> Result<Option<lock::LockHolder>, sqlx::Error> {
+    let row = statement::maintain_holder::Query::fixed()
+        .bind(statement::maintain_holder::Params { store })
+        .fetch_optional(conn)
+        .await?;
+
+    Ok(row.and_then(|row| lock::LockHolder::from_row(row.pid, row.role)))
 }
 
 async fn maintain(conn: &mut PgConnection, admin: &Admin) -> Result<(), MaintainError> {

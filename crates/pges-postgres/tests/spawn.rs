@@ -25,6 +25,7 @@ async fn operations_run_on_spawned_tasks() -> Result<()> {
             &mut conn,
             &common::STORE_NAME,
             &store::StoreDefinition::default(),
+            &migrate::MigrateConfig::default(),
         )
         .await
         .unwrap();

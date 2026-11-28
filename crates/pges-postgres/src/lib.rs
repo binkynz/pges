@@ -39,6 +39,7 @@ pub mod error;
 pub mod freeze;
 pub mod limit;
 pub mod load;
+pub mod lock;
 pub mod migrate;
 pub mod read;
 pub mod retention;

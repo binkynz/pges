@@ -25,11 +25,14 @@ impl Store {
     /// Opens the store named in `config`.
     ///
     /// With [`AutoMigrate::CreateOrMigrate`] it first applies the migrations, creating the store from the
-    /// [`StoreDefinition`] if it does not exist. Then it checks that the shared `pges` schema and the store
-    /// schema (and, for a store with the outbox, its outbox scope `<store>.outbox`) are at the version this
-    /// crate needs and that their applied migrations match the embedded ones, reads the store's `outbox` and
-    /// `dcb` flags, lists the partitions of `streams` so each append can name its stream's partition (with
-    /// [`AppendRouting::Auto`], the default), and loads the ids of its categories and event types.
+    /// [`StoreDefinition`] if it does not exist, with the default [`migrate::MigrateConfig`]: it fails with
+    /// [`migrate::MigrateError::LockTimeout`] when another session holds the migration lock for longer than
+    /// [`lock::DEFAULT_WAIT`](crate::lock::DEFAULT_WAIT); run [`migrate::run`] first to wait longer. Then it
+    /// checks that the shared `pges` schema and the store schema (and, for a store with the outbox, its
+    /// outbox scope `<store>.outbox`) are at the version this crate needs and that their applied migrations
+    /// match the embedded ones, reads the store's `outbox` and `dcb` flags, lists the partitions of
+    /// `streams` so each append can name its stream's partition (with [`AppendRouting::Auto`], the
+    /// default), and loads the ids of its categories and event types.
     ///
     /// Fails with [`OpenError::StoreNotFound`] for a store that does not exist (and is not created), with
     /// [`OpenError::StoreRequiresFeature`] for a store that needs a feature this build lacks, and with
@@ -40,7 +43,13 @@ impl Store {
 
         let mut conn = pool.acquire().await.map_err(OpenError::database)?;
         if let Some(definition) = config.definition() {
-            migrate::run(&mut conn, &store_name, definition).await?;
+            migrate::run(
+                &mut conn,
+                &store_name,
+                definition,
+                &migrate::MigrateConfig::default(),
+            )
+            .await?;
         }
 
         let shared_exists = sql::statement::shared_schema_exists::Query::fixed()

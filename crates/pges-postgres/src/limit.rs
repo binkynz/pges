@@ -15,7 +15,7 @@ use sqlx::PgConnection;
 use pges_core::{interval, non_empty, store as core_store};
 
 use crate::{
-    admin, error,
+    admin, error, lock,
     sql::{statement, typed::Query as _},
     store,
 };
@@ -138,6 +138,10 @@ pub enum SetWriterLimitsError {
     /// A database error.
     #[error(transparent)]
     Database(#[from] error::DbError),
+    /// The store's maintenance lock stayed taken by another session for longer than the lock wait
+    /// ([`admin::Admin::with_lock_wait`]). Nothing was changed.
+    #[error(transparent)]
+    LockTimeout(lock::LockTimeout),
 }
 
 impl From<sqlx::Error> for SetWriterLimitsError {

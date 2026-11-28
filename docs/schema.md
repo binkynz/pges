@@ -129,8 +129,20 @@ applied by its runner
 `AutoMigrate::CreateOrMigrate`). The migration texts are in `crates/pges-postgres/migrations/`, the runner's
 own statements in `crates/pges-postgres/sql/migrate/`.
 
-- Each migration runs in its own transaction holding `pg_advisory_xact_lock(hashtext('pges.migrate'))`, so
-  concurrent runners apply it once. Store migrations run with `SET LOCAL search_path` set to the store, so
+- Each migration runs in its own transaction holding the migration lock, so concurrent runners apply it
+  once. The lock is the `pges` row of `pges.scopes`, locked `FOR UPDATE SKIP LOCKED`
+  (`crates/pges-postgres/sql/migrate/lock.sql`), which needs `UPDATE` on `pges.scopes`: the owner and store
+  creators have it, readers, writers and the sequencer do not. Before the first shared migration created the
+  table, the advisory lock `hashtext('pges.migrate')` stands for it
+  (`crates/pges-postgres/sql/migrate/bootstrap_lock.sql`); a runner that takes it and then finds the table
+  locks the row too, so no runner holds only the advisory lock while another holds the row.
+- The runner tries the lock and does not wait in the server: between tries it sleeps 10 ms, doubling up to
+  250 ms. One run waits at most `MigrateConfig::lock_wait` in all (60 s by default), then fails with
+  `MigrateError::LockTimeout`, naming the session holding the lock: for the row, the transaction in its
+  `xmax` looked up in `pg_locks` (`crates/pges-postgres/sql/migrate/lock_holder.sql`); for the advisory lock,
+  its key in `pg_locks` (`crates/pges-postgres/sql/migrate/bootstrap_holder.sql`); the role from
+  `pg_stat_activity`. Both views show these columns to every role. A run that finds every migration applied
+  takes no lock. Store migrations run with `SET LOCAL search_path` set to the store, so
   their SQL uses unqualified names.
 - Every `run_shared` (so every `migrate::run` and auto-migrating `Store::open`) first refuses a schema `pges` that belongs to another role than `current_user`
   (`crates/pges-postgres/sql/migrate/shared_schema_owner.sql`, `MigrateError::SharedSchemaNotOwned`), a
@@ -195,7 +207,9 @@ own statements in `crates/pges-postgres/sql/migrate/`.
 TABLE pges.stores`, enforces it for every writer of `pges.stores`, not only the runner. After each insert, or
 update of `outbox`, it takes the migration lock and raises `PGE02` if another store has a different `outbox`.
 
-- The check takes the migration runner's lock first (the runner already holds it). So of two READ COMMITTED
+- The check locks the `pges` row of `pges.scopes` first, the migration lock (the runner already holds it in
+  the same transaction, so it does not wait for itself). It waits for the lock in the server, under the
+  caller's `lock_timeout`. So of two READ COMMITTED
   transactions adding stores of different kinds, the second waits and then sees the first's row. Under
   REPEATABLE READ the snapshot would not see it; the runner uses the default level.
 - SQLSTATE `PGE02` maps to `MigrateError::OutboxMismatch`, and nothing is created.
@@ -1247,13 +1261,20 @@ integer) modulo the lane count; persisted progress depends on it, so it never ch
 A crate task (`Admin::maintain`) runs on a schedule; it is idempotent. It, `Admin::register_category`,
 `Admin::change_bucket`, `Admin::set_retention`, `Admin::set_default_retention`, `Admin::apply_retention`,
 `Admin::prune_log`, `Admin::set_writer_limits` and `Admin::freeze_closed_partitions` (once per partition)
-take `pg_advisory_lock(hashtext('pges.maintain.' || $1))` (`$1` the store) on their own connection, then run
+take `pg_try_advisory_lock(hashtext('pges.maintain.' || $1))` (`$1` the store) on their own connection, then run
 `SET TimeZone = 'UTC'`, `SET lock_timeout = '1s'` and `SET jit = off` (the planner's cost for retention's
 per-stream loops made it JIT-compile them for 0.6–0.8 s per statement), and retry DDL that times out (55P03)
-with backoff. The lock is taken before `SET lock_timeout`, because
-`lock_timeout` also applies to `pg_advisory_lock`: a second maintainer must wait for the first, not fail after
-a second. The statements: `crates/pges-postgres/sql/maintain/lock.sql`,
+with backoff. The statements: `crates/pges-postgres/sql/maintain/lock.sql`,
 `crates/pges-postgres/sql/maintain/session.sql` and `crates/pges-postgres/sql/maintain/unlock.sql`.
+
+The lock is tried, not waited for in the server, before `SET lock_timeout` (a second maintainer must wait for
+the first, not fail after a second). A busy try returns the connection to the pool and sleeps 10 ms, doubling
+up to 250 ms, so operations waiting for another maintainer hold a pooled connection only for each try and
+cannot drain the store's pool (`Store::admin` uses it). A try's connection is closed instead if its future
+is dropped before the try returns, since it may hold the lock. After the operation's lock wait
+(`Admin::with_lock_wait`, 60 s by default) it fails with its error's `LockTimeout` variant, naming the holder
+from `pg_locks` and `pg_stat_activity` (`crates/pges-postgres/sql/maintain/holder.sql`). A dedicated
+connection outside the pool was rejected: it would skip the pool's `after_connect`, which may `SET ROLE`.
 
 Leaves that already exist get no DDL. The `bound` constraint is dropped only from attached leaves that still
 have it (an interrupted creation), found with one catalog query over the category's leaves
@@ -1523,6 +1544,21 @@ source) and a reader with exactly the grants below; a few other tests run statem
 (a writer denied one `streams` partition, a store creator that does not own the publication). Operations the
 roles test does not run (retention, resequence, snapshots) are not checked statement by statement.
 
+**Every role that can connect is trusted for availability.** Any role that can connect to the database may
+take any advisory lock, and hold it for as long as its session lasts. pges reserves these keys (each an int8
+key from `hashtext`, in this database):
+
+| Key | Held by | Effect of a squatter |
+|---|---|---|
+| `hashtext('pges.migrate')` | the first shared migration, before `pges.scopes` exists | `run_shared` on an empty database fails with `MigrateError::LockTimeout` |
+| `hashtext('pges.maintain.' \|\| <store>)` | every `Admin` operation but `partition_headroom`, per store | the operation fails with its `LockTimeout` variant: `maintain` stops running, and partitions run out |
+
+The migration lock itself is a row of `pges.scopes`, which only roles with `UPDATE` on the table can lock, so
+a role that can only connect cannot block migrations or store creation. No lock wait is unbounded: a squatter
+causes errors that name its pid and login role (`lock::LockTimeout`), never a hang, and never wrong data. (pges-testing also takes key `726637` while it builds a template
+database; tests only.) Still, keep untrusted roles out of the database: `REVOKE CONNECT ON DATABASE <db> FROM PUBLIC`, grant
+`CONNECT` to the pges roles only, and give pges a database of its own.
+
 **Every role needs `USAGE` on the schema `pges` and on the store's schema.** No table grant works without it,
 and the migrations grant nothing:
 
@@ -1561,7 +1597,7 @@ ran `migrate::run_shared`: `run_shared`, and so `migrate::run`, refuses a `pges`
 
 | Role | Needs |
 |---|---|
-| owner | owns `pges` and store schemas (migrations refuse a `pges` schema whose owner is not `current_user`: a login role that inherits from a NOLOGIN owner runs `SET ROLE <owner>` before migrating) and, for the logical source, the publication `pges` (or inherits from its owner); runs migrations, maintenance, `apply_retention`, `prune_log` and `set_writer_limits` (DDL, `VACUUM`, `UPDATE` on `pges.stores`; `pg_db_role_setting` is readable by PUBLIC). The one-source-kind trigger needs nothing more: it runs as the inserting role, and `pg_advisory_xact_lock` is executable by PUBLIC |
+| owner | owns `pges` and store schemas (migrations refuse a `pges` schema whose owner is not `current_user`: a login role that inherits from a NOLOGIN owner runs `SET ROLE <owner>` before migrating) and, for the logical source, the publication `pges` (or inherits from its owner); runs migrations, maintenance, `apply_retention`, `prune_log` and `set_writer_limits` (DDL, `VACUUM`, `UPDATE` on `pges.stores`; `pg_db_role_setting` is readable by PUBLIC). The one-source-kind trigger runs as the inserting role and locks the `pges` row of `pges.scopes`, so a store creator that does not own `pges` needs `UPDATE` on `pges.scopes`, which recording its migrations needs anyway |
 | writer | `INSERT`, `UPDATE` on `streams` (`UPDATE` also covers the `SELECT … FOR UPDATE` taken before a rerun with a new commit id); `INSERT` on `commits`, `pending`, `event_types`, `commit_tags`, `tag_heads`; `UPDATE` on `tag_heads`, `snapshots`; `INSERT` on `snapshots`; `DELETE` on `commits` and `snapshots` and `INSERT` on `deleted_commits` (`delete_stream`); `SELECT` on all, and on `pges.stores`, `pges.scopes` and `pges.migrations` (`Store::open` reads the writer limits and checks the schema versions and migration checksums); `EXECUTE` on `pges.check_commit_id`. The outbox trigger's `pg_notify` needs nothing extra (PUBLIC). Set `transaction_timeout` and `idle_in_transaction_session_timeout` on the role, at most the store's `max_txn_age` |
 | reader | `SELECT` on store tables and on `pges.stores`, `pges.scopes` and `pges.migrations` (`Store::open` checks the schema versions and migration checksums; taking and renewing leases checks `min_compatible`); `SELECT`, `INSERT`, `UPDATE` on `subscriptions` and `backfills`; `SELECT`, `INSERT`, `UPDATE`, `DELETE` on `subscription_members` (the heartbeat deletes lapsed members, and leaving deletes the instance's own row). Replica reads need nothing more: `pg_current_wal_insert_lsn()`, `pg_last_wal_replay_lsn()`, `pg_is_in_recovery()`, `current_setting` and `pg_settings` are available to PUBLIC; the replica pool's role needs `SELECT` on the store tables |
 | sequencer | `REPLICATION` (logical source only); `SELECT` on `pges.sequencer`, `pges.scopes` (taking and renewing the lease checks `min_compatible`), `pges.stores`, `categories`, `pending`, `log`; `INSERT` on `log`; `UPDATE` on `categories`, `pges.stores`, `pges.sequencer`; `DELETE` on `pending`; `EXECUTE` on the `pg_replication_origin_*` functions for token option (a). `pg_current_wal_insert_lsn()` is executable by PUBLIC. Terminating the previous leader's walsender needs no extra grant when every sequencer instance uses the same role; otherwise grant `pg_signal_backend`. With the logical source: `SELECT` on each store's `commits`, which the source reads in a new slot's snapshot every time it creates the slot (`bootstrap`, a first start, `resequence`). With the logical source and a missing publication: `CREATE` on the database (`CREATE PUBLICATION`), and for `ALTER PUBLICATION … ADD TABLE` the privileges of the owner of each store's `commits` (membership in the owner's role), besides owning the publication it created. The publication then belongs to the sequencer's role, and an owner that is not a member of it can no longer create a store for the logical source (42501, above): give the publication back with `ALTER PUBLICATION pges OWNER TO <owner>`. With `watch-notify`: nothing extra (`pg_notify` is PUBLIC). `resequence`: `SELECT` on `pges.stores`, `commits` and `categories` (in the exported snapshot), `INSERT` on `log`, `UPDATE` on `categories` (the resequenced range) and `pges.sequencer`, `REPLICATION`; the writer-role check reads `pg_db_role_setting`, `pg_database` and `pg_roles` (PUBLIC) |

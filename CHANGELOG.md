@@ -76,6 +76,17 @@ The first release: `pges`, `pges-core`, `pges-derive`, `pges-postgres`, `pges-su
   partition's primary key `commits_<cat>__pkey`, a leaf's `<leaf>_s`), is taken by another relation of the
   store's schema, instead of a raw database error (SQLSTATE 42P07). Nothing is dropped or attached under it.
   `name` is an `admin::RelationName`, since it may be an index's.
+- **Bounded lock waits** (`pges-postgres`). Migrations and every `Admin` operation that takes the store's
+  maintenance lock wait for their lock at most 60 s (`MigrateConfig::lock_wait`, passed to `migrate::run`,
+  `run_shared` and `run_store`; `Admin::with_lock_wait`), then fail with a `LockTimeout` variant
+  (`lock::LockTimeout`) naming the pid and login role of the session holding the lock, read from `pg_locks`
+  and `pg_stat_activity`. A second maintainer is still waited for, up to the wait. Locks are tried rather
+  than queued, and an `Admin` operation returns its pooled connection between tries, so operations waiting
+  for the maintenance lock cannot drain the store's pool. The migration lock is the `pges` row of
+  `pges.scopes` (`SELECT … FOR UPDATE`, which needs `UPDATE` on the table), for the runner and the
+  one-source-kind trigger, so a role that can only connect cannot block migrations or store creation; the
+  advisory key `hashtext('pges.migrate')` guards only the first shared migration. Every role that can
+  connect is still trusted for availability (docs/schema.md, Roles): revoke `CONNECT` from `PUBLIC`.
 
 ### Stability
 
