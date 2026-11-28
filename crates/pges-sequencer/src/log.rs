@@ -1,7 +1,7 @@
 //! Each store's log as the leader sees it: the next positions, the coarse high-water marks, and the ids of
 //! recently sequenced commits for deduplication.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use sqlx::PgConnection;
 use uuid::Uuid;
@@ -137,7 +137,7 @@ impl Logs {
     pub(crate) fn is_dirty(&self) -> bool {
         self.stores
             .values()
-            .any(|log| log.position != log.persisted || !log.dirty_categories.is_empty())
+            .any(|log| log.mark() != log.persisted || !log.dirty_categories.is_empty())
     }
 
     /// Writes the coarse high-water marks of the stores that moved, in the caller's fenced transaction.
@@ -165,10 +165,10 @@ impl Logs {
                     .execute(&mut *tx)
                     .await?;
             }
-            if log.position != log.persisted {
+            if log.mark() != log.persisted {
                 statement::log_set_store_position::Query::fixed()
                     .bind(statement::log_set_store_position::Params {
-                        last_position: log.position.to_i64(),
+                        last_position: log.mark().to_i64(),
                         store_id: id.get(),
                     })
                     .execute(&mut *tx)
@@ -180,10 +180,11 @@ impl Logs {
     }
 
     /// Records that the transaction holding [`Logs::persist`] committed. Replays can now only start after
-    /// the persisted token, so the dedupe window shrinks to its tail.
+    /// the persisted token, so the dedupe window shrinks to its tail and the log rows the source may still
+    /// replay.
     pub(crate) fn persisted(&mut self) {
         for log in self.stores.values_mut() {
-            log.persisted = log.position;
+            log.persisted = log.mark();
             log.dirty_categories.clear();
             log.window.trim();
         }
@@ -243,7 +244,8 @@ impl Logs {
         }
 
         // Replays after the durable token can only cover log rows above the coarse store position, plus
-        // whatever a source replays beyond it (the tail).
+        // whatever a source replays beyond it (the tail). The rows above it stay in the window until the
+        // source has replayed them, however many tokens are stored meanwhile.
         let mut window = Window::new(self.dedupe_tail);
         let mut recent: Vec<Uuid> = Vec::new();
         if self.dedupe_tail > 0 {
@@ -266,10 +268,13 @@ impl Logs {
             .await?
         {
             recent.push(row.commit_id);
+            if let Some(commit_id) = commit::CommitId::from_uuid(row.commit_id) {
+                window.expect_replay(to_position(row.last_position), commit_id);
+            }
         }
         for id_in_log in recent {
             if let Some(commit_id) = commit::CommitId::from_uuid(id_in_log) {
-                window.insert(commit_id);
+                window.seed(commit_id);
             }
         }
 
@@ -313,6 +318,17 @@ struct StoreLog {
     window: Window,
 }
 
+impl StoreLog {
+    /// The coarse mark to store with the next token: the newest position, or just below the oldest log row
+    /// the source may still replay. The next term seeds its dedupe window with every row above it.
+    fn mark(&self) -> position::Position {
+        match self.window.replay.first_key_value() {
+            Some((oldest, _)) => to_position(oldest.to_i64() - 1).min(self.position),
+            None => self.position,
+        }
+    }
+}
+
 struct StoreSql {
     insert: typed::Rendered<statement::log_insert::Query>,
     categories: typed::Rendered<statement::log_set_category_positions::Query>,
@@ -351,6 +367,10 @@ struct Window {
     order: VecDeque<commit::CommitId>,
     ids: HashSet<commit::CommitId>,
     tail: usize,
+    /// Log rows above the coarse mark when the term started, by position: an earlier term sequenced them
+    /// after the durable token, so the source replays them first. Kept through trims until replayed.
+    replay: BTreeMap<position::Position, commit::CommitId>,
+    replay_positions: HashMap<commit::CommitId, position::Position>,
 }
 
 impl Window {
@@ -359,15 +379,43 @@ impl Window {
             order: VecDeque::new(),
             ids: HashSet::new(),
             tail,
+            replay: BTreeMap::new(),
+            replay_positions: HashMap::new(),
         }
     }
 
+    fn seed(&mut self, commit_id: commit::CommitId) {
+        if self.ids.insert(commit_id) {
+            self.order.push_back(commit_id);
+        }
+    }
+
+    fn expect_replay(&mut self, position: position::Position, commit_id: commit::CommitId) {
+        self.replay.insert(position, commit_id);
+        self.replay_positions.insert(commit_id, position);
+    }
+
     /// `false` if the commit is already in the window.
+    ///
+    /// The earlier terms sequenced the replayed commits in the order the source delivers them again, so a
+    /// replayed commit means every row before it was replayed too, and a new commit means the replay is
+    /// over.
     fn insert(&mut self, commit_id: commit::CommitId) -> bool {
+        if let Some(position) = self.replay_positions.get(&commit_id).copied() {
+            let rest = self.replay.split_off(&position);
+            for replayed in std::mem::replace(&mut self.replay, rest).into_values() {
+                self.replay_positions.remove(&replayed);
+            }
+            self.replay.remove(&position);
+            self.replay_positions.remove(&commit_id);
+            return false;
+        }
         if !self.ids.insert(commit_id) {
             return false;
         }
 
+        self.replay.clear();
+        self.replay_positions.clear();
         self.order.push_back(commit_id);
         true
     }
@@ -412,5 +460,34 @@ mod tests {
         assert!(window.insert(ids[1]));
         assert!(!window.insert(ids[2]));
         assert!(!window.insert(ids[3]));
+    }
+
+    #[test]
+    fn rows_to_replay_outlive_trims_until_the_source_passes_them() {
+        let mut window = Window::new(0);
+        let ids: Vec<_> = (0..4).map(|_| id()).collect();
+        for (i, commit_id) in ids.iter().enumerate() {
+            window.seed(*commit_id);
+            window.expect_replay(position_at(10 + i as u64), *commit_id);
+        }
+
+        window.trim();
+        assert!(
+            !window.insert(ids[1]),
+            "a replayed row is a repeat after a trim"
+        );
+        assert!(
+            !window.replay_positions.contains_key(&ids[0]),
+            "rows before a replayed one were replayed too"
+        );
+        assert_eq!(window.replay.len(), 2);
+
+        let new = id();
+        assert!(window.insert(new));
+        assert!(window.replay.is_empty(), "a new commit ends the replay");
+    }
+
+    fn position_at(n: u64) -> position::Position {
+        position::Position::new(n).unwrap()
     }
 }

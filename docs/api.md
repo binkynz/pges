@@ -1516,8 +1516,9 @@ Contract for any source, built in or custom:
   `SELECT commit_id FROM <store>.log ORDER BY last_position DESC LIMIT $1` (`$1` = `dedupe_tail`) and
   `SELECT commit_id FROM <store>.log WHERE last_position > $1 ORDER BY last_position`
   (`$1` = `pges.stores.last_position`). After each persisted token it is trimmed back to the newest
-  `dedupe_tail` ids of each store. A source that replays further back than its token needs `dedupe_tail` at
-  least as large as that span.
+  `dedupe_tail` ids of each store, except the log rows above that mark, which stay until the source has
+  replayed them (schema.md, Sequencer batch). A source that replays further back than its token needs
+  `dedupe_tail` at least as large as that span.
 
 | Source | Feature | How | Needs | Trade-offs |
 |---|---|---|---|---|
