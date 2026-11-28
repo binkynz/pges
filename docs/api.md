@@ -1075,7 +1075,8 @@ The first `.categories(..)` takes a `NonEmpty<CategoryName>`, later ones any ite
 `SubscribeError::is_retried()` is true for `Database` and `Wake`: those are retried every `retry_interval`
 and shown as `State::Recovering`, including errors while redefining (the lease is released and taken
 again). Every other error releases the lease and ends the run. `Aborted` means the task panicked or was
-cancelled.
+cancelled. The status becomes `State::Stopped` when the run returns, and also when its future is dropped
+before that (a panicking handler, an aborted task); a dropped run keeps its lease until it lapses.
 
 ### Backfills
 
