@@ -117,8 +117,8 @@ use pges::subscribe::subscription::StoreExt;
   outbox sources. Links to modules behind a feature are written twice, as a link when the feature is on and
   as plain code when it is off, so the docs build with any feature set.
 - The workspace and each crate have a `README.md`, compiled as doctests through a hidden
-  `#[cfg(doctest)]` item in `lib.rs`. `crates/pges` includes the workspace README, which builds only with
-  `derive`. The `pges-sequencer` README builds only with `source-logical`.
+  `#[cfg(doctest)]` item in `lib.rs`. The workspace README is outside every published package, so
+  `pges-examples` (not published) includes it, with `pges`'s `derive`. The `pges-sequencer` README builds only with `source-logical`.
 - Runnable code is in `examples/` (`pges-examples`, not published): `quickstart`, `unit_of_work`,
   `subscription`, `multi_category`, `sharded`, `backfill`, `sequencer_logical`, `outbox`, `grpc_watch` and
   `metadata` (a request scope, a follow-up from a handler, and otel trace context).

@@ -7,6 +7,12 @@
 pub mod database;
 pub mod wait;
 
+// The workspace README is outside every published crate's package, so it is tested here, in a crate that is
+// never published.
+#[cfg(doctest)]
+#[doc = include_str!("../../README.md")]
+struct WorkspaceReadmeDoctests;
+
 /// Sends `tracing` output to stderr, filtered by `RUST_LOG` (default `warn`). Does nothing if a subscriber is
 /// already installed.
 pub fn init_logging() {

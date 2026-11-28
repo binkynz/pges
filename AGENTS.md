@@ -47,8 +47,9 @@ is the user manual. Docs say what the item guarantees and when it fails, not how
 `#![warn(missing_docs)]` in every published crate.
 
 The workspace and each crate have a `README.md`. A hidden `#[cfg(doctest)]` item in the crate's `lib.rs`
-includes it, so its code runs as doctests; `crates/pges` also includes the workspace README. README code
-follows these rules and must compile. Examples that need a database are `no_run`.
+includes it, so its code runs as doctests. The workspace README is outside every published package, so
+`pges-examples` (not published) includes it. README code follows these rules and must compile. Examples that
+need a database are `no_run`.
 
 Everywhere else, the code names things; if a name doesn't carry the meaning, rename it. Comments are only for:
 

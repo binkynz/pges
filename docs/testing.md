@@ -34,8 +34,9 @@ pg-down            # stop; pg-down --clean also deletes ./.pg
 Docker fallback, every process would look up the container on its own.
 
 `cargo test` also runs the README examples as doctests (`cargo test --doc` runs only those and the rustdoc
-examples). `cargo nextest` does not run doctests. The workspace README builds with `pges`'s `derive`
-feature, the `pges-sequencer` README with `source-logical`.
+examples). `cargo nextest` does not run doctests. The workspace README is included by `pges-examples`
+(not published: the README is outside every published package), which builds it with `pges`'s `derive`
+feature; the `pges-sequencer` README builds with `source-logical`.
 
 `cargo test` also runs the ten examples in `examples/` (`pges-examples`): `examples/tests/run.rs` includes
 each example file as a module and calls its `run()`. Each example makes its own database:
@@ -213,7 +214,7 @@ afterwards.
 | Subscription cancellation: a `run_pg` subscription and a backfill dropped at every await point, each run under a new name so every run takes the same path | `crates/pges-subscribe/tests/cancel.rs` | always |
 | `replica::Pair`: the replica follows the primary, and paused replay holds it back | `crates/pges-testing/tests/replica.rs` | always; starts a private pair |
 | Faults: network partitions between the sequencer and the server (killing the sequencer mid-batch is covered by `crash.rs` and `bin.rs`, slot invalidation by `invalidation.rs`, promotion by `promotion.rs`) | containers (toxiproxy); planned | CI only, nightly |
-| README code: the workspace README and each crate's, as doctests | `README.md`, `crates/*/README.md`, included by each `lib.rs` | always; the workspace README with `pges`'s `derive`, the `pges-sequencer` README with `source-logical` |
+| README code: the workspace README and each crate's, as doctests | `README.md`, `crates/*/README.md`, included by each `lib.rs` (the workspace README by `examples/src/lib.rs`) | always; the workspace README with `pges`'s `derive`, the `pges-sequencer` README with `source-logical` |
 | Examples: each of the ten examples runs to the end, including `metadata` (a request scope, a follow-up from a handler, otel trace context through the SDK tracer provider and tracing-opentelemetry) | `examples/tests/run.rs` | always |
 | Benchmark smoke: each `pges-bench` command runs for about a second with small settings (`append_runs`, `sequencer_runs`, `outbox_notify_runs`, `read_runs`, `partitions_runs`, `wake_runs`; `scale_runs` fills 1000 streams and runs every `scale` action once, retention dropping a `jobs` leaf) | `bench/tests/smoke.rs` | always |
 | Benchmarks: append rate (`--statistics autovacuum` skips the `ANALYZE` after the prefill), sequencer lag, outbox NOTIFY lock, catch-up and load, reads as leaves grow (two-step against `LATERAL`, plan-cache memory in auto mode), commit to subscriber woken with the in-process and gRPC wakers for 1 to N subscriptions (`wake`, run at 1 and 200; design.md, Spike results and Durable dev-box run); the scale targets in a database that outlives the command (`scale fill`, then `append`, `load`, `catch-up`, `drain`, `retention`; a 100M-stream fill takes about an hour and 180 GB; design.md, Scale run); `pges-bench server start` gives a durable server | `cargo run -p pges-bench --release -- <command>` | on demand; on a durable server |

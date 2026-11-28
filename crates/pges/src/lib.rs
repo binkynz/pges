@@ -276,7 +276,3 @@ pub use pges_subscribe as subscribe;
 #[cfg(all(doctest, feature = "derive"))]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
-
-#[cfg(all(doctest, feature = "derive"))]
-#[doc = include_str!("../../../README.md")]
-struct WorkspaceReadmeDoctests;
