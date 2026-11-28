@@ -18,6 +18,11 @@ pub type BoxError = Box<dyn error::Error + Send + Sync + 'static>;
 /// cursor therefore commit together or not at all: a batch's effect is applied exactly once, also across
 /// crashes and lease takeovers. Write only through `tx`, and do not commit or roll it back.
 ///
+/// A raw `COMMIT` or `ROLLBACK` sent through `tx` ends the transaction behind sqlx's back. The checkpoint
+/// then finds itself outside the batch's transaction and moves nothing, and the batch fails with a fatal
+/// [`HandlerError`]: the subscription or backfill stops. The handler's writes before a `COMMIT` stay
+/// committed, so the batch's effect may then be applied twice when it runs again.
+///
 /// If the handler returns an error, or leaves the transaction aborted (a failed statement whose error it
 /// ignored), the transaction is rolled back and the batch is retried according to the subscription's
 /// [`RetryPolicy`](crate::subscription::RetryPolicy). So is an error the server reports for the checkpoint

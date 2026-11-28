@@ -163,6 +163,74 @@ async fn a_handler_whose_savepoint_begin_fails_moves_no_lane() -> Result<()> {
     f.finish().await
 }
 
+/// A handler that ends its transaction with a raw `ROLLBACK` or `COMMIT` moves no lane, whose checkpoint would
+/// run in autocommit: the backfill stops at once with `HandlerFailed`.
+#[tokio::test]
+async fn a_handler_that_ends_its_transaction_moves_no_lane() -> Result<()> {
+    let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    write(&f, 4, 2).await?;
+
+    for (name, end) in [("rolled-back", "ROLLBACK"), ("committed", "COMMIT")] {
+        let ending = EndsItsTransaction {
+            recorder: Recorder::new(name),
+            end,
+        };
+        let result = f
+            .store
+            .backfill(
+                subscription::SubscriptionName::new(name).unwrap(),
+                backfill::Until::Head,
+            )
+            .category::<common::JobEvent>()
+            .on_error(subscription::RetryPolicy::new(
+                interval!(1 ms),
+                NonZeroU32::new(3).unwrap(),
+            ))
+            .run_pg(ending.clone())
+            .await;
+        let Err(backfill::BackfillError::HandlerFailed { source, .. }) = result else {
+            panic!("{end}: expected a handler failure, got {result:?}");
+        };
+        assert!(
+            source.to_string().contains("ended the batch's transaction"),
+            "{end}: {source}"
+        );
+        assert_eq!(ending.recorder.calls(), 1, "{end}: misuse is not retried");
+        let moved: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM es.backfills WHERE name = $1 AND position > 0",
+        )
+        .bind(name)
+        .fetch_one(&f.pool)
+        .await?;
+        assert_eq!(moved, 0, "{end}: a lane moved");
+    }
+
+    f.finish().await
+}
+
+/// Records like [`Recorder`], ends its transaction with a raw `ROLLBACK` or `COMMIT`, which sqlx does not
+/// see, and returns `Ok`.
+#[derive(Clone)]
+struct EndsItsTransaction {
+    recorder: Recorder,
+    end: &'static str,
+}
+
+impl handler::PgHandler for EndsItsTransaction {
+    async fn handle(
+        &mut self,
+        tx: &mut PgConnection,
+        batch: &batch::Batch,
+    ) -> Result<(), handler::HandlerError> {
+        *self.recorder.calls.lock().unwrap() += 1;
+        self.recorder.record(tx, batch).await?;
+        sqlx::query(sqlx::AssertSqlSafe(self.end))
+            .execute(&mut *tx)
+            .await?;
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn the_end_comes_from_a_subscription_and_the_definition_is_fixed() -> Result<()> {
     let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
@@ -393,10 +461,13 @@ async fn a_second_run_that_moves_a_lane_overtakes_this_one() -> Result<()> {
         pool: f.pool.clone(),
         calls: Arc::new(AtomicUsize::new(0)),
     };
+    // One commit per page: the move lands after the first batch commits, and the second batch's lane lock
+    // finds it, before its handler runs.
     let result = f
         .store
         .backfill(subscription_name!("overtaken"), backfill::Until::Head)
         .categories(non_empty![category!("jobs")])
+        .batch_size(NonZeroU32::new(1).unwrap())
         .run_pg(overtaking.clone())
         .await;
 
@@ -675,8 +746,8 @@ impl handler::PgHandler for Slow {
     }
 }
 
-/// Plays a second run of the same backfill: moves every lane's cursor on another connection before
-/// returning.
+/// Plays a second run of the same backfill: moves every lane's cursor on another connection. The batch's
+/// transaction holds its lane, so the move waits for it; the handler returns once the move waits.
 #[derive(Clone)]
 struct Overtaking {
     pool: PgPool,
@@ -687,14 +758,30 @@ impl handler::PgHandler for Overtaking {
     async fn handle(
         &mut self,
         _tx: &mut PgConnection,
-        batch: &batch::Batch,
+        _batch: &batch::Batch,
     ) -> Result<(), handler::HandlerError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        sqlx::query("UPDATE es.backfills SET position = $1 WHERE name = 'overtaken'")
-            .bind(batch.last_position().get() as i64)
-            .execute(&self.pool)
+        let pool = self.pool.clone();
+        tokio::spawn(async move {
+            sqlx::query(
+                "UPDATE es.backfills SET position = position + 1000000 WHERE name = 'overtaken'",
+            )
+            .execute(&pool)
+            .await
+        });
+        loop {
+            let waits: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT FROM pg_stat_activity
+                                WHERE datname = current_database() AND wait_event_type = 'Lock'
+                                  AND query LIKE 'UPDATE es.backfills%')",
+            )
+            .fetch_one(&self.pool)
             .await?;
-        Ok(())
+            if waits {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 }
 

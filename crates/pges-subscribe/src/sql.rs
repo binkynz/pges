@@ -97,6 +97,8 @@ pub(crate) struct Backfill {
     pub(crate) create: Rendered<statement::backfill_create::Query>,
     /// The lanes, with their definition and cursors.
     pub(crate) lanes: Rendered<statement::backfill_lanes::Query>,
+    /// Locks one lane's row for a batch, if its cursor is still where the run left it.
+    pub(crate) hold: Rendered<statement::backfill_hold::Query>,
     /// Moves one lane's cursor in the handler's transaction, if it is still where the run left it.
     pub(crate) checkpoint: Rendered<statement::backfill_checkpoint::Query>,
     /// Moves the cursors of lanes that had no events in a page.
@@ -112,6 +114,7 @@ impl Backfill {
         Self {
             create: statement::backfill_create::Query::render(&values),
             lanes: statement::backfill_lanes::Query::render(&values),
+            hold: statement::backfill_hold::Query::render(&values),
             checkpoint: statement::backfill_checkpoint::Query::render(&values),
             advance: statement::backfill_advance::Query::render(&values),
             subscription: statement::backfill_subscription::Query::render(&values),

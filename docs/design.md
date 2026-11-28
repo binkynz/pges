@@ -1135,6 +1135,18 @@ the halt, 43 recovered, 335 after.
     touch two rows; and every lease statement, status query and the schema would change. Rejected: forcing
     READ COMMITTED (refusing other levels). It is the smallest change, but removes a level handlers may need
     for their own reads, and the lock costs little more.
+- A raw `COMMIT` or `ROLLBACK` in a `PgHandler` is caught (2026-11-28). sqlx counts transaction depth
+  itself, so after a handler sent one, `is_in_transaction()` still said yes: the checkpoint ran in
+  autocommit and moved the cursor past writes that had rolled back (nothing delivered) or committed alone
+  (no longer atomic with the cursor). The row lock that begins a `run_pg` batch now returns
+  `pg_current_xact_id()`, and the checkpoint moves the cursor only while `pg_current_xact_id_if_assigned()`
+  is still that id; otherwise it reports `in_batch` false and the batch fails with a fatal handler error.
+  Fatal, not transient: it is a bug in the handler, and after a raw `COMMIT` a retry would apply the writes
+  twice. Backfills do the same with a lane lock at the start of each lane batch (one more statement per
+  batch; it also finds an overtaken lane before the handler runs). `run_pg` pays nothing extra: the id
+  rides on the lock and the check on the checkpoint. Alternatives: `SET LOCAL pges.batch` (a separate
+  statement, and session state to reason about), or comparing `now()` with `statement_timestamp()`, which
+  misses `ROLLBACK; BEGIN` in the handler.
 - Sequencer polish (2026-11-25):
   - `Status::Halted(Arc<str>)` is set for every error `run()` returns: persisted halts, `RunError::Halted`
     at acquire, `SourceMismatch`, fatal and invalid source errors, unknown or invalid stores, position

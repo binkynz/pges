@@ -754,12 +754,32 @@ impl LaneCtx<'_> {
         loop {
             let mut conn = self.pool.acquire().await?;
             let mut tx = handler::begin(&mut conn, handler.isolation()).await?;
+            let held = self
+                .sql
+                .hold
+                .bind(statement::backfill_hold::Params {
+                    name: self.name,
+                    lane: lane_id,
+                    from: read::to_i64(from),
+                })
+                .fetch_optional(&mut *tx)
+                .await?;
+            let Some(held) = held else {
+                let _ = tx.rollback().await;
+                return Err(BackfillError::Overtaken);
+            };
+            let xact = held.xact.ok_or_else(|| {
+                sqlx::Error::Protocol("a held backfill lane had no transaction id".into())
+            })?;
+
             let error = match handler.handle(&mut tx, &batch).await {
                 // Without this, the checkpoint would move in autocommit and the commit do nothing.
                 Ok(()) if !tx.is_in_transaction() => {
                     handler::HandlerError::Transient(Box::new(subscription::EndedTransaction))
                 }
                 Ok(()) => {
+                    // sqlx does not see a raw COMMIT or ROLLBACK the handler sent: the checkpoint checks it
+                    // runs in the transaction the hold began, or it would move the cursor in autocommit.
                     let moved = self
                         .sql
                         .checkpoint
@@ -768,17 +788,32 @@ impl LaneCtx<'_> {
                             lane: lane_id,
                             position: read::to_i64(batch.last_position()),
                             from: read::to_i64(from),
+                            xact,
                         })
-                        .execute(&mut *tx)
-                        .await;
+                        .fetch_one(&mut *tx)
+                        .await
+                        .map(|row| (row.in_batch, row.moved));
                     match moved {
-                        Ok(done) if done.rows_affected() == 0 => {
+                        Ok((Some(false), _)) => {
+                            let _ = tx.rollback().await;
+                            handler::HandlerError::Fatal(Box::new(
+                                subscription::HandlerEndedTransaction,
+                            ))
+                        }
+                        Ok((Some(true), Some(false))) => {
                             let _ = tx.rollback().await;
                             return Err(BackfillError::Overtaken);
                         }
-                        Ok(_) => {
+                        Ok((Some(true), Some(true))) => {
                             tx.commit().await?;
                             return Ok((lane, u64::try_from(batch.len()).unwrap_or(u64::MAX)));
+                        }
+                        Ok(_) => {
+                            let _ = tx.rollback().await;
+                            return Err(sqlx::Error::Protocol(
+                                "the backfill checkpoint came back with a NULL column".into(),
+                            )
+                            .into());
                         }
                         Err(error) if subscription::is_aborted_transaction(&error) => {
                             let _ = tx.rollback().await;

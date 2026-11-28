@@ -223,17 +223,25 @@ pges_postgres::typed_query! {
             store_version: i32,
             outbox_version: i32,
         },
-        row { shard: i16 },
+        row { xact: Option<i64> },
     }
 }
 
 pges_postgres::typed_query! {
-    /// Moves a shard's cursor at the end of a `run_pg` batch and renews its lease, fenced.
+    /// Moves a shard's cursor at the end of a `run_pg` batch and renews its lease, fenced, if it runs in the
+    /// batch's transaction.
     pub CHECKPOINT_HELD, mod checkpoint_held {
         name: "subscription/checkpoint_held",
         files: [sql_file!("subscription/checkpoint_held.sql")],
-        params<'q> { name: &'q str, shard: i16, position: i64, fence: i64, lease: PgInterval },
-        row {},
+        params<'q> {
+            name: &'q str,
+            shard: i16,
+            position: i64,
+            fence: i64,
+            xact: i64,
+            lease: PgInterval,
+        },
+        row { in_batch: Option<bool>, moved: Option<bool> },
     }
 }
 
@@ -338,12 +346,22 @@ pges_postgres::typed_query! {
 }
 
 pges_postgres::typed_query! {
-    /// Moves one lane's cursor, if it is still where the run left it.
+    /// Locks one lane's row for a batch, if its cursor is still where the run left it.
+    pub BACKFILL_HOLD, mod backfill_hold {
+        name: "backfill/hold",
+        files: [sql_file!("backfill/hold.sql")],
+        params<'q> { name: &'q str, lane: i16, from: i64 },
+        row { xact: Option<i64> },
+    }
+}
+
+pges_postgres::typed_query! {
+    /// Moves one lane's cursor, if it is still where the run left it and this is the batch's transaction.
     pub BACKFILL_CHECKPOINT, mod backfill_checkpoint {
         name: "backfill/checkpoint",
         files: [sql_file!("backfill/checkpoint.sql")],
-        params<'q> { name: &'q str, lane: i16, position: i64, from: i64 },
-        row {},
+        params<'q> { name: &'q str, lane: i16, position: i64, from: i64, xact: i64 },
+        row { in_batch: Option<bool>, moved: Option<bool> },
     }
 }
 
@@ -443,6 +461,7 @@ pub const ALL: &[&template::Statement] = &[
     &LEAVE,
     &BACKFILL_CREATE,
     &BACKFILL_LANES,
+    &BACKFILL_HOLD,
     &BACKFILL_CHECKPOINT,
     &BACKFILL_ADVANCE,
     &BACKFILL_SUBSCRIPTION,
@@ -481,6 +500,7 @@ pub const TYPED: &[typed::Shape] = &[
     typed::Shape::of::<leave::Query>(),
     typed::Shape::of::<backfill_create::Query>(),
     typed::Shape::of::<backfill_lanes::Query>(),
+    typed::Shape::of::<backfill_hold::Query>(),
     typed::Shape::of::<backfill_checkpoint::Query>(),
     typed::Shape::of::<backfill_advance::Query>(),
     typed::Shape::of::<backfill_subscription::Query>(),

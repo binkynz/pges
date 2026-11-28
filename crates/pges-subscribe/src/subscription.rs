@@ -1242,11 +1242,29 @@ enum Checkpoint {
 
 /// The outcome of locking the shard's row for a `run_pg` batch.
 enum Held {
-    /// The row is locked until the batch's transaction ends.
-    Locked,
+    /// The row is locked until the batch's transaction ends, whose id this is.
+    Locked(i64),
     /// The fence moved on (another instance took the lease), or the database no longer supports this crate.
     Fenced,
 }
+
+/// The outcome of the checkpoint at the end of a `run_pg` batch.
+enum HeldCheckpoint {
+    /// The cursor moved and the lease was renewed until this deadline, once the transaction commits.
+    Moved(Instant),
+    /// The fence moved on: another instance took the lease.
+    Fenced,
+    /// The checkpoint ran outside the batch's transaction, which the handler ended itself; nothing moved.
+    OutsideBatch,
+}
+
+/// A handler ended the batch's transaction itself, with a raw `COMMIT` or `ROLLBACK`.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the handler ended the batch's transaction itself (a raw COMMIT or ROLLBACK): its writes were committed \
+     or rolled back without the checkpoint, which did not move"
+)]
+pub(crate) struct HandlerEndedTransaction;
 
 enum Delivered {
     Checkpointed,
@@ -1815,22 +1833,27 @@ impl Ctx {
             .fetch_optional(&mut *tx)
             .await?;
 
-        Ok(match held {
-            Some(_) => Held::Locked,
-            None => Held::Fenced,
-        })
+        let Some(row) = held else {
+            return Ok(Held::Fenced);
+        };
+        let xact = row.xact.ok_or_else(|| {
+            sqlx::Error::Protocol("a held subscription row had no transaction id".into())
+        })?;
+
+        Ok(Held::Locked(xact))
     }
 
-    /// Moves the cursor to `to` at the end of a `run_pg` batch, in the transaction that holds the row, and
-    /// renews the lease from now.
+    /// Moves the cursor to `to` at the end of a `run_pg` batch and renews the lease from now, if it runs in
+    /// the batch's transaction `xact`, which holds the row.
     async fn checkpoint_held(
         &self,
         tx: &mut PgConnection,
         term: &Term,
         to: position::Position,
-    ) -> Result<Checkpoint, sqlx::Error> {
+        xact: i64,
+    ) -> Result<HeldCheckpoint, sqlx::Error> {
         let sent = Instant::now();
-        let updated = self
+        let row = self
             .sql
             .checkpoint_held
             .bind(sql::statement::checkpoint_held::Params {
@@ -1838,15 +1861,22 @@ impl Ctx {
                 shard: term.shard,
                 position: read::to_i64(to),
                 fence: term.fence,
+                xact,
                 lease: self.interval,
             })
-            .execute(&mut *tx)
+            .fetch_one(&mut *tx)
             .await?;
-        if updated.rows_affected() == 0 {
-            return Ok(Checkpoint::Refused);
-        }
+        let (Some(in_batch), Some(moved)) = (row.in_batch, row.moved) else {
+            return Err(sqlx::Error::Protocol(
+                "the run_pg checkpoint came back with a NULL column".into(),
+            ));
+        };
 
-        Ok(Checkpoint::Moved(Some(sent + self.lease)))
+        Ok(match (in_batch, moved) {
+            (false, _) => HeldCheckpoint::OutsideBatch,
+            (true, false) => HeldCheckpoint::Fenced,
+            (true, true) => HeldCheckpoint::Moved(sent + self.lease),
+        })
     }
 
     /// Renews the lease in autocommit on a pool connection. Returns the new deadline, or `None` if the fence
@@ -1998,8 +2028,8 @@ async fn deliver_pg(
     let mut tx = handler::begin(&mut conn, handler.isolation())
         .await
         .map_err(database)?;
-    match ctx.hold(&mut tx, term).await {
-        Ok(Held::Locked) => {}
+    let xact = match ctx.hold(&mut tx, term).await {
+        Ok(Held::Locked(xact)) => xact,
         Ok(Held::Fenced) => {
             let _ = tx.rollback().await;
             return Ok(Delivered::LostLease);
@@ -2011,7 +2041,7 @@ async fn deliver_pg(
             return Err(Failure::Handler(refused(error)));
         }
         Err(error) => return Err(database(error)),
-    }
+    };
 
     if let Err(error) = handler.handle(&mut tx, batch).await {
         let _ = tx.rollback().await;
@@ -2024,14 +2054,23 @@ async fn deliver_pg(
         )));
     }
 
+    // sqlx counts transactions itself and does not see a raw COMMIT or ROLLBACK the handler sent: the
+    // checkpoint checks it runs in the transaction the hold began, or it would move the cursor in autocommit.
     let renewed = match ctx
-        .checkpoint_held(&mut tx, term, batch.last_position())
+        .checkpoint_held(&mut tx, term, batch.last_position(), xact)
         .await
     {
-        Ok(Checkpoint::Moved(renewed)) => renewed,
-        Ok(Checkpoint::Refused) => {
+        Ok(HeldCheckpoint::Moved(renewed)) => renewed,
+        Ok(HeldCheckpoint::Fenced) => {
             let _ = tx.rollback().await;
             return Ok(Delivered::Refused);
+        }
+        // A bug in the handler, and its writes may have committed: retrying cannot make the batch exactly once.
+        Ok(HeldCheckpoint::OutsideBatch) => {
+            let _ = tx.rollback().await;
+            return Err(Failure::Handler(handler::HandlerError::Fatal(Box::new(
+                HandlerEndedTransaction,
+            ))));
         }
         Err(error) if is_aborted_transaction(&error) => {
             let _ = tx.rollback().await;
@@ -2054,7 +2093,7 @@ async fn deliver_pg(
             database(error)
         });
     }
-    renew(term, renewed);
+    term.deadline = renewed;
 
     Ok(Delivered::Checkpointed)
 }
