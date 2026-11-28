@@ -157,8 +157,9 @@ async fn measure_leaves(
         .into_iter()
         .map(|row| row.commit_id)
         .collect();
+    // skip_through 0: a subscription's strict read.
     let read_values = format!(
-        "({category_id}, {}, {events}, {})",
+        "({category_id}, {}, {events}, {}, 0)",
         events / 2,
         args.batch_size
     );
