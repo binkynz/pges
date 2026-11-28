@@ -301,7 +301,7 @@ pges_postgres::typed_query! {
 }
 
 pges_postgres::typed_query! {
-    /// The ids of a store's commits above a position.
+    /// The positions and ids of a store's commits above a position.
     pub LOG_ABOVE, mod log_above {
         name: "log/above",
         files: [sql_file!("log/above.sql")],
@@ -309,6 +309,7 @@ pges_postgres::typed_query! {
             after: i64,
         },
         row {
+            last_position: i64,
             commit_id: Uuid,
         },
     }

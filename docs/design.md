@@ -907,6 +907,15 @@ the halt, 43 recovered, 335 after.
   public option either (Compile-time checks, below).
 - Sequencer token default: coarse, written about once a second, with dedupe against the log tail
   (schema.md, option b). Replication origins (option a) stay available where the grants exist.
+- The dedupe window keeps the log rows a term found above `pges.stores.last_position` until its source has
+  replayed them, and the mark is written below the oldest of them until then (2026-11-28). A randomized
+  concurrent run found commits sequenced twice: a leader crashed after sequencing more than `dedupe_tail`
+  commits without storing a token; its successor stored a token after its first replayed batch, which wrote
+  the mark at the head and trimmed the window, so the rest of the replay was not recognised, in that term or
+  the next. Tracking the replay by position costs one more column in the seeding read. A replayed row ends
+  the replay of the rows before it, and a new commit ends it all, because earlier terms sequenced the rows
+  in the order the source delivers them; rows a source never delivers again (a resequence's) therefore only
+  hold the mark until the next new commit.
 - Build order: `pges-core`, `pges-postgres`, `pges-sequencer` with the outbox source, `pges-subscribe`; a
   `pges-replication` spike alongside, then the logical source becomes the default.
 - Upcast chains are strict: `upcast(..)` must cover versions 1..version-1, so an old version can never
@@ -1380,7 +1389,8 @@ the halt, 43 recovered, 335 after.
     commits with `synchronous_commit = on`, stores the consistent point as the token, clears `halted` and
     releases the lease. Renewal stops just before it, so a late renewal cannot take the lease back.
   - The coarse marks (`pges.stores.last_position`, `categories.last_position`) are not written; the next
-    term seeds its dedupe window with every recovered commit and persists them.
+    term seeds its dedupe window with every recovered commit and persists them once its source delivers a
+    new commit.
   - Any inactive slot of this database is dropped, valid or invalidated, so a failed run can be retried. The
     new slot keeps the old slot's failover unless `LogicalConfig::failover` is `Set`.
   - A failure before the final commit drops the new slot and releases the lease; on `LeaseLost` the slot is

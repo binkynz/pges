@@ -945,7 +945,8 @@ consistent point as 8 bytes big-endian), clears `halted` and releases the lease;
   retention has already passed (`resequenced_through <= retention_scan_from`) is replaced, not widened.
 - The coarse high-water marks (`pges.stores.last_position`, `categories.last_position`) are not written. The
   next term seeds its dedupe window with every log row above `pges.stores.last_position`, which includes
-  every recovered commit, and persists the marks with its first token.
+  every recovered commit, and moves the store's mark up once its source delivers a new commit (Sequencer
+  batch, Dedupe window).
 - A failure before COMMIT drops the new slot (new replication connection) and releases the lease
   (`crates/pges-sequencer/sql/lease/release.sql`), except on `LeaseLost`, where the slot may already belong to
   the resequence that took the lease over and is left for the next run to drop. A failed COMMIT is
@@ -1009,9 +1010,16 @@ The resume token and the high-water marks are not written per batch:
   token, plus `SequencerConfig::dedupe_tail` (default 1024) older ones. It is seeded whenever a term starts or
   restarts after an error, with the newest `dedupe_tail` ids (`crates/pges-sequencer/sql/log/tail.sql`) and
   the ids above `pges.stores.last_position` (`crates/pges-sequencer/sql/log/above.sql`). After each stored
-  token it is trimmed back to the newest `dedupe_tail` ids of each store.
+  token it is trimmed back to the newest `dedupe_tail` ids of each store, except the rows above the mark:
+  an earlier term sequenced them after the durable token (it crashed before storing one), so the source
+  delivers them again first. They stay until the source has replayed them: a replayed one means every row
+  before it was replayed too (the earlier terms sequenced them in the order the source delivers them), and a
+  new commit means the replay is over. Until then the store's mark is written just below the oldest of them,
+  not at the newest position, so a term that stores a token part-way through the replay leaves the rest
+  above the mark for the next term. Without this, a token stored during a replay longer than `dedupe_tail`
+  let the rest of the replay be sequenced a second time.
 - **High-water marks.** `categories.last_position` and `pges.stores.last_position` are written with the
-  coarse token. The watch carries the live values, which the leader derives at term start from `log` (above)
+  coarse token (`pges.stores.last_position` held below a replay, above). The watch carries the live values, which the leader derives at term start from `log` (above)
   and keeps in memory.
 
 **NOTIFY (`watch-notify`).** After a batch that wrote rows committed and the WAL insert LSN was read, the
