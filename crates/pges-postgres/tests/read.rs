@@ -506,11 +506,25 @@ async fn orders_round_trip_through_their_own_partition() -> Result<()> {
 /// A read stops at the stream's version when it began without asking for another page: a stream of exactly
 /// one page (256 commits) is one page query for `load` and `read_stream`, and a load from a snapshot at the
 /// head runs none. Counted as scans of the jobs partition's leaves, once the reading pool has closed.
+///
+/// The leaves are never analyzed: 256 inserts are enough for autoanalyze, and once a leaf has a histogram the
+/// planner probes its primary key for the actual bounds of `commit_id >= $3 AND commit_id <= $4`
+/// (`get_actual_variable_range`), which counts as an index scan: 2 per page query, 6 in all.
 #[tokio::test]
 async fn a_read_that_reaches_the_head_asks_for_no_more_pages() -> Result<()> {
     const COMMITS: usize = 256;
 
     let f = Fixture::new().await?;
+    sqlx::query(
+        "DO $$ DECLARE leaf name; BEGIN
+           FOR leaf IN SELECT relname FROM pg_stat_user_tables
+                       WHERE schemaname = 'es' AND relname LIKE 'commits\\_jobs\\_\\_%' LOOP
+             EXECUTE format('ALTER TABLE es.%I SET (autovacuum_enabled = off)', leaf);
+           END LOOP;
+         END $$",
+    )
+    .execute(&f.pool)
+    .await?;
     let id = stream::StreamId::new_v7();
     let mut expected = version::ExpectedVersion::NoStream;
     for i in 0..COMMITS {
@@ -543,6 +557,13 @@ async fn a_read_that_reaches_the_head_asks_for_no_more_pages() -> Result<()> {
     assert_eq!(from_snapshot.version(), loaded.version());
     assert_eq!(from_snapshot.commit_id(), loaded.commit_id());
     assert_eq!(from_snapshot.state(), loaded.state());
+    let analyzed: i64 = sqlx::query_scalar(
+        "SELECT coalesce(sum(analyze_count + autoanalyze_count), 0)::int8
+         FROM pg_stat_user_tables WHERE schemaname = 'es' AND relname LIKE 'commits\\_jobs\\_\\_%'",
+    )
+    .fetch_one(&mut f.db.connect().await?)
+    .await?;
+    assert_eq!(analyzed, 0, "a leaf was analyzed, so the planner probes it");
     assert_eq!(
         scans, 2,
         "one page each for load and read_stream, none from the snapshot"
