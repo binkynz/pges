@@ -26,7 +26,9 @@ The first release: `pges`, `pges-core`, `pges-derive`, `pges-postgres`, `pges-su
   load made before the deletion. A stream read or `load` that retention truncates between reading the
   stream's head and fetching its commits fails with `ReadError::Truncated` (or `StreamDeleted`), instead of
   returning the stream without its first events. `load_snapshotted` of a stream that retention truncated
-  loads from its snapshot, also from one saved while the load runs.
+  loads from its snapshot, also from one saved while the load runs, and starts again from the newer snapshot
+  when retention truncates the stream above its starting point during the replay; deleted during the load,
+  it fails with `StreamDeleted`.
 - **Events** (`pges-core`, `pges-derive`). `#[derive(Event)]` gives each variant a stable type name and a
   schema version, with upcasting from older versions. JSON codec by default. A versioned payload frame.
 - **Metadata.** Correlation id, causation id, actor, W3C trace context and string pairs on each commit; an

@@ -42,45 +42,30 @@ impl store::Store {
     /// aggregate is rebuilt from the start. With [`aggregate::SnapshotPolicy::EveryN`], a load that replayed at
     /// least `n` events saves a new snapshot.
     ///
-    /// A stream that retention truncated loads from its snapshot, also one saved while the load runs. It
-    /// fails with [`read::ReadError::Truncated`] only when the stored snapshot is of another state version,
-    /// or behind the floor.
+    /// A stream that retention truncated loads from its snapshot, also one saved while the load runs. When
+    /// retention truncates the stream above where the replay started, during the load, the load starts again
+    /// from the snapshot that truncation relied on. It fails with [`read::ReadError::Truncated`] only when
+    /// the stored snapshot is of another state version, or behind the floor, or when the stream was truncated
+    /// during each of several attempts in a row. A stream deleted during the load fails with
+    /// [`read::ReadError::StreamDeleted`].
     pub async fn load_snapshotted<A: aggregate::Snapshotted>(
         &self,
         stream_id: stream::StreamId,
     ) -> Result<Loaded<A>, LoadError> {
-        let mut head_rereads = 0;
-        let (category, start) = loop {
-            let Some((category, head)) = read::open_stream::<A::Event>(self, stream_id).await?
-            else {
+        let mut retries = 0;
+        let loaded = loop {
+            let Some((category, start)) = start::<A>(self, stream_id, &mut retries).await? else {
                 return Ok(Loaded::new(stream_id));
             };
-
-            match read_snapshot::<A>(self, stream_id, &category, &head).await? {
-                StoredSnapshot::Usable(start) => break (category, start),
-                // Saved after the head was read. Its version is committed, so the head read again is at or
-                // above it. Ignoring it would replay from the start, which retention may have truncated
-                // because this snapshot covers it.
-                StoredSnapshot::AheadOfHead if head_rereads < HEAD_REREADS => head_rereads += 1,
-                StoredSnapshot::AheadOfHead | StoredSnapshot::Unusable
-                    if head.floor_version > 0 =>
-                {
-                    return Err(read::truncated(stream_id, head.floor_version).into());
-                }
-                StoredSnapshot::AheadOfHead | StoredSnapshot::Unusable => {
-                    let start = Replay {
-                        state: A::default(),
-                        from: version::Version::FIRST,
-                        commits: head.commits(),
-                        last_version: head.version,
-                        version: None,
-                        commit_id: None,
-                    };
-                    break (category, start);
-                }
+            match replay(self, category, stream_id, start).await {
+                // The start was at or above the floor, so retention raised the floor above it and dropped the
+                // versions after the start during the replay. It raises a floor only under a snapshot at or
+                // above it, and a stored snapshot's version never goes down: the next start finds that
+                // snapshot, or one newer.
+                Err(read::ReadError::Truncated { .. }) if retries < RETRIES => retries += 1,
+                result => break result?,
             }
         };
-        let loaded = replay(self, category, stream_id, start).await?;
 
         if let aggregate::SnapshotPolicy::EveryN(n) = A::policy()
             && loaded.replayed >= u64::from(n.get())
@@ -260,9 +245,10 @@ struct Replay<A> {
     commit_id: Option<commit::CommitId>,
 }
 
-/// How often `load_snapshotted` reads the head again for a snapshot saved after its head read. Each reread
-/// needs another snapshot saved in between.
-const HEAD_REREADS: u32 = 8;
+/// How often `load_snapshotted` starts again: reads the head again for a snapshot saved after its head read,
+/// or the head and the snapshot again after retention truncated the stream above where its replay started.
+/// Each retry needs another snapshot saved, or another truncation of the stream, during the attempt before.
+const RETRIES: u32 = 8;
 
 /// The stream's snapshot as a load at `head` finds it.
 enum StoredSnapshot<A> {
@@ -272,6 +258,48 @@ enum StoredSnapshot<A> {
     AheadOfHead,
     /// None, or one of another state version, format or category, or behind the stream's retention floor.
     Unusable,
+}
+
+/// Reads the stream's head and its snapshot, and where the replay starts: from the snapshot when it is usable,
+/// otherwise from the stream's first version. `None` if the stream does not exist. Fails as truncated when the
+/// stream is truncated and its snapshot is not usable.
+async fn start<A: aggregate::Snapshotted>(
+    store: &store::Store,
+    stream_id: stream::StreamId,
+    retries: &mut u32,
+) -> Result<Option<(catalog::Category, Replay<A>)>, LoadError> {
+    loop {
+        let Some((category, head)) = read::open_stream::<A::Event>(store, stream_id).await? else {
+            return Ok(None);
+        };
+
+        match read_snapshot::<A>(store, stream_id, &category, &head).await? {
+            StoredSnapshot::Usable(start) => return Ok(Some((category, start))),
+            // Saved after the head was read. Its version is committed, so the head read again is at or above
+            // it. Ignoring it would replay from the start, which retention may have truncated because this
+            // snapshot covers it.
+            StoredSnapshot::AheadOfHead if *retries < RETRIES => *retries += 1,
+            // delete_stream deletes the snapshot in the transaction that marks the stream deleted: a deletion
+            // committed after the head read leaves none. The head read again fails with StreamDeleted then.
+            StoredSnapshot::AheadOfHead | StoredSnapshot::Unusable if head.floor_version > 0 => {
+                return match read::open_stream::<A::Event>(store, stream_id).await? {
+                    Some((_, head)) => Err(read::truncated(stream_id, head.floor_version).into()),
+                    None => Ok(None),
+                };
+            }
+            StoredSnapshot::AheadOfHead | StoredSnapshot::Unusable => {
+                let start = Replay {
+                    state: A::default(),
+                    from: version::Version::FIRST,
+                    commits: head.commits(),
+                    last_version: head.version,
+                    version: None,
+                    commit_id: None,
+                };
+                return Ok(Some((category, start)));
+            }
+        }
+    }
 }
 
 /// The stream's snapshot, usable when it has the same state version and format, and lies between the
