@@ -1977,10 +1977,12 @@ the halt, 43 recovered, 335 after.
   every category's log page is read first, then the cut, then the commits of the rows at or below it. Before,
   each category fetched its whole page's payloads and the rows above the cut were dropped, so with skewed
   rates a sparse category fetched up to `batch_size` payloads per page to deliver a few. A category with no
-  row at or below the cut runs no fetch. The delivered sequence is unchanged. The one difference is when a
-  missing commit above the cut is noticed: retention that drops it between the statements is now found by
-  the next page's horizon check instead of this page's re-check, which is the same outcome as retention that
-  lands just after the fetch, a schedule the old code already allowed.
+  row at or below the cut runs no fetch. The delivered sequence is unchanged except when a missing commit
+  above the cut is noticed: retention that drops it between the statements is now found by the next page's
+  horizon check instead of this page's re-check, which is the same outcome as retention that lands just
+  after the fetch, a schedule the old code already allowed. In `Fail` mode the page up to the cut is
+  delivered before `CursorBeforeHorizon`; in `Skip` mode the surviving commits at or below the cut are
+  delivered, where the old code could leave them out.
 
 ## Open decisions
 
