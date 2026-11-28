@@ -19,8 +19,9 @@
 //!
 //! # Retention
 //!
-//! A backfill reads each category from its retention horizon when its cursor is below it: the events
-//! before the horizon were removed and are skipped, without an error. A read model that needs the state
+//! A backfill reads each category from its retention start position when its cursor is below it: the
+//! events retention dropped are skipped, without an error, and every event it kept is read, also one
+//! positioned below the category's horizon. A read model that needs the state
 //! they built starts from the application's own snapshots; the backfill does not replay them.
 //!
 //! # Lanes
@@ -285,9 +286,10 @@ impl Builder<subscription::Listed> {
                 limit: self.batch_size.get(),
                 on_unknown: self.on_unknown,
                 shards: 1,
-                before_horizon: read::BeforeHorizon::Skip,
             },
         );
+        // Skips every commit retention dropped: a backfill reads what is left.
+        reader.skip_dropped_through(position::Position::MAX);
         reader
             .load_types()
             .await

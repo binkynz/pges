@@ -99,6 +99,13 @@ The first release: `pges`, `pges-core`, `pges-derive`, `pges-postgres`, `pges-su
   `pges.uuidv7_floor`, `pges.check_one_source_kind`, the outbox trigger's `notify_pending`) set
   `search_path = pg_catalog, pg_temp` and qualify what they reference, so a caller's `search_path` or a
   function another role creates in `public` cannot change what they call. None is `SECURITY DEFINER`.
+- **Retention start position** (`pges-postgres`, `pges-subscribe`). Retention records each category's start
+  position next to its horizon (`categories.start_position`, `DroppedLeaf::start`): every commit at or
+  below it was dropped, while a commit positioned between it and the horizon, which committed before the
+  dropped leaf's last commit, stays. `Start::Retained` creates a subscription that reads every event
+  retention kept and skips the dropped ones (`subscriptions.skip_through`); backfills read from the start
+  position instead of the horizon, so neither misses a kept commit below the horizon. Running subscriptions
+  behind the horizon still fail with `CursorBeforeHorizon`.
 
 ### Stability
 

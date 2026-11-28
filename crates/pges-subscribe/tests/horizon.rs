@@ -201,3 +201,73 @@ async fn retention_between_the_log_page_and_its_commits_stops_the_subscription()
 
     f.finish().await
 }
+
+/// Retention can keep a commit positioned below the horizon: one that committed before the dropped leaf's
+/// last commit. A subscription created at `Start::Retained` reads every commit retention kept, listed or
+/// store-wide, and skips the dropped ones; one from the beginning still fails.
+#[tokio::test]
+async fn a_subscription_started_at_retained_reads_commits_kept_below_the_horizon() -> Result<()> {
+    let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    let (job, order) = (stream::StreamId::new_v7(), stream::StreamId::new_v7());
+    for _ in 0..3 {
+        f.append(Cat::Jobs, job, 1).await?;
+        f.append(Cat::Orders, order, 1).await?;
+    }
+    f.sequence_all().await?;
+    // As apply_retention records it: jobs at position 3 is dropped, jobs at position 1 is kept.
+    sqlx::query(
+        "UPDATE es.categories SET horizon_position = 3, start_position = 0 WHERE category_id = $1",
+    )
+    .bind(f.id(Cat::Jobs).get())
+    .execute(&f.pool)
+    .await?;
+    sqlx::query(
+        "DELETE FROM es.commits_jobs WHERE commit_id = (SELECT commit_id FROM es.log WHERE last_position = 3)",
+    )
+    .execute(&f.pool)
+    .await?;
+
+    let error = stopped_with(
+        f.store
+            .subscription(subscription_name!("beginning"))
+            .categories(non_empty![category!("jobs")])
+            .run_pg(Recorder::new("beginning")),
+    )
+    .await?;
+    assert!(
+        matches!(
+            error,
+            subscription::SubscribeError::CursorBeforeHorizon { .. }
+        ),
+        "{error:?}"
+    );
+
+    for (name, all) in [("listed", false), ("all", true)] {
+        let builder = f
+            .store
+            .subscription(subscription::SubscriptionName::parse(name)?)
+            .start(subscription::Start::Retained)
+            .waker(recheck::Recheck::every(interval!(5 ms)));
+        let subscription = if all {
+            builder.all_categories().run_pg(Recorder::new(name))
+        } else {
+            builder
+                .categories(non_empty![category!("jobs"), category!("orders")])
+                .run_pg(Recorder::new(name))
+        };
+        let running = common::Running::spawn(subscription);
+        running.wait_position(6).await?;
+        running.stop().await?;
+        assert_eq!(
+            f.delivered(name)
+                .await?
+                .iter()
+                .map(|d| d.0)
+                .collect::<Vec<_>>(),
+            [1, 2, 4, 5, 6],
+            "{name}"
+        );
+    }
+
+    f.finish().await
+}

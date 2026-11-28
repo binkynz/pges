@@ -5,8 +5,8 @@
 -- shared (pges) schema version, $6 the store, $7 the crate's newest store schema version, $8 its newest outbox
 -- schema version. Returns one row: too_old, whether a migration raised the min_compatible of the shared scope,
 -- the store's or the store's outbox scope above the crate's version for it (as subscription/renew.sql), and
--- the shard, its new fence, its cursor and the stored definition, all NULL when no shard was taken: every
--- shard is leased, or too_old. A too_old crate takes no shard and locks no row.
+-- the shard, its new fence, its cursor, its skip_through and the stored definition, all NULL when no shard
+-- was taken: every shard is leased, or too_old. A too_old crate takes no shard and locks no row.
 --
 -- FOR UPDATE SKIP LOCKED lets instances racing for a shard each take a different one instead of waiting. The
 -- fence makes every later write of the previous holder fail, so two holders never move one cursor.
@@ -23,7 +23,8 @@ WITH checked AS (
                    AND (lease_until IS NULL OR lease_until < now())
                    AND NOT (SELECT too_old FROM checked)
                  ORDER BY shard LIMIT 1 FOR UPDATE SKIP LOCKED)
-  RETURNING shard, fence, position, shards, category_ids
+  RETURNING shard, fence, position, skip_through, shards, category_ids
 )
-SELECT checked.too_old, taken.shard, taken.fence, taken.position, taken.shards, taken.category_ids
+SELECT checked.too_old, taken.shard, taken.fence, taken.position, taken.skip_through, taken.shards,
+       taken.category_ids
 FROM checked LEFT JOIN taken ON true

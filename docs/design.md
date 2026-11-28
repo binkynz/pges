@@ -274,11 +274,13 @@ by `Admin::apply_retention(&RetentionConfig)`, run on the same schedule as `Admi
   range whole, and the next scan start ignores rows in it.
 - Both policies raise `streams.floor_version` to each stream's newest version in the leaf, so a read of a
   stream whose commits were dropped fails with `Truncated` instead of returning part of it.
-- The retention horizon is recorded per category before the leaf goes; a subscriber whose cursor is behind
-  it gets `CursorBeforeHorizon` and must rebuild from snapshots or an existing projection. The check is part
-  of the read statement, never a separate step. Store-wide subscriptions compare against the highest
-  horizon of any category. A backfill instead reads each category from its horizon, skipping events that
-  are gone.
+- The retention horizon and start position are recorded per category before the leaf goes. A subscriber
+  whose cursor is behind the horizon gets `CursorBeforeHorizon` and must rebuild, from snapshots or an
+  existing projection for the state the dropped events built. The check is part of the read statement,
+  never a separate step. Store-wide subscriptions compare against the highest horizon of any category. A
+  new subscription created at `Start::Retained`, and a backfill, read each category from its start position
+  instead, skipping events that are gone and reading every event that stays, also one positioned below the
+  horizon (Decided, Retention start position).
 - A log partition is dropped once it is full, not the newest, and every row in it is at or below its own
   category's `retention_scan_from`. A `Forever` category pins every log partition it writes to. Put
   high-volume short-lived categories in their own store, or use `Admin::prune_log`, which deletes a
@@ -2135,6 +2137,48 @@ the halt, 43 recovered, 335 after.
     store it adds to the publication has no commits yet, and halt for `resequence` otherwise.
   - `pges.check_commit_id` refuses ids that are not UUIDv7 (22023). The CHECK constraints over several
     columns are named (`<table>_<purpose>`) instead of PostgreSQL's `<table>_check`.
+- Retention start position (2026-11-28; schema.md, Retention, Read a category from a cursor):
+  - The horizon is the newest position of a commit retention dropped. A commit just past the dropped leaf's
+    upper bound that committed before the leaf's last commit is positioned below it and stays. One position
+    cannot both stop a subscription that has not handled every dropped commit (lowering the horizon to the
+    kept commit would let a running subscription skip the dropped ones) and tell a new reader where the
+    commits that stay begin (starting at the horizon misses the kept commit, and starting before it fails).
+  - So each category records two values, in the transaction that raises the horizon
+    (`retention/raise_horizon.sql`): `horizon_position`, every dropped commit is at or below it (unchanged);
+    and `start_position`, every commit at or below it is dropped: least(new horizon, the oldest position of
+    a commit at or past the leaf's bound in the scan, minus 1). Both only rise. The scan already reads every
+    log row from `retention_scan_from` to its stop in one snapshot, and every commit that stays is positioned
+    after `retention_scan_from`, so `first_kept` is one more aggregate over the same rows. Sequencing during
+    the scan only adds rows past the snapshot, above the horizon; a range resequence wrote before the
+    snapshot is inside the scan (the stop covers it), and one after only adds rows past the tail.
+  - Running subscriptions keep the horizon check. Which check applies is a property of the reader, not of
+    the cursor: a running subscription at a cursor between the start and the horizon has not handled the
+    dropped commit at the horizon, and a new one at the same cursor does not care. Each subscription stores
+    `skip_through` with its cursor (0 unless created at `Start::Retained`, then the store's head at
+    creation; a redefine sets it from its start). A category whose horizon is at or below `skip_through` is
+    read after max(cursor, start), its read statement checks the start, and its missing commits are skipped
+    as dropped; a category whose horizon is above it keeps the horizon check. Backfills use the largest
+    position, so they always read from the start (the `read::BeforeHorizon` modes are replaced).
+  - `skip_through` is the head at creation, not the highest horizon: a drop that races the creation, or
+    drops events the subscription had not reached while it catches up, is still of events that existed
+    before it, so it is skipped rather than failing a subscription that never handled them. A drop of
+    events written after the creation, while the cursor is behind them, fails as for any subscription.
+    Stored, because the reader must still know after a restart that it was created this way.
+  - The store-wide read cannot start each category at its own start in one statement. Its log statement
+    checks only horizons above `skip_through`, and a missing commit at or below its (skipped) category's
+    horizon is dropped and skipped (one `read/horizons.sql` per page with missing commits, only while the
+    cursor is below `skip_through`). It may read dead rows below a category's start one page at a time.
+  - API: `Start::Retained` (new variant; `Start` is `#[non_exhaustive]`), `DroppedLeaf::start`. Unchanged:
+    `CursorBeforeHorizon { category, cursor, horizon }`; its advice is now "rebuild from
+    `Start::Retained`", since no position is a correct strict start. `Start::Beginning` keeps the strict
+    check; whether it should mean `Retained` is open.
+  - Migration 0001 is edited (`categories.start_position`, `subscriptions.skip_through`), not extended by a
+    0002: 0.1.0 is not published, and AGENTS.md freezes 0001 from the release on.
+  - Rejected: lowering the horizon to the start (running subscriptions would skip dropped commits);
+    refusing or delaying a leaf until no kept commit is positioned below its horizon (writers commit in any
+    order within `max_txn_age`, so it may never happen); delivering every kept commit below the horizon in
+    the first batch so the first checkpoint passes the horizon (unbounded batch); a skip mode kept only in
+    memory (a restart between checkpoints below the horizon would fail, or skip forever).
 
 - Listed reads fetch commits only up to the merge cut (2026-11-28; schema.md, Read a category from a cursor):
   every category's log page is read first, then the cut, then the commits of the rows at or below it. Before,

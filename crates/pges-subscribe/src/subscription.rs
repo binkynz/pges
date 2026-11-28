@@ -839,13 +839,23 @@ impl SubscriptionHandle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum Start {
-    /// Before the first event.
+    /// Before the first event. If retention dropped events of a category it reads, the subscription fails
+    /// with [`SubscribeError::CursorBeforeHorizon`].
     #[default]
     Beginning,
     /// After the store's newest event when the subscription is created.
     Now,
-    /// After this position.
+    /// After this position. If retention dropped an event of a category it reads after this position,
+    /// the subscription fails with [`SubscribeError::CursorBeforeHorizon`].
     Position(position::Position),
+    /// Before the first event retention kept: every event that still exists is delivered, and the events
+    /// retention dropped are skipped. This is where a new read model starts in a store with retention.
+    ///
+    /// The events skipped are those of the categories whose retention horizon is at or below the store's
+    /// newest position when the subscription is created, which covers every drop before it and any drop
+    /// of those events while it catches up. A later drop of events written after it was created, while
+    /// its cursor is behind them, still fails with [`SubscribeError::CursorBeforeHorizon`].
+    Retained,
 }
 
 /// How a batch is retried after [`handler::HandlerError::Transient`].
@@ -1011,7 +1021,8 @@ pub enum SubscribeError {
         requested: u16,
     },
     /// The cursor is behind a category's retention horizon: events after it were removed. Rebuild the read
-    /// model from snapshots or another projection, then restart from a later position.
+    /// model under a new subscription created with [`Start::Retained`], which reads every event retention
+    /// kept, starting from snapshots or another projection for the state the removed events built.
     #[error("cursor {cursor} is behind the retention horizon {horizon} of category {category}")]
     CursorBeforeHorizon {
         /// The category.
@@ -1220,11 +1231,22 @@ struct Term {
     shard: i16,
     fence: i64,
     cursor: position::Position,
+    /// The stored `skip_through`: the reader skips commits retention dropped from categories whose horizon
+    /// is at or below it.
+    skip_through: position::Position,
     /// When the lease expires, measured from before the statement that set it was sent.
     deadline: Instant,
     stored: Vec<category::CategoryId>,
     stored_shards: i16,
     cursor_state: CursorState,
+}
+
+/// Where a new subscription starts: its cursor, and the position through which it skips commits retention
+/// dropped (`Term::skip_through`).
+#[derive(Debug, Clone, Copy)]
+struct StartAt {
+    cursor: position::Position,
+    skip_through: position::Position,
 }
 
 /// Whether `Term::cursor` is known to match the stored cursor.
@@ -1422,6 +1444,7 @@ impl Runner {
             }
         }
 
+        reader.skip_dropped_through(term.skip_through);
         self.status.send_modify(|status| {
             status.state = State::Running;
             status.position = term.cursor;
@@ -1712,15 +1735,16 @@ impl Ctx {
         start: Start,
         requested: &[category::CategoryId],
     ) -> Result<(), SubscribeError> {
-        let position = self.start_position(start).await?;
+        let start = self.start_position(start).await?;
         let ids: Vec<i32> = requested.iter().map(|id| id.get()).collect();
         self.sql
             .redefine
             .bind(sql::statement::redefine::Params {
                 name: &self.name,
-                position: read::to_i64(position),
+                position: read::to_i64(start.cursor),
                 shards: self.shards,
                 category_ids: &ids,
+                skip_through: read::to_i64(start.skip_through),
             })
             .execute(&self.pool)
             .await?;
@@ -1728,21 +1752,33 @@ impl Ctx {
         Ok(())
     }
 
-    async fn start_position(&self, start: Start) -> Result<position::Position, SubscribeError> {
+    async fn start_position(&self, start: Start) -> Result<StartAt, SubscribeError> {
+        let strict = |cursor| StartAt {
+            cursor,
+            skip_through: position::Position::BEGINNING,
+        };
         match start {
-            Start::Beginning => Ok(position::Position::BEGINNING),
-            Start::Position(position) => Ok(position),
-            Start::Now => {
-                let head = self
-                    .sql
-                    .head
-                    .bind(sql::statement::head::Params {})
-                    .fetch_one(&self.pool)
-                    .await?
-                    .head;
-                read::to_position(head)
-            }
+            Start::Beginning => Ok(strict(position::Position::BEGINNING)),
+            Start::Position(position) => Ok(strict(position)),
+            Start::Now => Ok(strict(self.head().await?)),
+            Start::Retained => Ok(StartAt {
+                cursor: position::Position::BEGINNING,
+                skip_through: self.head().await?,
+            }),
         }
+    }
+
+    /// `H`, the store's newest position.
+    async fn head(&self) -> Result<position::Position, SubscribeError> {
+        let head = self
+            .sql
+            .head
+            .bind(sql::statement::head::Params {})
+            .fetch_one(&self.pool)
+            .await?
+            .head;
+
+        read::to_position(head)
     }
 
     /// Takes the lease of the lowest shard whose lease is free or lapsed. `None`: every shard is leased.
@@ -1783,9 +1819,13 @@ impl Ctx {
         let Some(shard) = row.shard else {
             return Ok(None);
         };
-        let (Some(fence), Some(position), Some(shards), Some(category_ids)) =
-            (row.fence, row.position, row.shards, row.category_ids)
-        else {
+        let (Some(fence), Some(position), Some(skip_through), Some(shards), Some(category_ids)) = (
+            row.fence,
+            row.position,
+            row.skip_through,
+            row.shards,
+            row.category_ids,
+        ) else {
             return Err(SubscribeError::Corrupt {
                 position: position::Position::BEGINNING,
                 reason: "a taken subscription lease came back with a NULL column",
@@ -1802,6 +1842,8 @@ impl Ctx {
             shard,
             fence,
             cursor: position::Position::from_i64(position).unwrap_or(position::Position::BEGINNING),
+            skip_through: position::Position::from_i64(skip_through)
+                .unwrap_or(position::Position::BEGINNING),
             deadline: sent + self.lease,
             stored,
             stored_shards: shards,
@@ -2038,7 +2080,6 @@ async fn prepare(
         limit: setup.batch_size,
         on_unknown: setup.on_unknown,
         shards: ctx.shards,
-        before_horizon: read::BeforeHorizon::Fail,
     };
     let store = pges_postgres::sql::store_name(&setup.store);
     let watched = match setup.scope {
@@ -2065,10 +2106,11 @@ async fn prepare(
         .sql
         .create
         .bind(sql::statement::create::Params {
-            position: read::to_i64(start),
+            position: read::to_i64(start.cursor),
             name: &ctx.name,
             shards: ctx.shards,
             category_ids: &ids,
+            skip_through: read::to_i64(start.skip_through),
         })
         .execute(&ctx.pool)
         .await;

@@ -670,7 +670,7 @@ not own `pges` can create stores in the schema the owner migrated; call it only 
 }                                                 // store's max_txn_age
 #[non_exhaustive] pub struct RetentionReport {
     pub dropped: Vec<DroppedLeaf>,                // { category: CategoryName, leaf: PartitionName,
-                                                  //   horizon: Position }
+                                                  //   horizon: Position, start: Position }
     pub refused: Vec<Refusal>,                    // { category: CategoryName, leaf: Option<PartitionName>,
                                                   //   reason }
     pub log_partitions: Vec<PartitionName>,
@@ -717,9 +717,13 @@ log partitions the sequencer writes to.
   changes an existing category's retention.
 - `apply_retention` drops, per category and oldest first, the time leaves its policy no longer keeps, then
   the log partitions no category needs (schema.md, Retention). It stops a category at its first refused
-  leaf and tries again on the next run. Before a leaf goes, the category's horizon and its streams'
-  `floor_version` are raised, so subscriptions behind the horizon fail with `CursorBeforeHorizon` and reads
-  below a floor with `ReadError::Truncated` (load such streams with `load_snapshotted`). It refuses while the
+  leaf and tries again on the next run. Before a leaf goes, the category's horizon, its start position and
+  its streams' `floor_version` are raised, so subscriptions behind the horizon fail with
+  `CursorBeforeHorizon`, subscriptions created at `Start::Retained` and backfills read the category after
+  its start, and reads below a floor fail with `ReadError::Truncated` (load such streams with
+  `load_snapshotted`). `DroppedLeaf::horizon` is the newest position of a dropped commit;
+  `DroppedLeaf::start` (at most the horizon) is the position before the oldest commit that stays. Commits
+  between the two stay when they committed before the dropped leaf's last commit. It refuses while the
   sequencer is halted and unless every writer role's `transaction_timeout`, set on the role or the
   database, is at most the store's `max_txn_age` (`WriterRole`). The margins it keeps are the store's
   writer limits. What was dropped before an error stays dropped.
@@ -896,7 +900,8 @@ let handle = store.subscription(subscription_name!("jobs-board.v3"))
                                                     //   category!("orders")]),
                                                     // or .all_categories(): the whole store
     .sharded(shards!(8))                            // optional: 1 to 1024 shards by stream; default 1
-    .start(subscription::Start::Beginning)          // or Now, Position(p); only when the rows are created
+    .start(subscription::Start::Beginning)          // or Now, Position(p), Retained; only when the rows
+                                                    // are created
     .redefine(subscription::Start::Now)             // optional: accept changed categories or shards
     .lease(interval!(15 s))                         // default 15 s; run_pg is always exclusive
     .batch_size(const { NonZeroU32::new(1024).unwrap() })  // commits per category per batch; default 1024
@@ -1140,7 +1145,15 @@ The first `.categories(..)` takes a `NonEmpty<CategoryName>`, later ones any ite
   subscription with `HandlerFailed { first, last }`. Nothing of that batch is checkpointed. A dead-letter
   table is out of scope for v1.
 - A cursor behind a category's retention horizon fails with `CursorBeforeHorizon`; the check is part of
-  every read (schema.md).
+  every read (schema.md). `Start::Beginning` and `Start::Position(p)` keep that check from the first read: a
+  subscription resumed at a position must not skip events after it.
+- `Start::Retained` starts a new read model in a store with retention: it delivers every event retention
+  kept and skips the ones it dropped. The subscription stores the store's newest position at creation
+  (`skip_through`); a category whose horizon is at or below it is read after its start position, and its
+  missing commits are skipped. A category whose horizon rises above it (retention dropped events written
+  after the subscription was created) is checked against its horizon again. `Start::Position(horizon)` is
+  not a substitute: a kept commit can be positioned below the horizon. After `CursorBeforeHorizon`, rebuild
+  under a new name (or `.redefine(Start::Retained)` with a changed definition) from `Start::Retained`.
 - Without a waker, a caught-up subscription uses `waker::recheck::Recheck::default()`: it reads the log again
   every 500 ms. A plain timer, which works with no features; a custom interval is
   `.waker(waker::recheck::Recheck::every(interval!(..)))`.
@@ -1209,9 +1222,9 @@ pub struct Lanes(NonZeroU16);             // 1..=32767; ONE, MAX, const fn new -
   `WHERE <field>_pos IS NULL OR <field>_pos < $pos`. The `backfill` example shows it.
 - Pool size: one store connection per lane (`PoolTooSmall` otherwise). Backfills read from the primary,
   unsharded.
-- It reads each category from its retention horizon: events before it are gone and are skipped, so a
-  backfill never fails on a horizon (a projection that needs them starts from snapshots). If retention raises
-  a horizon during a read, the page is read again. There is no API to delete a finished backfill's rows yet.
+- It reads each category from its retention start position: events retention dropped are skipped, so a
+  backfill never fails on a horizon (a projection that needs them starts from snapshots), and events it kept
+  below the horizon are read. If retention raises a start during a read, the page is read again. There is no API to delete a finished backfill's rows yet.
 
 `pges-subscribe` reads `categories` and `event_types` itself and interns category names (leaked once per
 process), because `pges-postgres` keeps its catalog private.

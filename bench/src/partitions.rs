@@ -583,6 +583,7 @@ impl measure::Operation for CategoryRead {
                         after: cursor,
                         head,
                         limit,
+                        skip_through: 0,
                     })
                     .fetch_all(&self.pool)
                     .await?
