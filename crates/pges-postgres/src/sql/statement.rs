@@ -229,10 +229,10 @@ crate::typed_query! {
 }
 
 crate::typed_query! {
-    /// Saves a stream's snapshot.
+    /// Saves a stream's snapshot in the transaction of the append that wrote its version.
     pub SNAPSHOT_UPSERT, mod snapshot_upsert {
         name: "snapshot/upsert",
-        files: [sql_file!("snapshot/upsert.sql")],
+        files: [sql_file!("snapshot/insert.sql"), sql_file!("snapshot/replace.sql")],
         params<'q> {
             version: i64,
             stream_id: Uuid,
@@ -244,6 +244,19 @@ crate::typed_query! {
             min_distance: i64,
         },
         row {},
+    }
+}
+
+crate::typed_query! {
+    /// Saves a stream's snapshot, unless the stream was deleted or does not exist.
+    pub SNAPSHOT_SAVE, mod snapshot_save {
+        name: "snapshot/save",
+        files: [
+            sql_file!("snapshot/insert.sql"),
+            sql_file!("snapshot/live_stream.sql"),
+            sql_file!("snapshot/replace.sql"),
+        ],
+        like snapshot_upsert,
     }
 }
 
@@ -1377,6 +1390,7 @@ pub const ALL: &[&template::Statement] = &[
     &READ_STREAM,
     &SNAPSHOT_READ,
     &SNAPSHOT_UPSERT,
+    &SNAPSHOT_SAVE,
     &REGISTER_TYPES,
     &SELECT_TYPES,
     &CATEGORY_TYPES,
@@ -1478,6 +1492,7 @@ pub const TYPED: &[typed::Shape] = &[
     typed::Shape::of::<read_stream::Query>(),
     typed::Shape::of::<snapshot_read::Query>(),
     typed::Shape::of::<snapshot_upsert::Query>(),
+    typed::Shape::of::<snapshot_save::Query>(),
     typed::Shape::of::<register_types::Query>(),
     typed::Shape::of::<select_types::Query>(),
     typed::Shape::of::<category_types::Query>(),

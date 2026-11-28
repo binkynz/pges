@@ -77,11 +77,12 @@ async fn queries_match_their_registry_types() -> Result<()> {
             failures.push(format!("{error:#}"));
         }
     }
-    // A store that routes its appends runs them on one partition of streams.
+    // A store that routes its appends runs them, and snapshot saves, on one partition of streams.
     let partition = values.clone().stream_table(Some(&ident("streams_p000")));
     for shape in statement::TYPED.iter().filter(|shape| {
         shape.statement.name == statement::APPEND.name
             || shape.statement.name == statement::APPEND_OUTBOX.name
+            || shape.statement.name == statement::SNAPSHOT_SAVE.name
     }) {
         if let Err(error) = pges_testing::statement::check_typed(&mut conn, shape, &partition).await
         {

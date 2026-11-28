@@ -1200,6 +1200,68 @@ const APPEND_RELATION_LOCKS: i64 = 9;
 /// [`APPEND_RELATION_LOCKS`] in a store with the outbox, which also inserts into `pending`.
 const APPEND_OUTBOX_RELATION_LOCKS: i64 = 11;
 
+/// Relation locks the snapshot upsert of `snapshot_after` adds to an append's: `snapshots`, the stream's
+/// partition of it and their keys.
+const SNAPSHOT_RELATION_LOCKS: i64 = 4;
+
+/// An append with `snapshot_after` locks only its stream's partition of `streams`, even under
+/// `force_generic_plan`: the snapshot upsert does not read `streams`. A generic plan of a statement that reads
+/// `streams` locks every partition.
+#[tokio::test]
+async fn an_append_with_a_snapshot_locks_one_streams_partition() -> Result<()> {
+    let mut definition = pges_testing::definition(store::Outbox::Disabled);
+    definition.stream_partitions = std::num::NonZeroU16::new(64).unwrap();
+    let f = Fixture::with_definition(definition).await?;
+    let id = stream::StreamId::new_v7();
+    let mut conn = f.pool.acquire().await?;
+    sqlx::query("SET plan_cache_mode = force_generic_plan")
+        .execute(&mut *conn)
+        .await?;
+    let events = [JobEvent::assigned()];
+    let state = common::Job::default();
+
+    // Past the sixth execution, from which the plan cache weighs a generic plan; the last is counted.
+    let mut counted = (0, Vec::new());
+    for _ in 0..10 {
+        let mut tx = conn.begin().await?;
+        let mut work = unit_of_work::UnitOfWork::wrap(&f.store, &mut tx);
+        work.append(id, version::ExpectedVersion::Any, &events)
+            .snapshot_after(&state)
+            .await?;
+        work.finish().await?;
+        let relations: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_locks WHERE pid = pg_backend_pid() AND locktype = 'relation'",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let partitions: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT c.relname::text FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
+             WHERE l.pid = pg_backend_pid() AND c.relnamespace = 'es'::regnamespace
+               AND c.relname ~ '^streams_p[0-9]+$'",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        counted = (relations, partitions);
+    }
+    let snapshots: i64 =
+        sqlx::query_scalar("SELECT max(version) FROM es.snapshots WHERE stream_id = $1")
+            .bind(id.as_uuid())
+            .fetch_one(&f.pool)
+            .await?;
+
+    assert_eq!(snapshots, 10, "every append wrote its snapshot");
+    let (relations, partitions) = counted;
+    assert_eq!(partitions.len(), 1, "{partitions:?}");
+    assert!(
+        relations <= APPEND_RELATION_LOCKS + SNAPSHOT_RELATION_LOCKS,
+        "{relations} relation locks"
+    );
+
+    drop(conn);
+    f.finish().await
+}
+
 /// A store whose `streams` partitions the client cannot name exactly (here one needs quoting) appends
 /// through `streams` itself, to every partition.
 #[tokio::test]

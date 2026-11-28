@@ -175,6 +175,16 @@ pub struct Bound<'q, S> {
 }
 
 impl<'q, S: Query> Bound<'q, S> {
+    /// Runs the statement unnamed: PostgreSQL parses and plans it on each run, with a custom plan for its
+    /// parameters unless `plan_cache_mode` forces a generic one, and the connection's statement cache does
+    /// not keep it.
+    pub fn unprepared(self) -> Self {
+        Self {
+            arguments: self.arguments.persistent(false),
+            query: PhantomData,
+        }
+    }
+
     /// Runs the statement and returns how many rows it affected.
     pub async fn execute<'c, E>(self, executor: E) -> Result<PgQueryResult, sqlx::Error>
     where

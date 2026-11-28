@@ -483,6 +483,9 @@ pub enum Outbox {
 
 /// How a single append reaches its stream's row in `streams`. Batches ([`Store::append_many`]) always go
 /// through `streams`.
+///
+/// [`Store::save_snapshot`] locks the stream's row the same way, but runs unprepared: with `Auto` it names
+/// the partition even when the appends fall back because of the statement cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum AppendRouting {

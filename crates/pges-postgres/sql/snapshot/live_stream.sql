@@ -1,0 +1,12 @@
+-- Saves a stream's snapshot only while the stream exists and is not deleted (state 2). Middle part, between
+-- snapshot/insert.sql and snapshot/replace.sql, for save_snapshot and the save of load_snapshotted.
+--
+-- A save from a load made before delete_stream would otherwise store the deleted state again. The stream's
+-- row is locked FOR KEY SHARE, which conflicts with the FOR UPDATE lock delete_stream takes first: a deletion
+-- in progress makes the save wait and then see the stream deleted, and a save in progress makes the deletion
+-- wait, then delete its snapshot. Appends lock the row FOR NO KEY UPDATE and do not wait for it.
+--
+-- {stream_table} is the hash partition of streams that holds $2 when the store routes appends, so no plan has
+-- partitions to prune: through streams, a generic plan locks every partition. The save runs unprepared, so
+-- through streams it is planned for its stream each time, unless plan_cache_mode forces a generic plan.
+  AND EXISTS (SELECT FROM {store}.{stream_table} s WHERE s.stream_id = $2 AND s.state <> 2 FOR KEY SHARE)
