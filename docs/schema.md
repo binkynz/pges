@@ -1141,9 +1141,10 @@ cursors twice.
   grow.
 
 `run_pg` runs the checkpoint in the handler's transaction, after the handler; `run` runs it in autocommit
-after the handler. It is fenced: 0 rows means the lease was lost, and `run_pg` rolls the batch back
-(`crates/pges-subscribe/sql/subscription/checkpoint.sql`). When less than half the lease is left, the
-checkpoint also renews it (`crates/pges-subscribe/sql/subscription/checkpoint_renew.sql`).
+after the handler. It is fenced and moves the cursor only from where the instance holds it: 0 rows means the
+lease was lost or the stored cursor moved, `run_pg` rolls the batch back, and the instance reads the stored
+cursor again to tell which (`crates/pges-subscribe/sql/subscription/checkpoint.sql`). When less than half the
+lease is left, the checkpoint also renews it (`crates/pges-subscribe/sql/subscription/checkpoint_renew.sql`).
 
 While caught up and idle, while a handler runs and while a failed batch waits for its retry (in autocommit, on
 another pool connection), the instance renews its lease (`crates/pges-subscribe/sql/subscription/renew.sql`),
@@ -1152,7 +1153,9 @@ are fenced.
 
 After any retried error (database or waker) the subscriber reads the stored cursor before its next read
 (`crates/pges-subscribe/sql/subscription/cursor.sql`), because a COMMIT whose reply was lost may have moved
-it. No row means the fence moved on, and the instance stands down.
+it. No row means the fence moved on, and the instance stands down. Such a COMMIT can also become visible only
+after that read (the client saw the error while the server still finished it); the next checkpoint then finds
+the cursor moved, waiting on the COMMIT's row lock if it is still in flight, and the batch rolls back.
 
 An instance of a sharded subscription records itself in `subscription_members` every `min(acquire_interval,
 lease / 2)` and counts the live instances, itself included

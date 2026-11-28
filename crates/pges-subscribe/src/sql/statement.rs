@@ -199,17 +199,17 @@ pges_postgres::typed_query! {
 }
 
 pges_postgres::typed_query! {
-    /// Moves a shard's cursor, fenced.
+    /// Moves a shard's cursor, fenced, if it is still at `from`.
     pub CHECKPOINT, mod checkpoint {
         name: "subscription/checkpoint",
         files: [sql_file!("subscription/checkpoint.sql")],
-        params<'q> { name: &'q str, shard: i16, position: i64, fence: i64 },
+        params<'q> { name: &'q str, shard: i16, position: i64, fence: i64, from: i64 },
         row {},
     }
 }
 
 pges_postgres::typed_query! {
-    /// Moves a shard's cursor and renews its lease, fenced.
+    /// Moves a shard's cursor and renews its lease, fenced, if the cursor is still at `from`.
     pub CHECKPOINT_RENEW, mod checkpoint_renew {
         name: "subscription/checkpoint_renew",
         files: [sql_file!("subscription/checkpoint_renew.sql")],
@@ -223,6 +223,7 @@ pges_postgres::typed_query! {
             store: &'q str,
             store_version: i32,
             outbox_version: i32,
+            from: i64,
         },
         row {},
     }
