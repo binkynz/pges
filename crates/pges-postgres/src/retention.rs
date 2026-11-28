@@ -33,7 +33,7 @@ impl admin::Admin {
         name: category::CategoryName,
         retention: Retention,
     ) -> Result<(), SetRetentionError> {
-        let (code, retain_for) = to_columns(retention)?;
+        let (code, retain_for) = to_columns(&retention)?;
         let mut conn = self.session().await?;
         let updated = self
             .sql()
@@ -63,7 +63,7 @@ impl admin::Admin {
         &self,
         retention: Retention,
     ) -> Result<(), SetDefaultRetentionError> {
-        let (code, retain_for) = to_columns(retention)?;
+        let (code, retain_for) = to_columns(&retention)?;
         let mut conn = self.session().await?;
         let updated = statement::set_default_retention::Query::fixed()
             .bind(statement::set_default_retention::Params {
@@ -150,7 +150,7 @@ impl admin::Admin {
 /// What retention keeps of a category.
 ///
 /// `keep` is at most [`Retention::MAX_KEEP`]; to keep everything, use [`Retention::Forever`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum Retention {
     /// Nothing is dropped.
@@ -178,7 +178,7 @@ impl Retention {
 }
 
 /// What happens to a time leaf once [`Retention::Window`] no longer keeps it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum AfterWindow {
     /// The leaf is detached and dropped.
@@ -471,8 +471,8 @@ impl RetentionCode {
 pub(crate) struct KeepTooLong(pub(crate) Duration);
 
 /// The `retention` and `retain_for` columns for a policy.
-pub(crate) fn to_columns(retention: Retention) -> Result<(i16, Option<PgInterval>), KeepTooLong> {
-    let (code, keep) = match retention {
+pub(crate) fn to_columns(retention: &Retention) -> Result<(i16, Option<PgInterval>), KeepTooLong> {
+    let (code, keep) = match *retention {
         Retention::Forever => return Ok((RetentionCode::Forever.code(), None)),
         Retention::Window {
             keep,
@@ -1252,8 +1252,8 @@ mod tests {
     #[test]
     fn policies_map_to_their_codes() {
         let keep = Duration::from_secs(90);
-        assert_eq!(to_columns(Retention::Forever).unwrap(), (0, None));
-        let (code, retain_for) = to_columns(Retention::Window {
+        assert_eq!(to_columns(&Retention::Forever).unwrap(), (0, None));
+        let (code, retain_for) = to_columns(&Retention::Window {
             keep,
             then: AfterWindow::Drop,
         })
@@ -1261,7 +1261,7 @@ mod tests {
         assert_eq!(code, 1);
         assert_eq!(retain_for.map(|i| i.microseconds), Some(90_000_000));
         assert_eq!(
-            to_columns(Retention::SnapshotAndTruncate { keep })
+            to_columns(&Retention::SnapshotAndTruncate { keep })
                 .unwrap()
                 .0,
             3

@@ -193,7 +193,7 @@ async fn categories_get_partitions_ahead_and_maintenance_is_idempotent() -> Resu
     daily.bucket = admin::Bucket::Day;
     let parts = pges_core::category!("parts");
 
-    admin.register_category(parts, daily).await?;
+    admin.register_category(parts, daily.clone()).await?;
     admin.register_category(parts, daily).await?;
     admin.maintain().await?;
     admin.maintain().await?;

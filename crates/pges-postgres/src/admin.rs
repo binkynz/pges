@@ -228,7 +228,7 @@ impl CategoryHeadroom {
 }
 
 /// How a category is set up.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct CategoryConfig {
     /// The time span of one partition of the category's commits.
@@ -472,7 +472,7 @@ async fn register_category(
 
     loop {
         let mut tx = conn.begin().await?;
-        match register_in_transaction(&mut tx, admin, name, config).await {
+        match register_in_transaction(&mut tx, admin, name, &config).await {
             Ok(()) => {
                 tx.commit().await?;
                 return Ok(());
@@ -502,9 +502,9 @@ async fn register_in_transaction(
     conn: &mut PgConnection,
     admin: &Admin,
     name: category::CategoryName,
-    config: CategoryConfig,
+    config: &CategoryConfig,
 ) -> Result<(), RegisterCategoryError> {
-    let (retention, retain_for) = match config.retention {
+    let (retention, retain_for) = match &config.retention {
         Some(policy) => retention::to_columns(policy)?,
         None => retention::store_default(conn, admin.store()).await?,
     };

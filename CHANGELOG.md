@@ -85,6 +85,8 @@ The first release: `pges`, `pges-core`, `pges-derive`, `pges-postgres`, `pges-su
   `Store::open`, and subscriptions and the sequencer can neither take nor renew a lease. They stop with
   `SubscribeError::CrateTooOld` or `RunError::CrateTooOld`, which is not retried, so during a rolling upgrade
   a standby of a release the database no longer supports does not take over.
+- Config types that may later hold owned data are `Clone` but not `Copy`: `StoreDefinition`, `AutoMigrate`,
+  `CategoryConfig`, `Retention` and `AfterWindow` (an archive export would carry its destination).
 - Experimental: the gRPC watch and waker, the outbox source, sharded subscriptions, replica reads,
   backfills, `otel`, and `pges-testing` (README, Stability).
 - MSRV 1.94. The MSRV follows sqlx; raising it is a minor-version change.
