@@ -502,6 +502,12 @@ So old code in a rolling deploy cannot overwrite new code's snapshot, and a snap
 `missing_snapshots.sql` accepted before raising a floor stays at or above that floor. After a rollback to a
 lower `SNAPSHOT_VERSION`, that code's saves are skipped.
 
+A save for a stream that was deleted, or does not exist, stores nothing: a save from a load made before
+`delete_stream` would otherwise bring the deleted state back. The upsert locks the stream's row `FOR KEY
+SHARE`, which conflicts with the `FOR UPDATE` lock `delete_stream` takes first, so a save and a deletion that
+overlap are ordered: the save waits and then sees the stream deleted, or the deletion waits and then deletes
+the saved snapshot. Appends lock the row `FOR NO KEY UPDATE`, which does not conflict with it.
+
 ### Writer limits
 
 Each store records two writer limits in `pges.stores`: `max_clock_skew`, how far a commit id may be from the

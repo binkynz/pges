@@ -18,7 +18,8 @@ The first release: `pges`, `pges-core`, `pges-derive`, `pges-postgres`, `pges-su
   `append_many` for several streams in one transaction; `UnitOfWork` for appends alongside the caller's own
   statements. Crate-generated, time-ordered commit ids make a retried append idempotent.
 - **Reads and aggregates.** Stream reads, `load` of an `Aggregate`, snapshots (`load_snapshotted`,
-  `save_snapshot`), stream deletion.
+  `save_snapshot`), stream deletion. A snapshot save for a deleted stream stores nothing, also one from a
+  load made before the deletion.
 - **Events** (`pges-core`, `pges-derive`). `#[derive(Event)]` gives each variant a stable type name and a
   schema version, with upcasting from older versions. JSON codec by default. A versioned payload frame.
 - **Metadata.** Correlation id, causation id, actor, W3C trace context and string pairs on each commit; an

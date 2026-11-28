@@ -226,3 +226,85 @@ async fn an_outbox_store_enqueues_the_tombstone() -> Result<()> {
 
     f.finish().await
 }
+
+/// A snapshot saved from a load made before the stream was deleted is not stored: the deletion removed the
+/// stream's snapshot, and a later save must not bring the deleted state back.
+#[tokio::test]
+async fn a_snapshot_saved_after_the_deletion_is_not_stored() -> Result<()> {
+    let f = Fixture::new().await?;
+    let id = stream::StreamId::new_v7();
+    f.store
+        .append(
+            id,
+            version::ExpectedVersion::NoStream,
+            &[JobEvent::created("a"), JobEvent::assigned()],
+        )
+        .await?;
+    let loaded = f.store.load_snapshotted::<Job>(id).await?;
+
+    f.store
+        .delete_stream::<JobEvent>(id, delete::DeleteExpected::Any)
+        .await?;
+    f.store.save_snapshot(&loaded).await?;
+
+    let (_, snapshots, _, state) = rows(&f, id).await?;
+    assert_eq!(state, 2, "the stream is deleted");
+    assert_eq!(snapshots, 0, "the deleted stream's state was stored again");
+
+    f.finish().await
+}
+
+/// A save that overlaps a deletion waits for it, then stores nothing. The deletion is played by hand: it
+/// locks the row as `delete_stream` does and marks the stream deleted, and commits only once the save waits.
+#[tokio::test]
+async fn a_snapshot_saved_during_the_deletion_is_not_stored() -> Result<()> {
+    let f = Fixture::new().await?;
+    let id = stream::StreamId::new_v7();
+    f.store
+        .append(
+            id,
+            version::ExpectedVersion::NoStream,
+            &[JobEvent::created("a"), JobEvent::assigned()],
+        )
+        .await?;
+    let loaded = f.store.load_snapshotted::<Job>(id).await?;
+
+    let mut deletion = f.db.connect().await?;
+    sqlx::query("BEGIN").execute(&mut deletion).await?;
+    sqlx::query("SELECT 1 FROM es.streams WHERE stream_id = $1 FOR UPDATE")
+        .bind(id.as_uuid())
+        .execute(&mut deletion)
+        .await?;
+    sqlx::query("UPDATE es.streams SET state = 2 WHERE stream_id = $1")
+        .bind(id.as_uuid())
+        .execute(&mut deletion)
+        .await?;
+    let save = tokio::spawn({
+        let store = f.store.clone();
+        async move { store.save_snapshot(&loaded).await }
+    });
+    let mut side = f.db.connect().await?;
+    for attempt in 0.. {
+        assert!(attempt < 2000, "the save did not wait for the deletion");
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(&mut side)
+        .await?;
+        if waiting > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    sqlx::query("COMMIT").execute(&mut deletion).await?;
+    save.await??;
+
+    let (_, snapshots, _, _) = rows(&f, id).await?;
+    assert_eq!(
+        snapshots, 0,
+        "the save stored the state of a stream deleted under it"
+    );
+
+    f.finish().await
+}
