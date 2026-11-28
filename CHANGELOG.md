@@ -79,6 +79,10 @@ The first release: `pges`, `pges-core`, `pges-derive`, `pges-postgres`, `pges-su
 - Experimental: the gRPC watch and waker, the outbox source, sharded subscriptions, replica reads,
   backfills, `otel`, and `pges-testing` (README, Stability).
 - MSRV 1.94. The MSRV follows sqlx; raising it is a minor-version change.
+- Public dependencies: sqlx 0.9, uuid 1, time 0.3, serde 1, serde_json 1, tokio 1, bytes 1, prost and tonic
+  0.14, and opentelemetry 0.33 (`otel`) have types in the API, so a semver-incompatible upgrade of one is a
+  minor pges version (docs/api.md, Publishing). Public errors are `Send + Sync + 'static`, and
+  `subscription::StoreExt` is sealed.
 
 [Unreleased]: https://github.com/binkynz/pges/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/binkynz/pges/releases/tag/v0.1.0
