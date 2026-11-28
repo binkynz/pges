@@ -40,6 +40,10 @@ pub(crate) struct Statements {
     pub(crate) acquire: Rendered<statement::acquire::Query>,
     /// Replaces the stored definition and cursor of every shard (`redefine`).
     pub(crate) redefine: Rendered<statement::redefine::Query>,
+    /// Locks the shard's row for a `run_pg` batch, fenced.
+    pub(crate) hold: Rendered<statement::hold::Query>,
+    /// Moves the cursor at the end of a `run_pg` batch and renews the lease, fenced.
+    pub(crate) checkpoint_held: Rendered<statement::checkpoint_held::Query>,
     /// Moves the cursor, fenced.
     pub(crate) checkpoint: Rendered<statement::checkpoint::Query>,
     /// Moves the cursor and renews the lease, fenced.
@@ -73,6 +77,8 @@ impl Statements {
             create: statement::create::Query::render(&values),
             acquire: statement::acquire::Query::render(&values),
             redefine: statement::redefine::Query::render(&values),
+            hold: statement::hold::Query::render(&values),
+            checkpoint_held: statement::checkpoint_held::Query::render(&values),
             checkpoint: statement::checkpoint::Query::render(&values),
             checkpoint_renew: statement::checkpoint_renew::Query::render(&values),
             renew: statement::renew::Query::render(&values),

@@ -1098,12 +1098,43 @@ the halt, 43 recovered, 335 after.
     fault of the batch and would otherwise stop the subscription, while the empty-advance checkpoint retries
     the same errors. Class 23 (integrity) and 22 (data exception), which fail every attempt the same way,
     are `Fatal`. A FATAL error or a lost connection may hide a commit and stays a database error, so the
-    stored cursor is read again. Handlers stay at READ COMMITTED: a side renewal updates the subscription's
-    row, so a REPEATABLE READ or SERIALIZABLE snapshot taken before it fails the checkpoint with 40001.
-    (2026-11-28)
+    stored cursor is read again. (2026-11-28; the side renewal that made a REPEATABLE READ handler's
+    checkpoint fail with 40001 is gone, see `run_pg` holds the subscription row, below.)
   - Fatal errors release the lease, so a standby takes over at once (and probably meets the same error).
   - `Start` applies only when the row is created and on redefine. Empty advances (a cut with no events) are
     checkpointed in autocommit without calling the handler.
+- `run_pg` holds the subscription row (2026-11-28). The side renewal during a handler updated the same
+  `subscriptions` row the checkpoint later updates in the handler's transaction. Under REPEATABLE READ or
+  SERIALIZABLE, a batch slower than half the lease then failed its checkpoint with 40001 on every attempt.
+  Now the batch's transaction locks the row first (`SELECT … FOR NO KEY UPDATE`, fenced, with the renewal's
+  crate-version check), the lock is the lease until the transaction ends, nothing renews beside the handler,
+  and the checkpoint renews the lease from `clock_timestamp()`. The handler picks its level with
+  `PgHandler::isolation()` (`Isolation::{Default, RepeatableRead, Serializable}`), applied in the `BEGIN`;
+  it cannot `SET TRANSACTION` itself any more. Backfills begin at the same level.
+  - Fencing: unchanged, and stronger during a batch. Acquire's `FOR UPDATE SKIP LOCKED` skips the locked row
+    (no wait, it takes another shard or none), and anything else that writes the row (redefine, an
+    operator's `UPDATE`) waits for the batch. So no takeover lands between the lock and the COMMIT, and the
+    checkpoint cannot find the fence moved. A takeover while the holder was idle is found by the lock: no
+    row, the batch rolls back before the handler runs. Before, the fence could move during the handler and
+    the deposed handler ran to completion only to roll back.
+  - Expiry: the stored `lease_until` may lapse while a batch runs; it does not matter while the lock is
+    held. A crashed holder's lock goes with its connection: at once when the process exits, which is often
+    faster than before (the lease has usually lapsed already). A vanished host (no FIN) keeps the lock until
+    the server's TCP keepalives drop the backend. That case was not much better before: the new holder then
+    replays the same batch and blocks on the read-model rows the zombie transaction locked. Operators bound
+    both with `tcp_keepalives_*` on the server. A holder that hangs inside its handler keeps the shard, as
+    its side renewal kept it before.
+  - Lock waits: acquire never waits (SKIP LOCKED). Redefine waits for the running batch, then bumps the fence.
+    A dropped renewal from before the batch can still be on the server when the lock runs; READ COMMITTED
+    waits for it, the higher levels fail once with 40001 and retry.
+  - Performance: one more statement per batch (the lock, a primary-key lookup; it takes the lock the
+    checkpoint's UPDATE took anyway), and no side renewals or second connection: `run_pg` needs one store
+    connection, not two. The checkpoint always writes `lease_until` (same row version as the cursor).
+  - Rejected: leases in a separate row or table. The checkpoint still has to check the fence, which acquire
+    bumps on the subscription's row, so a takeover would still conflict; the renewal and checkpoint would
+    touch two rows; and every lease statement, status query and the schema would change. Rejected: forcing
+    READ COMMITTED (refusing other levels). It is the smallest change, but removes a level handlers may need
+    for their own reads, and the lock costs little more.
 - Sequencer polish (2026-11-25):
   - `Status::Halted(Arc<str>)` is set for every error `run()` returns: persisted halts, `RunError::Halted`
     at acquire, `SourceMismatch`, fatal and invalid source errors, unknown or invalid stores, position
@@ -1137,11 +1168,12 @@ the halt, 43 recovered, 335 after.
     `name::SnapshotName`, as additions; `create_slot` is unchanged.
 - Subscriptions, leases and wakers (2026-11-25):
   - The lease is renewed on a side connection (autocommit, the store's pool) while a handler runs and while
-    a failed batch backs off, once less than half of it is left.
+    a failed batch backs off, once less than half of it is left. (Since 2026-11-28 not while a `run_pg`
+    handler runs: its row lock keeps the lease, see below.)
   - A handler whose side renewal found the fence moved runs to completion; it is not cancelled, because a
     cancelled handler could leave its own state or an external sink half-written. Then `run_pg` rolls back
     and `run` skips its checkpoint. The cost: a deposed `run_pg` handler can hold read-model row locks until
-    it returns.
+    it returns. (Since 2026-11-28 a `run_pg` handler cannot be deposed while it runs.)
   - A failed side renewal (a database error, not a moved fence) is retried after lease/8 and is not shown as
     `Recovering`: the handler is still working, and a real database problem shows up at the checkpoint.
   - If the lease was lost during a handler call that also failed, `LostLease` wins over the handler error,
@@ -1277,7 +1309,7 @@ the halt, 43 recovered, 335 after.
     `sequencer-outbox` is the outbox-only sequencer. `source-logical` turns on `replication` in the facade,
     rather than `pges-sequencer` re-exporting the connection `Config`, because only the facade
     re-exports.
-  - Subscriptions check the store's pool at start: `run_pg` needs 2 connections, `run` 1, plus
+  - Subscriptions check the store's pool at start: `run_pg` needs 2 connections (1 since 2026-11-28), `run` 1, plus
     `Waker::store_connections` (1 for `NotifyWaker::new`, 0 for `with_separate_pool`; `Wakers` sums). Fewer
     fails with `SubscribeError::PoolTooSmall` (fatal). The check is a lower bound by design. The sizing rule
     is documented on `Builder` and in the README: appends' and reads' concurrency, plus per subscription 2 for

@@ -1,7 +1,8 @@
 //! The registry of pges-subscribe: every statement the crate runs.
 //!
 //! Each statement is a query declared with [`typed_query!`](pges_postgres::typed_query), which adds a module of
-//! the same name in lower case with its typed parameters and row. It is listed in [`ALL`] and in [`TYPED`].
+//! the same name in lower case with its typed parameters and row, and is listed in [`ALL`] and in [`TYPED`],
+//! except the `BEGIN` statements of a handler's transaction, which are listed in [`ALL`] only.
 //! `tests/statement.rs` checks every one against PostgreSQL 18.
 
 use sqlx::postgres::types::PgInterval;
@@ -209,6 +210,34 @@ pges_postgres::typed_query! {
 }
 
 pges_postgres::typed_query! {
+    /// Locks a shard's row for a `run_pg` batch, fenced.
+    pub HOLD, mod hold {
+        name: "subscription/hold",
+        files: [sql_file!("subscription/hold.sql")],
+        params<'q> {
+            name: &'q str,
+            shard: i16,
+            fence: i64,
+            shared_version: i32,
+            store: &'q str,
+            store_version: i32,
+            outbox_version: i32,
+        },
+        row { shard: i16 },
+    }
+}
+
+pges_postgres::typed_query! {
+    /// Moves a shard's cursor at the end of a `run_pg` batch and renews its lease, fenced.
+    pub CHECKPOINT_HELD, mod checkpoint_held {
+        name: "subscription/checkpoint_held",
+        files: [sql_file!("subscription/checkpoint_held.sql")],
+        params<'q> { name: &'q str, shard: i16, position: i64, fence: i64, lease: PgInterval },
+        row {},
+    }
+}
+
+pges_postgres::typed_query! {
     /// Moves a shard's cursor and renews its lease, fenced, if the cursor is still at `from`.
     pub CHECKPOINT_RENEW, mod checkpoint_renew {
         name: "subscription/checkpoint_renew",
@@ -368,6 +397,24 @@ pges_postgres::typed_query! {
     }
 }
 
+/// Begins a batch's transaction in REPEATABLE READ.
+pub const BEGIN_REPEATABLE_READ: template::Statement = template::Statement {
+    name: "transaction/begin_repeatable_read",
+    files: &[sql_file!("transaction/begin_repeatable_read.sql")],
+    kind: template::Kind::Ddl,
+    params: &[],
+    columns: &[],
+};
+
+/// Begins a batch's transaction in SERIALIZABLE.
+pub const BEGIN_SERIALIZABLE: template::Statement = template::Statement {
+    name: "transaction/begin_serializable",
+    files: &[sql_file!("transaction/begin_serializable.sql")],
+    kind: template::Kind::Ddl,
+    params: &[],
+    columns: &[],
+};
+
 /// Every statement of this crate.
 pub const ALL: &[&template::Statement] = &[
     &HEAD,
@@ -385,6 +432,8 @@ pub const ALL: &[&template::Statement] = &[
     &CREATE,
     &ACQUIRE,
     &REDEFINE,
+    &HOLD,
+    &CHECKPOINT_HELD,
     &CHECKPOINT,
     &CHECKPOINT_RENEW,
     &RENEW,
@@ -400,6 +449,8 @@ pub const ALL: &[&template::Statement] = &[
     &INSERT_LSN,
     &REPLAY_LSN,
     &WAL_LAYOUT,
+    &BEGIN_REPEATABLE_READ,
+    &BEGIN_SERIALIZABLE,
 ];
 
 /// Every statement of this crate with its Rust types, for the registry test.
@@ -419,6 +470,8 @@ pub const TYPED: &[typed::Shape] = &[
     typed::Shape::of::<create::Query>(),
     typed::Shape::of::<acquire::Query>(),
     typed::Shape::of::<redefine::Query>(),
+    typed::Shape::of::<hold::Query>(),
+    typed::Shape::of::<checkpoint_held::Query>(),
     typed::Shape::of::<checkpoint::Query>(),
     typed::Shape::of::<checkpoint_renew::Query>(),
     typed::Shape::of::<renew::Query>(),

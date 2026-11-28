@@ -1197,20 +1197,34 @@ cursors twice.
 - Rows are never deleted. After a shrink, rows with `shard >= shards` stay as retired rows, so fences only
   grow.
 
-`run_pg` runs the checkpoint in the handler's transaction, after the handler; `run` runs it in autocommit
-after the handler. It is fenced and moves the cursor only from where the instance holds it: 0 rows means the
-lease was lost or the stored cursor moved, `run_pg` rolls the batch back, and the instance reads the stored
-cursor again to tell which (`crates/pges-subscribe/sql/subscription/checkpoint.sql`). When less than half the
-lease is left, the checkpoint also renews it (`crates/pges-subscribe/sql/subscription/checkpoint_renew.sql`),
-which is also refused once a migration dropped support for the crate (Migrations). The stored cursor then has
-not moved and the fence is in place, so a refused checkpoint that finds both where the instance holds them
-ends the term as a lost lease, which checks the scopes; reading on from the same cursor would read the same
-page and be refused again, forever. This holds for an empty page that only moves the cursor as well.
+`run_pg`'s transaction begins (at the handler's isolation level,
+`crates/pges-subscribe/sql/transaction/begin_*.sql`, or a plain `BEGIN`) and first locks the shard's row,
+fenced and with the crate-version check of the renewal
+(`crates/pges-subscribe/sql/subscription/hold.sql`, `SELECT … FOR NO KEY UPDATE`). No row means the lease
+was lost: the batch is rolled back before the handler runs. Then the handler runs, and the checkpoint moves
+the cursor and renews the lease from `clock_timestamp()` in the same transaction
+(`crates/pges-subscribe/sql/subscription/checkpoint_held.sql`), then it commits. `run` runs its checkpoint in
+autocommit after the handler. It is fenced and moves the cursor only from where the instance holds it: 0 rows
+means the lease was lost or the stored cursor moved, and the instance reads the stored cursor again to tell
+which (`crates/pges-subscribe/sql/subscription/checkpoint.sql`). When less than half the lease is left, the
+checkpoint also renews it (`crates/pges-subscribe/sql/subscription/checkpoint_renew.sql`), which is also
+refused once a migration dropped support for the crate (Migrations). The stored cursor then has not moved and
+the fence is in place, so a refused checkpoint that finds both where the instance holds them ends the term as
+a lost lease, which checks the scopes; reading on from the same cursor would read the same page and be
+refused again, forever. This holds for an empty page that only moves the cursor as well.
 
-While caught up and idle, while a handler runs and while a failed batch waits for its retry (in autocommit, on
-another pool connection), the instance renews its lease (`crates/pges-subscribe/sql/subscription/renew.sql`),
-and on shutdown or a fatal error it releases it (`crates/pges-subscribe/sql/subscription/release.sql`). Both
-are fenced.
+The row lock is `run_pg`'s lease while the handler runs. Acquire skips locked rows (`SKIP LOCKED`), and
+anything else that writes the row (a redefine, a test's fence bump) waits for the batch, so the fence cannot
+move during it and nothing renews the lease beside it. The stored `lease_until` may lapse meanwhile; the
+checkpoint renews it. Without the lock, a renewal on another connection would update the row during the
+handler: harmless under READ COMMITTED, but under REPEATABLE READ or SERIALIZABLE a renewal committed after
+the handler's snapshot fails the checkpoint's UPDATE with 40001, on every attempt of a batch slower than half
+the lease.
+
+While caught up and idle, while a `run` handler runs and while a failed batch waits for its retry (in
+autocommit, on another pool connection), the instance renews its lease
+(`crates/pges-subscribe/sql/subscription/renew.sql`), and on shutdown or a fatal error it releases it
+(`crates/pges-subscribe/sql/subscription/release.sql`). Both are fenced.
 
 After any retried error (database or waker) the subscriber reads the stored cursor before its next read
 (`crates/pges-subscribe/sql/subscription/cursor.sql`), because a COMMIT whose reply was lost may have moved
@@ -1228,14 +1242,18 @@ their current batch, and takes the lowest free ones below it. On stop it leaves
 A dead instance's member row and leases lapse after the lease, and the others take its shards.
 
 - Leases are renewed only when `lease_until - now() < lease / 2`, piggybacked on a checkpoint where possible.
-  In `run_pg` the renewing checkpoint runs in the handler's transaction, so `now()` is the transaction's
-  start time; the client counts the new deadline from before `BEGIN`, not from the checkpoint.
-- While a handler runs and while transient retries back off, the lease is renewed with the renewal statement
-  above in autocommit, on another pool connection, once less than half is left. 0 rows means the fence
-  moved: the batch is rolled back (`run_pg`) or not checkpointed (`run`) once the handler returns. A failed
-  side renewal is tried again after a lease/8; a lapsed lease is kept safe by the fenced checkpoint. The
-  checkpoint uses the plain statement instead of the renewing one when counting from the transaction's
-  start would not move the deadline, so it never shortens a lease that a side renewal extended.
+  `run_pg`'s checkpoint renews every time, from `clock_timestamp()`, because its transaction began before
+  the handler ran, maybe longer than the lease ago; the client counts the new deadline from before the
+  checkpoint was sent.
+- While a `run` handler runs and while transient retries back off, the lease is renewed with the renewal
+  statement above in autocommit, on another pool connection, once less than half is left. 0 rows means the
+  fence moved: the batch is not checkpointed once the handler returns. A failed side renewal is tried again
+  after a lease/8; a lapsed lease is kept safe by the fenced checkpoint. The checkpoint uses the plain
+  statement instead of the renewing one when it would not move the deadline, so it never shortens a lease
+  that a side renewal extended.
+- A renewal from before a `run_pg` batch can still be on the server when the batch's lock runs (one dropped
+  in flight). Under READ COMMITTED the lock waits for it; under REPEATABLE READ or SERIALIZABLE its commit
+  after the snapshot fails the lock with 40001, which is retried like any serialization failure.
 - A 25P02 from the checkpoint means the handler left the transaction aborted (a statement failed and the
   handler ignored the error). PostgreSQL would turn the COMMIT into a ROLLBACK, so the batch is rolled back
   and counted as a transient handler failure, never as handled. No extra `SELECT 1` is needed, unlike

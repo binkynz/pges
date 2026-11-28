@@ -306,8 +306,8 @@ mod sealed {
 /// Every subscription of a store shares the store's pool with the store's other users. Give it at least:
 ///
 /// - the connections the application's appends and reads use at once, plus
-/// - for each subscription on the store: 2 for [`Builder::run_pg`] (the handler's transaction and a lease
-///   renewal beside it) or 1 for [`Builder::run`], plus the connections its waker keeps
+/// - for each subscription on the store: 1 (the handler's transaction for [`Builder::run_pg`]; reads,
+///   checkpoints and lease renewals in turn for [`Builder::run`]), plus the connections its waker keeps
 ///   ([`waker::Waker::store_connections`]: 1 for a `NotifyWaker` on the store's pool, 0 otherwise).
 ///
 /// An instance of a [sharded](Builder::sharded) subscription reads its shards at the same time, and calls
@@ -467,10 +467,18 @@ impl<S> Builder<S> {
     /// How long the lease lasts without renewal. Default 15 s.
     ///
     /// The holder renews it once less than half of it is left: with a checkpoint where possible, otherwise
-    /// on another connection of the store's pool, also while a handler runs and while a failed batch waits
-    /// for its retry. A batch slower than the lease therefore keeps it, as long as the store's pool has a
-    /// connection to spare for the renewal. A renewal that finds another instance took over stops the
-    /// batch from being checkpointed; the handler's call still finishes first.
+    /// on a connection of the store's pool, also while a failed batch waits for its retry and while a
+    /// [`run`](Builder::run) handler runs. A [`run_pg`](Builder::run_pg) batch holds a lock on the
+    /// subscription's row instead, which keeps the lease until its transaction ends, and renews the lease
+    /// when it checkpoints. A batch slower than the lease therefore keeps it. A renewal that finds another
+    /// instance took over stops a `run` batch from being checkpointed; the handler's call still finishes
+    /// first.
+    ///
+    /// The lease is what a standby waits out after the holder's process died. A `run_pg` batch's lock goes
+    /// with its connection: when the holder's host vanishes without closing it, the server notices only
+    /// through TCP keepalives, so set them on the server (`tcp_keepalives_idle` and its siblings) to bound
+    /// the takeover. The lapsed lease of a holder that hangs inside its handler is not taken over either,
+    /// as it would not be with a renewal on the side.
     pub fn lease(mut self, lease: interval::Interval) -> Self {
         self.lease = lease;
         self
@@ -575,9 +583,12 @@ impl<S: Scope> Builder<S> {
     /// Delivers batches to a projection in the same database, exactly once: the handler's writes and the
     /// checkpoint commit in one transaction ([`handler::PgHandler`]).
     ///
-    /// The store's pool must allow at least 2 connections, plus those the waker keeps
-    /// ([`waker::Waker::store_connections`]), so the lease can be renewed while the handler's transaction is
-    /// open; otherwise the run fails at start with [`SubscribeError::PoolTooSmall`].
+    /// The batch's transaction locks the subscription's row before the handler runs, and the lock keeps the
+    /// lease until the transaction ends: no other instance takes over during a batch, however long it takes.
+    ///
+    /// The store's pool must allow at least 1 connection plus those the waker keeps
+    /// ([`waker::Waker::store_connections`]); otherwise the run fails at start with
+    /// [`SubscribeError::PoolTooSmall`].
     pub fn run_pg(self, handler: impl handler::PgHandler + 'static) -> Subscription {
         self.finish(Delivery::Pg(Box::new(handler)))
     }
@@ -596,9 +607,8 @@ impl<S: Scope> Builder<S> {
         let waker = self
             .waker
             .unwrap_or_else(|| Box::new(waker::recheck::Recheck::default()));
-        let pool_needs = delivery
-            .store_connections()
-            .saturating_add(waker::DynWaker::store_connections(&*waker));
+        let pool_needs =
+            BATCH_CONNECTIONS.saturating_add(waker::DynWaker::store_connections(&*waker));
         let (status, _) = watch::channel(Status {
             state: State::Starting,
             position: position::Position::BEGINNING,
@@ -964,9 +974,8 @@ pub enum State {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum SubscribeError {
-    /// The store's pool allows fewer connections than the subscription holds at once, so it could not renew
-    /// its lease while a handler runs. `run_pg` needs 2 (the handler's transaction and a side renewal), `run`
-    /// needs 1, and a waker adds the connections it keeps ([`waker::Waker::store_connections`]; 1 for a
+    /// The store's pool allows fewer connections than the subscription holds at once. `run_pg` and `run`
+    /// need 1, and a waker adds the connections it keeps ([`waker::Waker::store_connections`]; 1 for a
     /// `NotifyWaker` on the store's pool). Other users of the pool need their own on top; see
     /// [`Builder`], Pool size.
     #[error(
@@ -1101,6 +1110,10 @@ const DEFAULT_BATCH_SIZE: NonZeroU32 = match NonZeroU32::new(1024) {
 /// A failed side renewal is tried again after the lease divided by this.
 const RENEW_RETRY_FRACTION: u32 = 8;
 
+/// The store connections a subscription's batch holds at once: `run_pg`'s transaction, whose row lock keeps
+/// the lease, or `run`'s reads, checkpoints and renewals in turn.
+const BATCH_CONNECTIONS: u32 = 1;
+
 type Shutdown = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 struct Setup {
@@ -1145,15 +1158,6 @@ enum Shared {
 }
 
 impl Delivery {
-    /// The store connections a batch holds at once: `run_pg` keeps the handler's transaction open while a
-    /// side renewal takes another; `run` needs one, for reads, checkpoints and renewals in turn.
-    fn store_connections(&self) -> u32 {
-        match self {
-            Self::Pg(_) | Self::Shared(Shared::Pg(_)) => 2,
-            Self::External(_) | Self::Shared(Shared::External(_)) => 1,
-        }
-    }
-
     /// The handler, to share between the shards of an instance.
     fn into_shared(self) -> Shared {
         match self {
@@ -1234,6 +1238,14 @@ enum Checkpoint {
     /// No row matched: the fence moved on (another instance took the lease), or the stored cursor is not
     /// `Term::cursor` (a COMMIT whose reply was lost moved it). Read the stored cursor to tell which.
     Refused,
+}
+
+/// The outcome of locking the shard's row for a `run_pg` batch.
+enum Held {
+    /// The row is locked until the batch's transaction ends.
+    Locked,
+    /// The fence moved on (another instance took the lease), or the database no longer supports this crate.
+    Fenced,
 }
 
 enum Delivered {
@@ -1421,11 +1433,7 @@ impl Runner {
             }
         } else if cut > term.cursor {
             let mut conn = self.ctx.pool.acquire().await?;
-            match self
-                .ctx
-                .checkpoint(&mut conn, term, cut, Instant::now())
-                .await?
-            {
+            match self.ctx.checkpoint(&mut conn, term, cut).await? {
                 Checkpoint::Moved(renewed) => renew(term, renewed),
                 Checkpoint::Refused => return self.refused(term).await,
             }
@@ -1472,8 +1480,9 @@ impl Runner {
         Ok(Step::More)
     }
 
-    /// Hands the batch to the handler and checkpoints, retrying transient handler errors. The lease is
-    /// renewed while the handler runs and while a retry waits; shutdown ends the wait.
+    /// Hands the batch to the handler and checkpoints, retrying transient handler errors. The lease is kept
+    /// while the handler runs (renewed beside a `run` handler, held by `run_pg`'s row lock) and renewed while a
+    /// retry waits; shutdown ends the wait.
     async fn deliver(
         &mut self,
         term: &mut Term,
@@ -1739,20 +1748,16 @@ impl Ctx {
         Ok(Some(read::to_position(row.position)?))
     }
 
-    /// Moves the cursor to `to` on `conn`, renewing the lease when less than half of it is left.
-    ///
-    /// `began` is an instant before `conn`'s transaction began. The renewal's `now()` is the transaction's
-    /// start time, which in `run_pg` is before the handler ran, so the new deadline counts from there. A
-    /// renewal that would not move the deadline (a side renewal during the handler went further) is skipped,
-    /// so the checkpoint never shortens the lease.
+    /// Moves the cursor to `to` in autocommit on `conn`, renewing the lease when less than half of it is
+    /// left. A renewal that would not move the deadline (a side renewal went further) is skipped, so the
+    /// checkpoint never shortens the lease.
     async fn checkpoint(
         &self,
         conn: &mut PgConnection,
         term: &Term,
         to: position::Position,
-        began: Instant,
     ) -> Result<Checkpoint, sqlx::Error> {
-        let renewed = began + self.lease;
+        let renewed = Instant::now() + self.lease;
         let due = term.deadline.saturating_duration_since(Instant::now()) < self.lease / 2
             && renewed > term.deadline;
         let updated = if due {
@@ -1790,6 +1795,58 @@ impl Ctx {
         }
 
         Ok(Checkpoint::Moved(due.then_some(renewed)))
+    }
+
+    /// Locks the shard's row in a `run_pg` batch's transaction, before the handler runs, while the database
+    /// still supports this crate.
+    async fn hold(&self, tx: &mut PgConnection, term: &Term) -> Result<Held, sqlx::Error> {
+        let held = self
+            .sql
+            .hold
+            .bind(sql::statement::hold::Params {
+                name: &self.name,
+                shard: term.shard,
+                fence: term.fence,
+                shared_version: migrate::latest_version(migrate::SHARED).get(),
+                store: self.store.as_str(),
+                store_version: migrate::latest_version(migrate::STORE).get(),
+                outbox_version: migrate::latest_version(migrate::OUTBOX).get(),
+            })
+            .fetch_optional(&mut *tx)
+            .await?;
+
+        Ok(match held {
+            Some(_) => Held::Locked,
+            None => Held::Fenced,
+        })
+    }
+
+    /// Moves the cursor to `to` at the end of a `run_pg` batch, in the transaction that holds the row, and
+    /// renews the lease from now.
+    async fn checkpoint_held(
+        &self,
+        tx: &mut PgConnection,
+        term: &Term,
+        to: position::Position,
+    ) -> Result<Checkpoint, sqlx::Error> {
+        let sent = Instant::now();
+        let updated = self
+            .sql
+            .checkpoint_held
+            .bind(sql::statement::checkpoint_held::Params {
+                name: &self.name,
+                shard: term.shard,
+                position: read::to_i64(to),
+                fence: term.fence,
+                lease: self.interval,
+            })
+            .execute(&mut *tx)
+            .await?;
+        if updated.rows_affected() == 0 {
+            return Ok(Checkpoint::Refused);
+        }
+
+        Ok(Checkpoint::Moved(Some(sent + self.lease)))
     }
 
     /// Renews the lease in autocommit on a pool connection. Returns the new deadline, or `None` if the fence
@@ -1928,21 +1985,35 @@ async fn prepare(
 }
 
 /// Exactly once: the handler's writes and the checkpoint commit in one transaction.
+///
+/// The shard's row is locked first, and the lock is the lease while the handler runs: no other instance
+/// can take the shard over, so nothing renews the lease on the side.
 async fn deliver_pg(
     ctx: &Ctx,
     handler: &mut dyn handler::DynPgHandler,
     term: &mut Term,
     batch: &batch::Batch,
 ) -> Result<Delivered, Failure> {
-    let began = Instant::now();
     let mut conn = ctx.pool.acquire().await.map_err(database)?;
-    let mut tx = conn.begin().await.map_err(database)?;
-    let (handled, lease) = renewing(ctx, term, handler.handle(&mut tx, batch)).await;
-    if lease == Lease::Lost {
-        let _ = tx.rollback().await;
-        return Ok(Delivered::LostLease);
+    let mut tx = handler::begin(&mut conn, handler.isolation())
+        .await
+        .map_err(database)?;
+    match ctx.hold(&mut tx, term).await {
+        Ok(Held::Locked) => {}
+        Ok(Held::Fenced) => {
+            let _ = tx.rollback().await;
+            return Ok(Delivered::LostLease);
+        }
+        // Under REPEATABLE READ or SERIALIZABLE, a renewal still in flight from before the batch can commit
+        // after the snapshot: 40001, worth a retry. Classified as the checkpoint's errors are ([`refused`]).
+        Err(error) if is_refused(&error) => {
+            let _ = tx.rollback().await;
+            return Err(Failure::Handler(refused(error)));
+        }
+        Err(error) => return Err(database(error)),
     }
-    if let Err(error) = handled {
+
+    if let Err(error) = handler.handle(&mut tx, batch).await {
         let _ = tx.rollback().await;
         return Err(Failure::Handler(error));
     }
@@ -1954,7 +2025,7 @@ async fn deliver_pg(
     }
 
     let renewed = match ctx
-        .checkpoint(&mut tx, term, batch.last_position(), began)
+        .checkpoint_held(&mut tx, term, batch.last_position())
         .await
     {
         Ok(Checkpoint::Moved(renewed)) => renewed,
@@ -2003,7 +2074,7 @@ async fn deliver_external(
 
     let mut conn = ctx.pool.acquire().await.map_err(database)?;
     match ctx
-        .checkpoint(&mut conn, term, batch.last_position(), Instant::now())
+        .checkpoint(&mut conn, term, batch.last_position())
         .await
         .map_err(database)?
     {
@@ -2016,7 +2087,8 @@ async fn deliver_external(
 }
 
 /// Runs `work` while renewing the lease on another pool connection whenever less than half of it is left,
-/// so a slow handler or a long retry backoff does not hand the lease to a standby.
+/// so a slow `run` handler or a long retry backoff does not hand the lease to a standby. Never around a
+/// `run_pg` handler: its transaction holds the row, and a renewal would wait for it.
 ///
 /// A renewal still in flight when `work` finishes is dropped: the deadline then stays the earlier one, which
 /// only makes the next renewal come sooner. Dropping it also keeps a pool of one connection from waiting on

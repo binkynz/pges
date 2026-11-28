@@ -753,7 +753,7 @@ impl LaneCtx<'_> {
         let mut attempt = 1_u32;
         loop {
             let mut conn = self.pool.acquire().await?;
-            let mut tx = conn.begin().await?;
+            let mut tx = handler::begin(&mut conn, handler.isolation()).await?;
             let error = match handler.handle(&mut tx, &batch).await {
                 // Without this, the checkpoint would move in autocommit and the commit do nothing.
                 Ok(()) if !tx.is_in_transaction() => {
