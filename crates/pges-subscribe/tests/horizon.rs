@@ -275,6 +275,81 @@ async fn a_subscription_started_at_retained_reads_commits_kept_below_the_horizon
     f.finish().await
 }
 
+/// `redefine(Start::Retained)` moves a subscription to the beginning and stores its `skip_through`, so the
+/// redefined subscription reads every commit retention kept in its new categories, also one below the
+/// horizon, and skips the dropped one.
+#[tokio::test]
+async fn a_subscription_redefined_at_retained_reads_commits_kept_below_the_horizon() -> Result<()> {
+    tokio::time::timeout(std::time::Duration::from_secs(60), redefined_at_retained()).await?
+}
+
+async fn redefined_at_retained() -> Result<()> {
+    let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    let (job, order) = (stream::StreamId::new_v7(), stream::StreamId::new_v7());
+    for _ in 0..3 {
+        f.append(Cat::Jobs, job, 1).await?;
+        f.append(Cat::Orders, order, 1).await?;
+    }
+    f.sequence_all().await?;
+    // As apply_retention records it: jobs at position 3 is dropped, jobs at position 1 is kept.
+    sqlx::query(
+        "UPDATE es.categories SET horizon_position = 3, start_position = 0 WHERE category_id = $1",
+    )
+    .bind(f.id(Cat::Jobs).get())
+    .execute(&f.pool)
+    .await?;
+    sqlx::query(
+        "DELETE FROM es.commits_jobs WHERE commit_id = (SELECT commit_id FROM es.log WHERE last_position = 3)",
+    )
+    .execute(&f.pool)
+    .await?;
+
+    let builder = || {
+        f.store
+            .subscription(subscription_name!("redefined"))
+            .waker(recheck::Recheck::every(interval!(5 ms)))
+    };
+    let running = common::Running::spawn(
+        builder()
+            .categories(non_empty![category!("orders")])
+            .run_pg(Recorder::new("before")),
+    );
+    running.wait_position(6).await?;
+    running.stop().await?;
+    let skip_through: i64 =
+        sqlx::query_scalar("SELECT skip_through FROM es.subscriptions WHERE name = 'redefined'")
+            .fetch_one(&f.pool)
+            .await?;
+    assert_eq!(
+        skip_through, 0,
+        "a subscription from the beginning skips nothing"
+    );
+
+    let running = common::Running::spawn(
+        builder()
+            .categories(non_empty![category!("jobs"), category!("orders")])
+            .redefine(subscription::Start::Retained)
+            .run_pg(Recorder::new("after")),
+    );
+    running.wait_position(6).await?;
+    running.stop().await?;
+    assert_eq!(
+        f.delivered("after")
+            .await?
+            .iter()
+            .map(|d| d.0)
+            .collect::<Vec<_>>(),
+        [1, 2, 4, 5, 6]
+    );
+    let skip_through: i64 =
+        sqlx::query_scalar("SELECT skip_through FROM es.subscriptions WHERE name = 'redefined'")
+            .fetch_one(&f.pool)
+            .await?;
+    assert_eq!(skip_through, 6, "the head when it was redefined");
+
+    f.finish().await
+}
+
 /// A store-wide subscription started at `Start::Retained` does not page through the log rows of commits
 /// retention dropped below a category's start: the log statement leaves them out, so the first page holds
 /// the commits that are left, and the cursor moves once.
