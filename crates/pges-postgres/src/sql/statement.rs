@@ -943,9 +943,11 @@ crate::typed_query! {
     pub LOG_PARTITION_PINNED, mod log_partition_pinned {
         name: "log/pinned",
         files: [sql_file!("log/pinned.sql")],
-        params {},
+        params<'q> {
+            store: &'q str,
+        },
         row {
-            exists: bool,
+            pinned: bool,
         },
     }
 }
@@ -955,10 +957,11 @@ crate::typed_query! {
     pub PRUNE_LOG, mod prune_log {
         name: "log/prune",
         files: [sql_file!("log/prune.sql")],
-        params {
+        params<'q> {
             category_id: i32,
             scan_from: i64,
             batch: i64,
+            store: &'q str,
         },
         row {},
     }

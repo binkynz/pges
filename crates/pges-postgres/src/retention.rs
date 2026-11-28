@@ -122,7 +122,9 @@ impl admin::Admin {
 
     /// Deletes a category's log rows that only point at commits retention already dropped, then drops the
     /// log partitions no category needs any more. A row whose commit still exists is kept, so the
-    /// sequencer's `resequence` never takes that commit for one without a log row.
+    /// sequencer's `resequence` never takes that commit for one without a log row. So is a row the sequencer
+    /// wrote after it last stored the store's high-water mark (`pges.stores.last_position`), so a sequencer
+    /// that stopped before storing it does not hand out that row's position again.
     ///
     /// Log partitions hold every category's positions, so a category that keeps its commits pins every log
     /// partition of the store. In a store that mixes such categories with short-lived ones, run this for
@@ -1014,10 +1016,12 @@ async fn drop_log_partitions(
                 .store(store)
                 .ident(template::IdentPlaceholder::LogPartition, &partition.name);
             let pinned = statement::log_partition_pinned::Query::render(&values)
-                .bind(statement::log_partition_pinned::Params {})
+                .bind(statement::log_partition_pinned::Params {
+                    store: store.as_str(),
+                })
                 .fetch_one(&mut *conn)
                 .await?;
-            !pinned.exists
+            !pinned.pinned
         };
         if droppable {
             detach_and_drop(conn, store, &parent, &partition.name).await?;
@@ -1134,7 +1138,8 @@ async fn prune_log(
             .store(admin.store_name())
             .category(name)
             .ident(template::IdentPlaceholder::LogPartition, &partition.name);
-        let deleted = delete_log_rows(conn, &values, category_id, scan_from).await?;
+        let deleted =
+            delete_log_rows(conn, &values, admin.store_name(), category_id, scan_from).await?;
         if deleted > 0 {
             conn.execute(statement::VACUUM_LOG_PARTITION.render_text(&values))
                 .await?;
@@ -1147,10 +1152,12 @@ async fn prune_log(
 }
 
 /// Deletes the category's rows at or below `through` from one log partition, in batches, except those
-/// whose commit still exists in the category's partition of `commits`.
+/// whose commit still exists in the category's partition of `commits` and those above the store's coarse
+/// high-water mark.
 async fn delete_log_rows(
     conn: &mut PgConnection,
     partition_values: &template::Values,
+    store: &pges_core::store::StoreName,
     category_id: i32,
     through: i64,
 ) -> Result<u64, sqlx::Error> {
@@ -1165,6 +1172,7 @@ async fn delete_log_rows(
                 category_id,
                 scan_from: through,
                 batch: PRUNE_BATCH,
+                store: store.as_str(),
             })
             .execute(&mut *conn)
             .await?

@@ -118,14 +118,19 @@ impl Fixture {
     /// and whose writers may append commit ids up to `skew` from the clock, so a test can write into old
     /// leaves. The store records `skew` and the default `max_txn_age` as its writer limits.
     pub async fn logical_with_history(months_back: u16, skew: Duration) -> Result<Self> {
+        Self::with_history(Kind::Logical, months_back, skew).await
+    }
+
+    /// [`Fixture::logical_with_history`] for either kind of source.
+    pub async fn with_history(kind: Kind, months_back: u16, skew: Duration) -> Result<Self> {
         let db = pges_testing::TestDb::new().await?;
         let mut conn = db.connect().await?;
-        pges_testing::create_store(
-            &mut conn,
-            &STORE_NAME,
-            &pges_testing::definition(store::Outbox::Disabled),
-        )
-        .await?;
+        let outbox = match kind {
+            Kind::Outbox => store::Outbox::Enabled,
+            Kind::Logical => store::Outbox::Disabled,
+        };
+        pges_testing::create_store(&mut conn, &STORE_NAME, &pges_testing::definition(outbox))
+            .await?;
         for category in [category!("jobs"), category!("orders")] {
             pges_testing::register_category(&mut conn, &STORE_NAME, category, months_back, 2)
                 .await?;
@@ -141,7 +146,7 @@ impl Fixture {
         let mut config = store::StoreConfig::new(STORE_NAME);
         config.max_clock_skew = Some(skew);
 
-        Self::opened(Kind::Logical, db, pool, config).await
+        Self::opened(kind, db, pool, config).await
     }
 
     async fn opened(

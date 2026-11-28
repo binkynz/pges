@@ -269,6 +269,97 @@ async fn positions_continue_after_prune_log_removed_the_newest_rows() -> Result<
     f.finish().await
 }
 
+/// A leader that crashed before it stored its token leaves log rows above the coarse high-water mark. When
+/// retention drops their commits, `prune_log` keeps those rows, so the next term continues after them and
+/// does not hand their positions out again. The outbox source does not deliver a drained commit again, so a
+/// new commit would take the position; the logical source replays the commit after its token and would give
+/// it the same position again.
+#[tokio::test]
+async fn positions_continue_after_a_crash_before_the_mark_and_prune_log() -> Result<()> {
+    for kind in [common::Kind::Outbox, common::Kind::Logical] {
+        let f = Fixture::with_history(kind, 3, 200 * DAY).await?;
+        let admin = admin::Admin::new(f.pool.clone(), common::STORE_NAME);
+
+        let running = f.start(common::fast()).await?;
+        running.wait_leading().await?;
+        append(&f, id_at(&f, 3, 2, 1).await?).await?;
+        common::wait_sequenced(&f.pool, 1).await?;
+        running.stop().await?;
+
+        // The token, and so the mark, would be stored only after an hour: the crash comes first.
+        let mut slow = common::fast();
+        slow.token_interval = Duration::from_secs(3600);
+        let running = f.start(slow).await?;
+        running.wait_leading().await?;
+        let late = append(&f, id_at(&f, 3, 2, 2).await?).await?;
+        common::wait_sequenced(&f.pool, 2).await?;
+        running.kill().await;
+        let mark: i64 =
+            sqlx::query_scalar("SELECT last_position FROM pges.stores WHERE schema_name = $1")
+                .bind(common::STORE)
+                .fetch_one(&f.pool)
+                .await?;
+        assert_eq!(mark, 1, "{kind:?}: the crashed leader stored its mark");
+
+        default_skew(&f).await?;
+        window(&admin, 7 * DAY).await?;
+        let report = admin
+            .apply_retention(&retention::RetentionConfig::new(limit::WriterRoles::one(
+                f.writer_role().await?,
+            )))
+            .await?;
+        assert!(report.refused.is_empty(), "{kind:?}: {report:?}");
+        assert_eq!(
+            horizon(&f).await?.1,
+            2,
+            "{kind:?}: the scan reached the newest row"
+        );
+        admin.prune_log(JobEvent::CATEGORY).await?;
+        let rows: Vec<i64> = sqlx::query_scalar("SELECT last_position FROM es.log")
+            .fetch_all(&f.pool)
+            .await?;
+        assert_eq!(
+            rows,
+            [2],
+            "{kind:?}: prune_log deleted a row above the mark"
+        );
+
+        let running = f.start(common::fast()).await?;
+        running.wait_leading().await?;
+        let next = append(&f, commit::CommitId::generate()).await?;
+        let position = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let position: Option<i64> =
+                    sqlx::query_scalar("SELECT last_position FROM es.log WHERE commit_id = $1")
+                        .bind(next.as_uuid())
+                        .fetch_optional(&f.pool)
+                        .await?;
+                if let Some(position) = position {
+                    return anyhow::Ok(position);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+        running.stop().await?;
+        assert_eq!(position, 3, "{kind:?}: a position was handed out twice");
+        let late_rows: Vec<i64> =
+            sqlx::query_scalar("SELECT last_position FROM es.log WHERE commit_id = $1")
+                .bind(late.as_uuid())
+                .fetch_all(&f.pool)
+                .await?;
+        assert_eq!(
+            late_rows,
+            [2],
+            "{kind:?}: the late commit was sequenced again"
+        );
+
+        f.finish().await?;
+    }
+
+    Ok(())
+}
+
 /// A resequence after `prune_log` removed the store's newest rows does not hand out their positions again
 /// either.
 #[tokio::test]
