@@ -1252,8 +1252,9 @@ enum Held {
 enum HeldCheckpoint {
     /// The cursor moved and the lease was renewed until this deadline, once the transaction commits.
     Moved(Instant),
-    /// The fence moved on: another instance took the lease.
-    Fenced,
+    /// No row matched: the fence moved on (another instance took the lease), or the stored cursor is not
+    /// `Term::cursor` (a COMMIT whose reply was lost moved it), as [`Checkpoint::Refused`].
+    Refused,
     /// The checkpoint ran outside the batch's transaction, which the handler ended itself; nothing moved.
     OutsideBatch,
 }
@@ -1843,8 +1844,8 @@ impl Ctx {
         Ok(Held::Locked(xact))
     }
 
-    /// Moves the cursor to `to` at the end of a `run_pg` batch and renews the lease from now, if it runs in
-    /// the batch's transaction `xact`, which holds the row.
+    /// Moves the cursor to `to` at the end of a `run_pg` batch and renews the lease from now, if the stored
+    /// cursor is still `term.cursor` and it runs in the batch's transaction `xact`, which holds the row.
     async fn checkpoint_held(
         &self,
         tx: &mut PgConnection,
@@ -1863,6 +1864,7 @@ impl Ctx {
                 fence: term.fence,
                 xact,
                 lease: self.interval,
+                from: read::to_i64(term.cursor),
             })
             .fetch_one(&mut *tx)
             .await?;
@@ -1874,7 +1876,7 @@ impl Ctx {
 
         Ok(match (in_batch, moved) {
             (false, _) => HeldCheckpoint::OutsideBatch,
-            (true, false) => HeldCheckpoint::Fenced,
+            (true, false) => HeldCheckpoint::Refused,
             (true, true) => HeldCheckpoint::Moved(sent + self.lease),
         })
     }
@@ -2061,7 +2063,7 @@ async fn deliver_pg(
         .await
     {
         Ok(HeldCheckpoint::Moved(renewed)) => renewed,
-        Ok(HeldCheckpoint::Fenced) => {
+        Ok(HeldCheckpoint::Refused) => {
             let _ = tx.rollback().await;
             return Ok(Delivered::Refused);
         }

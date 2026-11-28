@@ -600,13 +600,77 @@ async fn a_handler_cannot_set_its_isolation_level_itself() -> Result<()> {
 
     f.finish().await
 }
+/// Makes every COMMIT of a batch the subscription `subscriber` records run `body` first: a deferred constraint
+/// trigger on `public.delivered`, which fires at the COMMIT, after the checkpoint.
+async fn at_commit(f: &Fixture, subscriber: &str, body: &str) -> Result<()> {
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE FUNCTION public.at_commit_{subscriber}() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN {body} RETURN NULL; END $$"
+    )))
+    .execute(&f.pool)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE CONSTRAINT TRIGGER at_commit_{subscriber} AFTER INSERT ON public.delivered
+         DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+         WHEN (NEW.subscriber = '{subscriber}') EXECUTE FUNCTION public.at_commit_{subscriber}()"
+    )))
+    .execute(&f.pool)
+    .await?;
+    Ok(())
+}
 
-/// Records with a short `lock_timeout`, which the checkpoint in its transaction inherits; the first call waits
-/// until the test lets it go.
+/// A serialization failure at the COMMIT (40001, as a SERIALIZABLE handler's conflict with another
+/// transaction is reported there) follows the retry policy: transient, so the batch is retried, and the run
+/// stops with `HandlerFailed` once it runs out of attempts, instead of retrying the batch for good as a
+/// database error. The failure is raised by a deferred trigger, so every attempt meets it. With the
+/// subscription's row held for the batch, the checkpoint itself no longer fails with 40001 under REPEATABLE
+/// READ or SERIALIZABLE (`a_repeatable_read_or_serializable_batch_slower_than_the_lease_is_checkpointed`).
+#[tokio::test]
+async fn a_serialization_failure_at_the_commit_follows_the_retry_policy() -> Result<()> {
+    let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    jobs(&f, 1).await?;
+    at_commit(
+        &f,
+        "serializable",
+        "RAISE EXCEPTION 'could not serialize access' USING ERRCODE = 'serialization_failure';",
+    )
+    .await?;
+    let levels = Arc::new(Mutex::new(Vec::new()));
+
+    let error = common::Running::spawn(
+        f.store
+            .subscription(subscription_name!("serializable"))
+            .categories(non_empty![category!("jobs")])
+            .retry_interval(interval!(10 ms))
+            .on_error(retry(2))
+            .run_pg(Isolated {
+                recorder: Recorder::new("serializable"),
+                isolation: handler::Isolation::Serializable,
+                pause: Duration::ZERO,
+                levels: levels.clone(),
+            }),
+    )
+    .stopped()
+    .await?;
+    assert!(
+        matches!(&error, subscription::SubscribeError::HandlerFailed { source, .. }
+            if source.to_string().contains("could not serialize")),
+        "{error:?}"
+    );
+    assert_eq!(
+        *levels.lock().unwrap(),
+        ["serializable", "serializable"],
+        "retried per the policy"
+    );
+    assert_eq!(f.cursor("serializable").await?, Some(0));
+    assert!(f.delivered("serializable").await?.is_empty());
+
+    f.finish().await
+}
+
+/// Records with a short `lock_timeout`, which the COMMIT in its transaction inherits.
 struct ShortLockTimeout {
     recorder: Recorder,
-    entered: Arc<Notify>,
-    go: Arc<Notify>,
 }
 
 impl handler::PgHandler for ShortLockTimeout {
@@ -615,33 +679,36 @@ impl handler::PgHandler for ShortLockTimeout {
         tx: &mut PgConnection,
         batch: &batch::Batch,
     ) -> Result<(), handler::HandlerError> {
-        let call = {
-            let mut calls = self.recorder.calls.lock().unwrap();
-            *calls += 1;
-            *calls
-        };
+        *self.recorder.calls.lock().unwrap() += 1;
         sqlx::query("SET LOCAL lock_timeout = '100ms'")
             .execute(&mut *tx)
             .await?;
-        if call == 1 {
-            self.entered.notify_one();
-            self.go.notified().await;
-        }
         self.recorder.record(tx, batch).await?;
         Ok(())
     }
 }
 
-/// A checkpoint that times out waiting for the subscription's row lock (55P03, as behind a lost COMMIT still
-/// in flight) is no fault of the handler: it is transient and retried, and the batch is applied once the lock
-/// is gone, instead of stopping the run with `HandlerFailed`.
+/// A COMMIT that times out waiting for a lock (55P03, here in a deferred trigger, as behind a lock another
+/// session holds a little too long) is no fault of the batch: it is transient and retried, and the batch is
+/// applied once the lock is gone, instead of stopping the run with `HandlerFailed`. (The checkpoint itself no
+/// longer waits on the subscription's row: the batch locked it before the handler ran.)
 #[tokio::test]
-async fn a_checkpoint_lock_timeout_is_retried() -> Result<()> {
+async fn a_commit_lock_timeout_is_retried() -> Result<()> {
     let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
     jobs(&f, 1).await?;
+    sqlx::query("CREATE TABLE public.gate (k int PRIMARY KEY)")
+        .execute(&f.pool)
+        .await?;
+    sqlx::query("INSERT INTO public.gate VALUES (1)")
+        .execute(&f.pool)
+        .await?;
+    at_commit(&f, "locked", "PERFORM FROM public.gate FOR UPDATE;").await?;
     let recorder = Recorder::new("locked");
-    let (entered, go) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
 
+    let mut lock = f.pool.begin().await?;
+    sqlx::query("SELECT FROM public.gate FOR UPDATE")
+        .execute(&mut *lock)
+        .await?;
     let running = common::Running::spawn(
         f.store
             .subscription(subscription_name!("locked"))
@@ -652,19 +719,16 @@ async fn a_checkpoint_lock_timeout_is_retried() -> Result<()> {
             ))
             .run_pg(ShortLockTimeout {
                 recorder: recorder.clone(),
-                entered: entered.clone(),
-                go: go.clone(),
             }),
     );
-    tokio::time::timeout(Duration::from_secs(10), entered.notified())
-        .await
-        .context("the batch was not delivered")?;
-    let mut lock = f.pool.begin().await?;
-    sqlx::query("SELECT FROM es.subscriptions WHERE name = 'locked' FOR UPDATE")
-        .execute(&mut *lock)
-        .await?;
-    go.notify_one();
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while recorder.calls() < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first attempt did not time out"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     lock.rollback().await?;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -678,7 +742,6 @@ async fn a_checkpoint_lock_timeout_is_retried() -> Result<()> {
         assert!(tokio::time::Instant::now() < deadline, "not checkpointed");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(recorder.calls() >= 2, "the first attempt timed out");
     assert_eq!(f.delivered("locked").await?.len(), 1, "applied once");
     running.stop().await?;
 
@@ -988,9 +1051,10 @@ async fn after_a_database_error_the_stored_cursor_wins() -> Result<()> {
 
 /// A COMMIT whose reply was lost can become visible only after the subscription read its cursor again: the
 /// client saw an error while the server still finished the transaction. The batch read from the stale cursor
-/// must not be applied on top of it. The test holds the lost COMMIT open until the subscription's own
-/// checkpoint waits on its row lock, then commits it: the checkpoint finds the cursor moved, rolls the batch
-/// back and reads the cursor again.
+/// must not be applied on top of it. The test holds the lost COMMIT open until the subscription's next batch
+/// waits on its row lock (the batch's lock on the subscription's row, `subscription/hold.sql`), then commits
+/// it: the lock is taken on the moved row, the handler applies the stale batch, and the checkpoint finds the
+/// cursor moved (`subscription/checkpoint_held.sql`), rolls the batch back and reads the cursor again.
 #[tokio::test]
 async fn a_lost_commit_landing_late_is_not_applied_twice() -> Result<()> {
     let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
@@ -1038,13 +1102,13 @@ async fn a_lost_commit_landing_late_is_not_applied_twice() -> Result<()> {
         .execute(&f.pool)
         .await?;
 
-    // The subscription reads the cursor again (still 2), applies 3 and 4 and waits on the row lock.
+    // The subscription reads the cursor again (still 2), reads 3 and 4 and its batch waits on the row lock.
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let waiting: bool = sqlx::query_scalar(
                 "SELECT EXISTS (SELECT FROM pg_stat_activity
                                 WHERE datname = current_database() AND wait_event_type = 'Lock'
-                                  AND query LIKE '%subscriptions SET position%')",
+                                  AND query LIKE '%FOR NO KEY UPDATE OF subscriptions%')",
             )
             .fetch_one(&f.pool)
             .await?;
@@ -1055,7 +1119,7 @@ async fn a_lost_commit_landing_late_is_not_applied_twice() -> Result<()> {
         }
     })
     .await
-    .context("the subscription's checkpoint never waited on the lost COMMIT")??;
+    .context("the subscription's batch never waited on the lost COMMIT")??;
     lost.commit().await?;
 
     f.append(Cat::Jobs, id, 1).await?;
@@ -1067,6 +1131,63 @@ async fn a_lost_commit_landing_late_is_not_applied_twice() -> Result<()> {
         &f.delivered("late").await?,
         &f.expected(&[f.id(Cat::Jobs)]).await?,
     )?;
+
+    f.finish().await
+}
+
+/// `subscription/checkpoint_held.sql` moves the cursor only from where the instance holds it, as the other
+/// checkpoints do: a stored cursor elsewhere (as a lost COMMIT landing late leaves it) updates no row, in the
+/// batch's transaction and with the fence in place.
+#[tokio::test]
+async fn the_held_checkpoint_moves_only_a_cursor_it_holds() -> Result<()> {
+    use pges_postgres::sql::{template, typed::Query as _};
+    use pges_subscribe::sql::statement::checkpoint_held;
+
+    let f = Fixture::new(pges_postgres::store::Outbox::Disabled).await?;
+    jobs(&f, 2).await?;
+    let handle = f
+        .store
+        .subscription(subscription_name!("held"))
+        .categories(non_empty![category!("jobs")])
+        .run_pg(Recorder::new("held"))
+        .spawn();
+    common::wait_position(handle.status_changes(), 2).await?;
+    handle.shutdown().await?;
+    let fence: i64 =
+        sqlx::query_scalar("SELECT fence FROM es.subscriptions WHERE name = 'held' AND shard = 0")
+            .fetch_one(&f.pool)
+            .await?;
+
+    let checkpoint =
+        checkpoint_held::Query::render(&template::Values::new().store(&common::STORE_NAME));
+    let mut tx = f.pool.begin().await?;
+    let xact: i64 = sqlx::query_scalar("SELECT pg_current_xact_id()::text::int8")
+        .fetch_one(&mut *tx)
+        .await?;
+    let params = |from| checkpoint_held::Params {
+        name: "held",
+        shard: 0,
+        position: 5,
+        fence,
+        xact,
+        lease: sqlx::postgres::types::PgInterval {
+            months: 0,
+            days: 0,
+            microseconds: 1_000_000,
+        },
+        from,
+    };
+
+    let row = checkpoint.bind(params(1)).fetch_one(&mut *tx).await?;
+    assert_eq!(
+        (row.in_batch, row.moved),
+        (Some(true), Some(false)),
+        "moved a cursor the instance does not hold"
+    );
+    let row = checkpoint.bind(params(2)).fetch_one(&mut *tx).await?;
+    assert_eq!((row.in_batch, row.moved), (Some(true), Some(true)));
+    tx.rollback().await?;
+    assert_eq!(f.cursor("held").await?, Some(2));
 
     f.finish().await
 }
@@ -1697,7 +1818,9 @@ impl handler::PgHandler for FirstWaits {
 /// `CrateTooOld` at the checkpoint that renews the lease, whether it checkpoints a delivered batch or an
 /// empty page that only moves the cursor, for `run` and `run_pg`. The refused checkpoint leaves the cursor and
 /// the fence where they were, so reading the cursor again tells nothing: reading the same page and being
-/// refused again would go on forever, the handler called again each time.
+/// refused again would go on forever, the handler called again each time. A `run_pg` batch is refused
+/// earlier, by the lock on the subscription's row that begins its transaction (`subscription/hold.sql`,
+/// which checks the crate's version as the renewal does), so its handler is not called at all.
 ///
 /// The first batch's handler waits while the test raises `min_compatible` and locks the log, so the next page
 /// is read only after more than half of the lease has gone: its checkpoint renews the lease, and no renewal
@@ -1757,8 +1880,8 @@ async fn a_migration_past_the_crate_stops_a_subscription_at_a_renewing_checkpoin
             );
             assert_eq!(
                 calls,
-                if empty { 1 } else { 2 },
-                "{case}: the refused batch was not handled again"
+                if empty || pg { 1 } else { 2 },
+                "{case}: the refused batch was handled again, or a run batch not at all"
             );
             f.finish().await?;
         }
