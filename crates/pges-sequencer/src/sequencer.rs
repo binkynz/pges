@@ -25,7 +25,8 @@ use crate::{lease, log, source, sql::statement, watch};
 /// Each batch is one transaction that starts with a fence check (`SELECT … FOR SHARE` on the lease row with
 /// this term's fence), so a sequencer that lost its lease cannot write: a takeover bumps the fence, and
 /// waits for a batch that already holds the row lock. Positions are assigned per store in source order and
-/// carry on from the newest log row, so they stay gap-free and unique across takeovers and restarts.
+/// carry on from the newest log row (or the coarse high-water mark, if `prune_log` removed the newest rows),
+/// so they stay gap-free and unique across takeovers and restarts.
 ///
 /// About once a second ([`SequencerConfig::token_interval`]) a batch also stores the source's resume token
 /// and the coarse high-water marks (`pges.stores.last_position`, `categories.last_position`). After a

@@ -217,6 +217,97 @@ async fn retention_sees_a_resequence_that_lands_during_its_run() -> Result<()> {
     f.finish().await
 }
 
+/// `prune_log` deletes the log rows of a category whose commits retention dropped, and those can be the
+/// store's newest. A sequencer that starts afterwards must not hand out their positions again: subscribers
+/// have passed them, and would skip the commits that got them a second time.
+#[tokio::test]
+async fn positions_continue_after_prune_log_removed_the_newest_rows() -> Result<()> {
+    let f = Fixture::logical_with_history(3, 200 * DAY).await?;
+    let admin = admin::Admin::new(f.pool.clone(), common::STORE_NAME);
+
+    let running = f.start(common::fast()).await?;
+    running.wait_leading().await?;
+    append(&f, id_at(&f, 3, 2, 1).await?).await?;
+    append(&f, id_at(&f, 3, 2, 2).await?).await?;
+    common::wait_sequenced(&f.pool, 2).await?;
+    running.stop().await?;
+
+    default_skew(&f).await?;
+    window(&admin, 7 * DAY).await?;
+    let report = admin
+        .apply_retention(&retention::RetentionConfig::new(limit::WriterRoles::one(
+            f.writer_role().await?,
+        )))
+        .await?;
+    assert!(report.refused.is_empty(), "{report:?}");
+    admin.prune_log(JobEvent::CATEGORY).await?;
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM es.log")
+        .fetch_one(&f.pool)
+        .await?;
+    assert_eq!(rows, 0, "prune_log kept rows of dropped commits");
+
+    let running = f.start(common::fast()).await?;
+    running.wait_leading().await?;
+    let next = append(&f, commit::CommitId::generate()).await?;
+    let position = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let position: Option<i64> =
+                sqlx::query_scalar("SELECT last_position FROM es.log WHERE commit_id = $1")
+                    .bind(next.as_uuid())
+                    .fetch_optional(&f.pool)
+                    .await?;
+            if let Some(position) = position {
+                return anyhow::Ok(position);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    running.stop().await?;
+    assert_eq!(position, 3, "a position was handed out twice");
+
+    f.finish().await
+}
+
+/// A resequence after `prune_log` removed the store's newest rows does not hand out their positions again
+/// either.
+#[tokio::test]
+async fn resequence_continues_after_prune_log_removed_the_newest_rows() -> Result<()> {
+    let f = Fixture::logical_with_history(3, 200 * DAY).await?;
+    let admin = admin::Admin::new(f.pool.clone(), common::STORE_NAME);
+
+    let running = f.start(common::fast()).await?;
+    running.wait_leading().await?;
+    append(&f, id_at(&f, 3, 2, 1).await?).await?;
+    append(&f, id_at(&f, 3, 2, 2).await?).await?;
+    common::wait_sequenced(&f.pool, 2).await?;
+    running.stop().await?;
+
+    default_skew(&f).await?;
+    window(&admin, 7 * DAY).await?;
+    let report = admin
+        .apply_retention(&retention::RetentionConfig::new(limit::WriterRoles::one(
+            f.writer_role().await?,
+        )))
+        .await?;
+    assert!(report.refused.is_empty(), "{report:?}");
+    admin.prune_log(JobEvent::CATEGORY).await?;
+
+    f.drop_slot().await?;
+    let lost = append(&f, commit::CommitId::generate()).await?;
+    halt_on_missing_slot(&f).await?;
+    let mut source = f.logical_source(f.pool.clone())?;
+    let resequenced = source.resequence(&f.resequence_config().await?).await?;
+    assert_eq!(resequenced.stores[0].commits, 1);
+    let position: i64 = sqlx::query_scalar("SELECT last_position FROM es.log WHERE commit_id = $1")
+        .bind(lost.as_uuid())
+        .fetch_one(&f.pool)
+        .await?;
+    assert_eq!(position, 3, "a position was handed out twice");
+
+    f.finish().await
+}
+
 /// A `keep` that retains the leaf two months back and drops the one before it.
 async fn keep_two_months_back(f: &Fixture) -> Result<Duration> {
     let keep: f64 = sqlx::query_scalar(

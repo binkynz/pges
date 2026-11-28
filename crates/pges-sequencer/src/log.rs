@@ -273,9 +273,12 @@ impl Logs {
             }
         }
 
+        // Never below the coarse mark: `prune_log` can delete the newest rows, of commits retention dropped,
+        // and their positions must not be handed out again.
         let position = newest
             .map(to_position)
-            .unwrap_or(position::Position::BEGINNING);
+            .unwrap_or(position::Position::BEGINNING)
+            .max(to_position(persisted));
         self.stores.insert(
             id,
             StoreLog {

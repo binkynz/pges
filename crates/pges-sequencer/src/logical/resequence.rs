@@ -466,7 +466,16 @@ async fn insert(
         .fetch_optional(&mut *tx)
         .await?
         .map(|row| row.last_position);
+    // Never below the coarse mark, as a sequencer's term: `prune_log` can delete the newest rows.
+    let marked = statement::log_store::Query::fixed()
+        .bind(statement::log_store::Params {
+            store_id: store.store.get(),
+        })
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(|row| row.last_position);
     let mut position = newest
+        .max(marked)
         .and_then(position::Position::from_i64)
         .unwrap_or(position::Position::BEGINNING);
 
