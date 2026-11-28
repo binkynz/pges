@@ -28,11 +28,12 @@ impl store::Store {
             state: A::default(),
             from: version::Version::FIRST,
             commits: head.commits(),
+            last_version: head.version,
             version: None,
             commit_id: None,
         };
 
-        Ok(replay(self, category, stream_id, head.version, start).await?)
+        Ok(replay(self, category, stream_id, start).await?)
     }
 
     /// Loads an aggregate from its snapshot, then replays the events after it.
@@ -58,11 +59,12 @@ impl store::Store {
                 state: A::default(),
                 from: version::Version::FIRST,
                 commits: head.commits(),
+                last_version: head.version,
                 version: None,
                 commit_id: None,
             },
         };
-        let loaded = replay(self, category, stream_id, head.version, start).await?;
+        let loaded = replay(self, category, stream_id, start).await?;
 
         if let aggregate::SnapshotPolicy::EveryN(n) = A::policy()
             && loaded.replayed >= u64::from(n.get())
@@ -236,6 +238,8 @@ struct Replay<A> {
     state: A,
     from: version::Version,
     commits: RangeInclusive<Uuid>,
+    /// The stream's version at the head read, the version of `commits.end()`.
+    last_version: i64,
     version: Option<version::Version>,
     commit_id: Option<commit::CommitId>,
 }
@@ -288,6 +292,7 @@ async fn read_snapshot<A: aggregate::Snapshotted>(
         state,
         from,
         commits: commit_id.as_uuid()..=head.last_commit_id,
+        last_version: head.version,
         version: Some(snapshot_version),
         commit_id: Some(commit_id),
     }))
@@ -297,13 +302,13 @@ async fn replay<A: aggregate::Aggregate>(
     store: &store::Store,
     category: catalog::Category,
     stream_id: stream::StreamId,
-    through: i64,
     start: Replay<A>,
 ) -> Result<Loaded<A>, read::ReadError> {
     let Replay {
         mut state,
         from,
         commits,
+        last_version,
         mut version,
         mut commit_id,
     } = start;
@@ -313,7 +318,7 @@ async fn replay<A: aggregate::Aggregate>(
         stream_id,
         from,
         commits,
-        through,
+        last_version,
         event::OnUnknown::Fail,
     );
     let mut buffer = VecDeque::new();
