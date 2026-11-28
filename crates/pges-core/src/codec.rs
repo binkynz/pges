@@ -47,6 +47,12 @@ pub mod json {
         data: &[u8],
         upcasters: &[Upcaster],
     ) -> Result<T, event::CodecError> {
+        // `serde_json::Value` holds integers beyond 64 bits as floats, so data that needs no upcasting is
+        // read straight from the bytes.
+        if upcasters.is_empty() {
+            return decode(type_name, schema_version, data);
+        }
+
         let mut value: serde_json::Value = decode(type_name, schema_version, data)?;
 
         for upcaster in upcasters {

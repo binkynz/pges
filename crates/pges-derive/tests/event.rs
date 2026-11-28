@@ -586,3 +586,27 @@ fn accepted_serde_field_attributes_round_trip() {
     };
     assert_eq!((note.as_str(), tag.as_deref()), ("x", Some("t")));
 }
+
+#[derive(Debug, PartialEq, Event)]
+#[event(category = "ledger")]
+enum WideEvent {
+    #[event(name = "ledger.moved")]
+    Moved { amount: u128, delta: i128 },
+}
+
+/// Data at the current version is read straight from the bytes: a detour through `serde_json::Value`
+/// turns integers beyond 64 bits into floats, and the event the same code wrote no longer decodes.
+#[test]
+fn integers_beyond_64_bits_round_trip() {
+    let moved = WideEvent::Moved {
+        amount: u128::MAX,
+        delta: i128::MIN,
+    };
+
+    let data = encode(&moved);
+
+    assert_eq!(
+        decode::<WideEvent>("ledger.moved", 1, &data),
+        event::Decoded::Event(moved)
+    );
+}
