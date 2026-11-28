@@ -554,6 +554,15 @@ impl Sequencer {
         Self::spawn(pool, source, config)
     }
 
+    /// A sequencer on `pool` reading from `source`.
+    pub fn start_source<S: pges_sequencer::source::Source + 'static>(
+        pool: PgPool,
+        source: S,
+        config: sequencer::SequencerConfig,
+    ) -> Self {
+        Self::spawn(pool, source, config).expect("spawning cannot fail")
+    }
+
     /// Waits until this sequencer leads.
     pub async fn wait_leading(&self) -> Result<sequencer::Fence> {
         let mut status = self.watch.status();
